@@ -1,0 +1,49 @@
+branch_whitelist = ["main"]
+from_latest_tag = true
+ignore_merge_commits = true
+skip_ci = "[skip ci]"
+skip_untracked = true
+
+pre_bump_hooks = [
+  "perl -0777 -pi -e 's/^version = \"[^\"]*\"/version = \"{{version}}\"/' Cargo.toml",
+  "cargo build --release",
+  "git add Cargo.toml Cargo.lock",
+]
+
+post_bump_hooks = [
+  "git push",
+  "git push origin {{version}}",
+]
+
+[git_hooks.commit-msg]
+script = """#!/bin/sh
+set -e
+cog verify --file "$1"
+"""
+
+[git_hooks.pre-commit]
+script = """#!/bin/sh
+set -e
+gitleaks git --staged --no-banner --redact
+"""
+
+[git_hooks.pre-push]
+script = """#!/bin/sh
+set -e
+gitleaks git --no-banner --redact
+"""
+
+[commit_types]
+
+[changelog]
+path = "CHANGELOG.md"
+template = "remote"
+remote = "github.com"
+owner = "prymul"
+repository = "conch"
+authors = [
+  { signature = "Mateo Elias Martinez", username = "mmat30" },
+  { signature = "Mateo Martinez", username = "mmat30" },
+]
+
+[bump_profiles]
