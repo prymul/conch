@@ -16,10 +16,13 @@ jobs:
     if: "!contains(github.event.head_commit.message, 'chore(version):')"
     runs-on: ubuntu-latest
     steps:
+      # A PAT is required here (not GITHUB_TOKEN): pushes made with the
+      # default token don't trigger other workflows, so the tag this job
+      # pushes would never fire publish.yml.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
 
