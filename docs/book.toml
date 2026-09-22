@@ -1,0 +1,10 @@
+[book]
+title = "conch"
+authors = ["Mateo Elias Martinez"]
+description = "Conch Shell"
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/prymul/conch"
+edit-url-template = "https://github.com/prymul/conch/edit/main/docs/{path}"
