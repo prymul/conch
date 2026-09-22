@@ -2,6 +2,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [0.1.1](https://github.com/prymul/conch/compare/e0369f448518181fb693bfea285f93092d52b11f..0.1.1) - 2026-09-22
+#### Bug Fixes
+- replace gitleaks-action with the raw CLI to drop the license dependency - ([805c079](https://github.com/prymul/conch/commit/805c0790f04d9f89a66bccff2c90233baf315dc9)) - [@mmat30](https://github.com/mmat30)
+- rename crates.io package to conch-shell, keep conch as the binary name - ([e0369f4](https://github.com/prymul/conch/commit/e0369f448518181fb693bfea285f93092d52b11f)) - [@mmat30](https://github.com/mmat30)
+
+- - -
+
 ## [0.1.0](https://github.com/prymul/conch/compare/c6b3e46af2b8de0ae1e350fa580dfd3b029af6d6..0.1.0) - 2026-09-22
 #### Features
 - scaffold conch rust project with release automation - ([c6b3e46](https://github.com/prymul/conch/commit/c6b3e46af2b8de0ae1e350fa580dfd3b029af6d6)) - [@mmat30](https://github.com/mmat30)
