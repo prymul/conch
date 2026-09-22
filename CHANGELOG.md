@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [0.1.2](https://github.com/prymul/conch/compare/5d891d278ea86252a4127c80bad7a321d5e37ede..0.1.2) - 2026-09-22
+#### Bug Fixes
+- correct the pre_bump_hooks version-substitution regex - ([5d891d2](https://github.com/prymul/conch/commit/5d891d278ea86252a4127c80bad7a321d5e37ede)) - [@mmat30](https://github.com/mmat30)
+
+- - -
+
 ## [0.1.1](https://github.com/prymul/conch/compare/e0369f448518181fb693bfea285f93092d52b11f..0.1.1) - 2026-09-22
 #### Bug Fixes
 - replace gitleaks-action with the raw CLI to drop the license dependency - ([805c079](https://github.com/prymul/conch/commit/805c0790f04d9f89a66bccff2c90233baf315dc9)) - [@mmat30](https://github.com/mmat30)
