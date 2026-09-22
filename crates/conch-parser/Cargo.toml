@@ -1,0 +1,10 @@
+[package]
+name = "conch-shell-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "POSIX/bash-compatible shell parser, used internally by the conch shell"
+repository.workspace = true
+
+[dependencies]
+conch-shell-lexer = { workspace = true }

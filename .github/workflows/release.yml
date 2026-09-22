@@ -111,7 +111,20 @@ jobs:
         with:
           ref: ${{ needs.bump.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish workspace crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          # conch-shell (the binary) depends on the other four via path+version,
+          # so crates.io needs each dependency already published before the
+          # crate that depends on it — publish leaves-first. A short sleep
+          # after each publish gives the crates.io index a moment to catch up
+          # before the next crate's dependency resolution needs to see it.
+          for pkg in conch-shell-lexer conch-shell-parser conch-shell-core conch-shell-builtins conch-shell; do
+            cargo publish -p "$pkg"
+            sleep 15
+          done
 
   homebrew:
     name: Update Homebrew tap
@@ -145,7 +158,7 @@ jobs:
             depends_on "rust" => :build
 
             def install
-              system "cargo", "install", *std_cargo_args
+              system "cargo", "install", *std_cargo_args(path: "crates/conch")
             end
 
             test do

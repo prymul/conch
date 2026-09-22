@@ -1,0 +1,30 @@
+[package]
+name = "conch-shell"
+version.workspace = true
+edition.workspace = true
+description = "Conch Shell"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "conch"
+path = "src/main.rs"
+
+[dependencies]
+conch-shell-parser = { workspace = true }
+conch-shell-core = { workspace = true }
+conch-shell-builtins = { workspace = true }
+
+[package.metadata.deb]
+maintainer = "Mateo Elias Martinez <mateo.martinez.spc@icloud.com>"
+copyright = "2026, prymul"
+license-file = ["../../LICENSE", "4"]
+extended-description = "Conch Shell"
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/conch", "usr/bin/", "755"],
+]

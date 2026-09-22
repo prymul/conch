@@ -5,3 +5,33 @@ version = 4
 [[package]]
 name = "conch-shell"
 version = "0.1.1"
+dependencies = [
+ "conch-shell-builtins",
+ "conch-shell-core",
+ "conch-shell-parser",
+]
+
+[[package]]
+name = "conch-shell-builtins"
+version = "0.1.1"
+dependencies = [
+ "conch-shell-core",
+]
+
+[[package]]
+name = "conch-shell-core"
+version = "0.1.1"
+dependencies = [
+ "conch-shell-parser",
+]
+
+[[package]]
+name = "conch-shell-lexer"
+version = "0.1.1"
+
+[[package]]
+name = "conch-shell-parser"
+version = "0.1.1"
+dependencies = [
+ "conch-shell-lexer",
+]

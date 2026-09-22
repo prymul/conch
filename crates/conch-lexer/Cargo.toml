@@ -1,0 +1,9 @@
+[package]
+name = "conch-shell-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "POSIX/bash-compatible shell tokenizer, used internally by the conch shell"
+repository.workspace = true
+
+[dependencies]

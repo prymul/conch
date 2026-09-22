@@ -1,28 +1,23 @@
-[package]
-name = "conch-shell"
+[workspace]
+resolver = "3"
+members = [
+    "crates/conch-lexer",
+    "crates/conch-parser",
+    "crates/conch-core",
+    "crates/conch-builtins",
+    "crates/conch",
+]
+
+[workspace.package]
 version = "0.1.1"
 edition = "2024"
-description = "Conch Shell"
 license = "MIT"
 repository = "https://github.com/prymul/conch"
 homepage = "https://github.com/prymul/conch"
-readme = "README.md"
 authors = ["Mateo Elias Martinez"]
 
-[[bin]]
-name = "conch"
-path = "src/main.rs"
-
-[dependencies]
-
-[package.metadata.deb]
-maintainer = "Mateo Elias Martinez <mateo.martinez.spc@icloud.com>"
-copyright = "2026, prymul"
-license-file = ["LICENSE", "4"]
-extended-description = "Conch Shell"
-depends = "$auto"
-section = "utils"
-priority = "optional"
-assets = [
-    ["target/release/conch", "usr/bin/", "755"],
-]
+[workspace.dependencies]
+conch-shell-lexer = { path = "crates/conch-lexer", version = "0.1.1" }
+conch-shell-parser = { path = "crates/conch-parser", version = "0.1.1" }
+conch-shell-core = { path = "crates/conch-core", version = "0.1.1" }
+conch-shell-builtins = { path = "crates/conch-builtins", version = "0.1.1" }
