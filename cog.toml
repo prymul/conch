@@ -5,7 +5,7 @@ skip_ci = "[skip ci]"
 skip_untracked = true
 
 pre_bump_hooks = [
-  "perl -0777 -pi -e 's/^version = \"[^\"]*\"/version = \"{{version}}\"/' Cargo.toml",
+  "perl -0777 -pi -e 's/^version = \"[^\"]*\"/version = \"{{version}}\"/m' Cargo.toml",
   "cargo build --release",
   "git add Cargo.toml Cargo.lock",
 ]
