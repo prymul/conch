@@ -15,23 +15,10 @@ post_bump_hooks = [
   "git push origin {{version}}",
 ]
 
-[git_hooks.commit-msg]
-script = """#!/bin/sh
-set -e
-cog verify --file "$1"
-"""
-
-[git_hooks.pre-commit]
-script = """#!/bin/sh
-set -e
-gitleaks git --staged --no-banner --redact
-"""
-
-[git_hooks.pre-push]
-script = """#!/bin/sh
-set -e
-gitleaks git --no-banner --redact
-"""
+# Local git hooks (pre-commit/pre-push/commit-msg) are owned by lefthook —
+# see lefthook.yml. `cog verify`/`cog check` run there as a commit-msg job
+# instead of being installed here via `cog install-hook`, so only one tool
+# ever manages a given .git/hooks/* file.
 
 [commit_types]
 
