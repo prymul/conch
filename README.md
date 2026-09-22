@@ -6,7 +6,7 @@ Conch Shell
 **Cargo**
 
 ```sh
-cargo install conch
+cargo install conch-shell
 ```
 
 **Homebrew** (macOS/Linux)
@@ -21,7 +21,7 @@ brew install conch
 Download the `.deb` from the [latest release](https://github.com/prymul/conch/releases/latest) and:
 
 ```sh
-sudo dpkg -i conch_*.deb
+sudo dpkg -i conch-shell_*.deb
 ```
 
 ## Releases

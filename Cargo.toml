@@ -1,5 +1,5 @@
 [package]
-name = "conch"
+name = "conch-shell"
 version = "0.1.0"
 edition = "2024"
 description = "Conch Shell"
@@ -8,6 +8,10 @@ repository = "https://github.com/prymul/conch"
 homepage = "https://github.com/prymul/conch"
 readme = "README.md"
 authors = ["Mateo Elias Martinez"]
+
+[[bin]]
+name = "conch"
+path = "src/main.rs"
 
 [dependencies]
 
