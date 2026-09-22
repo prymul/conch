@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: "!contains(github.event.head_commit.message, 'chore(version):')"
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Semver release
+        id: bump
+        uses: cocogitto/cocogitto-action@v4
+        with:
+          command: bump
+          args: --auto
+          git-user: "github-actions[bot]"
+          git-user-email: "github-actions[bot]@users.noreply.github.com"
+
+  github-release:
+    needs: bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.bump.outputs.version }}
+
+      - name: Generate changelog
+        id: changelog
+        uses: cocogitto/cocogitto-action@v4
+        with:
+          command: changelog
+          args: --at ${{ needs.bump.outputs.version }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump.outputs.version }}
+          name: ${{ needs.bump.outputs.version }}
+          body: ${{ steps.changelog.outputs.stdout }}
+
+  binaries:
+    name: Build ${{ matrix.target }}
+    needs: [bump, github-release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.version }}
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: conch
+          target: ${{ matrix.target }}
+          archive: conch-${{ needs.bump.outputs.version }}-${{ matrix.target }}
+          ref: refs/tags/${{ needs.bump.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deb:
+    name: Build .deb package
+    needs: [bump, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo deb
+      - name: Upload .deb to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump.outputs.version }}
+          files: target/debian/*.deb
+
+  crates-io:
+    name: Publish to crates.io
+    needs: [bump, github-release]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: [bump, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute source tarball sha256
+        id: sha
+        run: |
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${{ needs.bump.outputs.version }}.tar.gz"
+          curl -sL "$url" -o source.tar.gz
+          echo "sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: prymul/homebrew-conch
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        run: |
+          cat > tap/Formula/conch.rb <<EOF
+          class Conch < Formula
+            desc "Conch Shell"
+            homepage "https://github.com/${{ github.repository }}"
+            url "https://github.com/${{ github.repository }}/archive/refs/tags/${{ needs.bump.outputs.version }}.tar.gz"
+            sha256 "${{ steps.sha.outputs.sha256 }}"
+            license "MIT"
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              system bin/"conch"
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/conch.rb
+          git commit -m "chore: update conch to ${{ needs.bump.outputs.version }}" || exit 0
+          git push

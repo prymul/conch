@@ -1,0 +1,36 @@
+branch_whitelist = ["main"]
+from_latest_tag = true
+ignore_merge_commits = true
+skip_ci = "[skip ci]"
+skip_untracked = true
+
+pre_bump_hooks = [
+  "perl -0777 -pi -e 's/^version = \"[^\"]*\"/version = \"{{version}}\"/' Cargo.toml",
+  "cargo build --release",
+  "git add Cargo.toml Cargo.lock",
+]
+
+post_bump_hooks = [
+  "git push",
+  "git push origin {{version}}",
+]
+
+# Local git hooks (pre-commit/pre-push/commit-msg) are owned by lefthook —
+# see lefthook.yml. `cog verify`/`cog check` run there as a commit-msg job
+# instead of being installed here via `cog install-hook`, so only one tool
+# ever manages a given .git/hooks/* file.
+
+[commit_types]
+
+[changelog]
+path = "CHANGELOG.md"
+template = "remote"
+remote = "github.com"
+owner = "prymul"
+repository = "conch"
+authors = [
+  { signature = "Mateo Elias Martinez", username = "mmat30" },
+  { signature = "Mateo Martinez", username = "mmat30" },
+]
+
+[bump_profiles]

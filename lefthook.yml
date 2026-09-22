@@ -1,0 +1,51 @@
+# Local git hook orchestration for conch.
+#
+# This is the single source of truth for the fast local gate: every command
+# below is copy-identical to what .github/workflows/ci.yml runs in CI, so
+# there is no separate "CI-only" rule set to be surprised by. Install once
+# per clone with:
+#
+#   lefthook install
+#
+# lefthook owns installation of every hook here (pre-commit, pre-push,
+# commit-msg) — don't also run `cog install-hook`, which would fight
+# lefthook over the same .git/hooks/* files. Cocogitto's own commands
+# (`cog verify`, `cog bump`, `cog changelog`) still run, just as jobs/CI
+# steps rather than as their own hook installer.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: fmt
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+
+    - name: gitleaks
+      run: gitleaks git --staged --no-banner --redact
+
+pre-push:
+  parallel: true
+  jobs:
+    - name: clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: test
+      run: cargo test --all-features
+
+    - name: gitleaks
+      run: gitleaks git --no-banner --redact
+
+commit-msg:
+  jobs:
+    - name: cog-verify
+      run: cog verify --file {1}
+      # `cog verify` rejects `fixup!`/`squash!` commit messages by design,
+      # which breaks `git commit --fixup` + `rebase --autosquash`. Skip
+      # verification for those so the workflow stays usable; the squashed,
+      # final message still gets checked when it lands for real.
+      # NOTE: {1} does not get templated inside `skip.run` (only inside
+      # `run`), so this reads the commit-msg file git itself writes rather
+      # than the {1} argument. Confirmed workaround from the maintainer:
+      # https://github.com/evilmartians/lefthook/issues/780
+      skip:
+        - run: grep -qE "^(fixup|squash)! " .git/COMMIT_EDITMSG

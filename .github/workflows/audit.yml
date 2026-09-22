@@ -1,0 +1,34 @@
+name: audit
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/audit.yml
+  schedule:
+    # Catches newly-published RustSec advisories against dependencies that
+    # haven't otherwise changed. Weekly is enough for a crate this size;
+    # tighten if the dependency count grows.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
