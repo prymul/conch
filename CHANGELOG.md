@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [0.2.0](https://github.com/prymul/conch/compare/d897add21d0305eb45910ea0883789087569d65b..0.2.0) - 2026-09-22
+#### Features
+- add a library target and mdBook user guide - ([6748849](https://github.com/prymul/conch/commit/67488498042a1a8479be2a8037c0c01f6e776252)) - [@mmat30](https://github.com/mmat30)
+#### Documentation
+- capture release-pipeline gotchas learned this session in CLAUDE.md - ([d897add](https://github.com/prymul/conch/commit/d897add21d0305eb45910ea0883789087569d65b)) - [@mmat30](https://github.com/mmat30)
+
+- - -
+
 ## [0.1.2](https://github.com/prymul/conch/compare/5d891d278ea86252a4127c80bad7a321d5e37ede..0.1.2) - 2026-09-22
 #### Bug Fixes
 - correct the pre_bump_hooks version-substitution regex - ([5d891d2](https://github.com/prymul/conch/commit/5d891d278ea86252a4127c80bad7a321d5e37ede)) - [@mmat30](https://github.com/mmat30)
