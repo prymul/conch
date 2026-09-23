@@ -300,16 +300,30 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
 /// no match means the pattern stands for itself, not an error and not an
 /// empty result).
 fn glob_field(field: Vec<Segment>, cwd: &Path) -> Result<Vec<String>, ExpandError> {
+    let has_unquoted_meta = field
+        .iter()
+        .any(|s| s.unquoted && s.text.chars().any(|c| matches!(c, '*' | '?' | '[')));
+
+    // No real wildcard anywhere in this field: skip pattern-building
+    // entirely and just concatenate the raw text. Building an escaped
+    // glob pattern here (and then un-escaping it back) only for this
+    // branch to throw the escaping away is both pointless and exactly
+    // the kind of round-trip that's easy to get subtly wrong (a literal
+    // backslash in the text would need escaping-then-unescaping too, not
+    // just the glob metacharacters).
+    if !has_unquoted_meta {
+        return Ok(vec![field.into_iter().map(|s| s.text).collect()]);
+    }
+
+    // A real wildcard is present: build a pattern where quoted
+    // metacharacters (and literal backslashes) are escaped so they match
+    // themselves rather than acting as wildcards.
     let mut pattern = String::new();
-    let mut has_unquoted_meta = false;
     for segment in &field {
         for c in segment.text.chars() {
             if segment.unquoted && matches!(c, '*' | '?' | '[') {
-                has_unquoted_meta = true;
                 pattern.push(c);
             } else if matches!(c, '*' | '?' | '[' | '\\') {
-                // A metacharacter from a quoted segment (or a literal
-                // backslash) must match itself, not act as a wildcard.
                 pattern.push('\\');
                 pattern.push(c);
             } else {
@@ -318,21 +332,12 @@ fn glob_field(field: Vec<Segment>, cwd: &Path) -> Result<Vec<String>, ExpandErro
         }
     }
 
-    if !has_unquoted_meta {
-        return Ok(vec![
-            pattern
-                .replace("\\*", "*")
-                .replace("\\?", "?")
-                .replace("\\[", "["),
-        ]);
-    }
-
     let mut matches = glob_match_dir(cwd, &pattern);
     if matches.is_empty() {
-        let literal = pattern
-            .replace("\\*", "*")
-            .replace("\\?", "?")
-            .replace("\\[", "[");
+        // No match: POSIX default is the pattern stands for itself,
+        // literally — reverse the escaping above exactly (including a
+        // literal backslash, not just the three glob metacharacters).
+        let literal: String = field.into_iter().map(|s| s.text).collect();
         return Ok(vec![literal]);
     }
     matches.sort();
