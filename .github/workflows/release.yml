@@ -106,14 +106,18 @@ jobs:
     needs: [bump, github-release]
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      id-token: write # required for crates.io Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.bump.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish workspace crates in dependency order
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -e
           # conch-shell (the binary) depends on the other four via path+version,
@@ -121,6 +125,11 @@ jobs:
           # crate that depends on it — publish leaves-first. A short sleep
           # after each publish gives the crates.io index a moment to catch up
           # before the next crate's dependency resolution needs to see it.
+          # The token above is a single 30-minute Trusted Publishing token,
+          # valid for every crate that has a matching trusted-publisher
+          # config for this repo/workflow/environment (each of the 5 needs
+          # its own config on crates.io — same GitHub fields, different
+          # crate name each time), not scoped to a single crate.
           for pkg in conch-shell-lexer conch-shell-parser conch-shell-core conch-shell-builtins conch-shell; do
             cargo publish -p "$pkg"
             sleep 15
