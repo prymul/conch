@@ -10,7 +10,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+# Kept in sync with main's already-published/tagged version (a bump landed
+# there for the docs/mdBook PR while this workspace conversion was in
+# flight on dev) so version numbering stays monotonic — the next release
+# becomes 0.3.0, correctly containing the actual Phase 1 shell rather than
+# clashing with the 0.2.0 already on crates.io.
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/prymul/conch"
@@ -18,7 +23,7 @@ homepage = "https://github.com/prymul/conch"
 authors = ["Mateo Elias Martinez"]
 
 [workspace.dependencies]
-conch-shell-lexer = { path = "crates/conch-lexer", version = "0.1.1" }
-conch-shell-parser = { path = "crates/conch-parser", version = "0.1.1" }
-conch-shell-core = { path = "crates/conch-core", version = "0.1.1" }
-conch-shell-builtins = { path = "crates/conch-builtins", version = "0.1.1" }
+conch-shell-lexer = { path = "crates/conch-lexer", version = "0.2.0" }
+conch-shell-parser = { path = "crates/conch-parser", version = "0.2.0" }
+conch-shell-core = { path = "crates/conch-core", version = "0.2.0" }
+conch-shell-builtins = { path = "crates/conch-builtins", version = "0.2.0" }
