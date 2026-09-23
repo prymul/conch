@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "conch-difftest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "conch-shell"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "conch-shell-builtins",
  "conch-shell-core",
@@ -50,14 +50,14 @@ dependencies = [
 
 [[package]]
 name = "conch-shell-builtins"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "conch-shell-core",
 ]
 
 [[package]]
 name = "conch-shell-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "conch-shell-parser",
  "thiserror",
@@ -65,14 +65,14 @@ dependencies = [
 
 [[package]]
 name = "conch-shell-lexer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "conch-shell-parser"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "conch-shell-lexer",
  "thiserror",

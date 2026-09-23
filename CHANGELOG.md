@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [0.3.0](https://github.com/prymul/conch/compare/b69286f81b08f23724b656e7173ad9261d7923f7..0.3.0) - 2026-09-23
+#### Features
+- Phase 1 shell — lexer, parser, executor, and 100/100 differential tests - ([bbeba03](https://github.com/prymul/conch/commit/bbeba036b59252d7696a8e56a60e68500c349477)) - [@mmat30](https://github.com/mmat30)
+- convert to a Cargo workspace and add Shell/Builtin core for Phase 1 - ([b69286f](https://github.com/prymul/conch/commit/b69286f81b08f23724b656e7173ad9261d7923f7)) - [@mmat30](https://github.com/mmat30)
+#### Continuous Integration
+- make the differential test suite a hard gate - ([2ffe6c5](https://github.com/prymul/conch/commit/2ffe6c53ec09d3ded8ca47b4f309bb1526b1ef40)) - [@mmat30](https://github.com/mmat30)
+
+- - -
+
 ## [0.2.0](https://github.com/prymul/conch/compare/d897add21d0305eb45910ea0883789087569d65b..0.2.0) - 2026-09-22
 #### Features
 - add a library target and mdBook user guide - ([6748849](https://github.com/prymul/conch/commit/67488498042a1a8479be2a8037c0c01f6e776252)) - [@mmat30](https://github.com/mmat30)
