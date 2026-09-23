@@ -171,7 +171,7 @@ jobs:
             end
 
             test do
-              system bin/"conch"
+              system bin/"conch", "-c", "exit 0"
             end
           end
           EOF
