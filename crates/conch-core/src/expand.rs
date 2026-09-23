@@ -18,10 +18,24 @@
 //! `*` that happened to be *inside* `$X`'s value must not be, even though
 //! both end up adjacent in the same field. Collapsing a word to a flat
 //! `String` before splitting/globbing loses exactly the information needed
-//! to tell those apart. This module keeps each expanded piece tagged with
-//! whether it came from an unquoted position (see [`Segment`]) all the way
-//! through splitting, and glob-escapes the quoted pieces before pattern
-//! matching rather than losing the distinction.
+//! to tell those apart. This module keeps each expanded piece tagged (see
+//! [`Segment`]) all the way through splitting, and glob-escapes the quoted
+//! pieces before pattern matching rather than losing the distinction.
+//!
+//! ## Splitting and globbing eligibility are not the same flag
+//!
+//! POSIX 2.6.5 only subjects the *results of parameter, command, and
+//! arithmetic expansion* to `IFS` field splitting — never literal source
+//! text. That matters here because the lexer has already resolved word
+//! boundaries (and backslash-escapes) for literal text by the time it
+//! reaches this module: a `Literal` segment can only contain whitespace
+//! that was backslash-escaped in the source (an unescaped space would have
+//! ended the word at the lexer level), so re-splitting on it would be
+//! wrong. Pathname expansion, on the other hand, *does* apply to literal
+//! unquoted text (`echo *.txt` must glob). So each [`Segment`] carries two
+//! independent eligibility flags rather than one `unquoted` bit: literal
+//! text is glob-eligible but never split-eligible, while an unquoted
+//! expansion result is both.
 
 use std::path::Path;
 
@@ -41,14 +55,22 @@ pub enum ExpandError {
     CommandSubstitutionFailed(String),
 }
 
-/// One piece of an expanded word, tagged with whether it came from an
-/// unquoted position (eligible for field splitting and pathname
-/// expansion) or a quoted one (never split, and its metacharacters are
-/// always literal, even inside a pattern built from a mix of both).
+/// One piece of an expanded word, tagged with its splitting/globbing
+/// eligibility (see the module docs for why these are two separate
+/// flags rather than one `unquoted` bit). A quoted segment always has
+/// both `false`: never split, and its metacharacters are always literal,
+/// even inside a pattern built from a mix of quoted and unquoted pieces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Segment {
     text: String,
-    unquoted: bool,
+    /// Eligible for pathname expansion (globbing) if it contains `*`,
+    /// `?`, or `[` — true for unquoted literal text and unquoted
+    /// expansion results alike.
+    glob_eligible: bool,
+    /// Eligible for `IFS` field splitting — true only for the unquoted
+    /// result of parameter/command/arithmetic expansion (POSIX 2.6.5),
+    /// never for literal source text.
+    split_eligible: bool,
 }
 
 /// Expands `word` to a single field: tilde and parameter/command/
@@ -100,13 +122,19 @@ fn expand_to_segments(word: &Word, shell: &mut Shell) -> Result<Vec<Segment>, Ex
             && (rest.is_empty() || rest.starts_with('/'))
             && let Some(home) = shell.get_var("HOME")
         {
+            // Tilde expansion isn't one of POSIX 2.6.5's three
+            // split-eligible expansions, so its result is never split —
+            // but it's plain unquoted text, so it stays glob-eligible
+            // (matching how literal text is treated below).
             segments.push(Segment {
                 text: home.to_string(),
-                unquoted: true,
+                glob_eligible: true,
+                split_eligible: false,
             });
             segments.push(Segment {
                 text: rest.to_string(),
-                unquoted: true,
+                glob_eligible: true,
+                split_eligible: false,
             });
             continue;
         }
@@ -122,16 +150,23 @@ fn expand_segment(
 ) -> Result<(), ExpandError> {
     match segment {
         WordSegment::Literal(text) => {
+            // Literal source text: the lexer has already resolved word
+            // boundaries (and backslash-escapes) for it, so any
+            // whitespace still present here was necessarily escaped and
+            // must never be re-split — but it's still eligible for
+            // pathname expansion (`echo *.txt`).
             out.push(Segment {
                 text: text.clone(),
-                unquoted: true,
+                glob_eligible: true,
+                split_eligible: false,
             });
             Ok(())
         }
         WordSegment::SingleQuoted(text) => {
             out.push(Segment {
                 text: text.clone(),
-                unquoted: false,
+                glob_eligible: false,
+                split_eligible: false,
             });
             Ok(())
         }
@@ -146,7 +181,8 @@ fn expand_segment(
                 let mut nested = Vec::new();
                 expand_segment(segment, shell, &mut nested)?;
                 for mut piece in nested {
-                    piece.unquoted = false;
+                    piece.glob_eligible = false;
+                    piece.split_eligible = false;
                     out.push(piece);
                 }
             }
@@ -155,14 +191,16 @@ fn expand_segment(
         WordSegment::Parameter(param) => {
             out.push(Segment {
                 text: expand_parameter(param, shell),
-                unquoted: true,
+                glob_eligible: true,
+                split_eligible: true,
             });
             Ok(())
         }
         WordSegment::CommandSubstitution(sub) => {
             out.push(Segment {
                 text: run_command_substitution(&sub.body, shell)?,
-                unquoted: true,
+                glob_eligible: true,
+                split_eligible: true,
             });
             Ok(())
         }
@@ -217,9 +255,11 @@ fn run_command_substitution(body: &str, shell: &Shell) -> Result<String, ExpandE
 }
 
 /// Splits `segments` into fields on `ifs` characters, per POSIX 2.6.5.
-/// Only text from `unquoted` segments is ever split on; a quoted segment
-/// is never split and always attaches to whichever field its neighbors
-/// place it in, even if its own text contains `IFS` characters.
+/// Only text from `split_eligible` segments is ever split on — the
+/// unquoted result of a parameter/command/arithmetic expansion. Every
+/// other segment (literal source text, quoted text) is never split and
+/// always attaches to whichever field its neighbors place it in, even if
+/// its own text contains `IFS` characters.
 ///
 /// Simplification: POSIX distinguishes `IFS` whitespace (which collapses
 /// runs and is trimmed at field edges) from other `IFS` characters (each
@@ -245,19 +285,21 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
     let mut current_has_content = false;
 
     for segment in segments {
-        if !segment.unquoted {
+        if !segment.split_eligible {
             current.push(segment);
             current_has_content = true;
             continue;
         }
 
+        let glob_eligible = segment.glob_eligible;
         let mut piece = String::new();
         for c in segment.text.chars() {
             if is_ifs_ws(c) {
                 if !piece.is_empty() {
                     current.push(Segment {
                         text: std::mem::take(&mut piece),
-                        unquoted: true,
+                        glob_eligible,
+                        split_eligible: true,
                     });
                     current_has_content = true;
                 }
@@ -269,7 +311,8 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
                 if !piece.is_empty() {
                     current.push(Segment {
                         text: std::mem::take(&mut piece),
-                        unquoted: true,
+                        glob_eligible,
+                        split_eligible: true,
                     });
                 }
                 fields.push(std::mem::take(&mut current));
@@ -281,7 +324,8 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
         if !piece.is_empty() {
             current.push(Segment {
                 text: piece,
-                unquoted: true,
+                glob_eligible,
+                split_eligible: true,
             });
             current_has_content = true;
         }
@@ -302,7 +346,7 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
 fn glob_field(field: Vec<Segment>, cwd: &Path) -> Result<Vec<String>, ExpandError> {
     let has_unquoted_meta = field
         .iter()
-        .any(|s| s.unquoted && s.text.chars().any(|c| matches!(c, '*' | '?' | '[')));
+        .any(|s| s.glob_eligible && s.text.chars().any(|c| matches!(c, '*' | '?' | '[')));
 
     // No real wildcard anywhere in this field: skip pattern-building
     // entirely and just concatenate the raw text. Building an escaped
@@ -321,7 +365,7 @@ fn glob_field(field: Vec<Segment>, cwd: &Path) -> Result<Vec<String>, ExpandErro
     let mut pattern = String::new();
     for segment in &field {
         for c in segment.text.chars() {
-            if segment.unquoted && matches!(c, '*' | '?' | '[') {
+            if segment.glob_eligible && matches!(c, '*' | '?' | '[') {
                 pattern.push(c);
             } else if matches!(c, '*' | '?' | '[' | '\\') {
                 pattern.push('\\');
