@@ -55,12 +55,13 @@ jobs:
   # member), but this job's `--nocapture` surfaces the harness's own
   # categorized report (see runner::print_report) in CI logs.
   #
-  # By default this stays green even when the conch binary can't yet run
-  # real scripts -- see tests/conch-difftest/README.md ("Wiring in real
-  # execution") for exactly how to flip CONCH_DIFFTEST_STRICT=1 here once
-  # Phase 1 execution semantics land and this should become a hard gate.
+  # CONCH_DIFFTEST_STRICT=1 makes a failing corpus case fail the build.
+  # Phase 1 execution has landed and the corpus is 100/100 against real
+  # bash/sh, so this is now a hard gate rather than report-only.
   difftest:
     runs-on: ubuntu-latest
+    env:
+      CONCH_DIFFTEST_STRICT: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -69,4 +70,5 @@ jobs:
         run: |
           bash --version | head -1
           sh -c 'echo sh ok'
+      - run: cargo build --release
       - run: cargo test -p conch-difftest --all-features -- --nocapture
