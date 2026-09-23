@@ -1,0 +1,10 @@
+[package]
+name = "conch-shell-builtins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Builtin commands (cd, export, echo, ...) for the conch shell"
+repository.workspace = true
+
+[dependencies]
+conch-shell-core = { workspace = true }

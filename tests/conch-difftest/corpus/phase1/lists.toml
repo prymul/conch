@@ -1,0 +1,76 @@
+# Phase 1 -- command lists: `;`, `&&`, `||`, and their left-to-right,
+# short-circuiting interaction. `&` (background) is Phase 4 (job control)
+# and isn't exercised here.
+
+[[case]]
+name = "semicolon-sequences-commands"
+description = "`;` runs commands one after another regardless of exit status"
+tags = ["lists"]
+oracles = ["bash", "sh"]
+script = '''
+echo one; echo two; echo three
+'''
+
+[[case]]
+name = "and-list-runs-rhs-on-success"
+description = "`&&` runs its right-hand side only when the left-hand side succeeds"
+tags = ["lists", "short-circuit"]
+oracles = ["bash", "sh"]
+script = '''
+true && echo yes
+'''
+
+[[case]]
+name = "and-list-skips-rhs-on-failure"
+description = "`&&` skips its right-hand side when the left-hand side fails"
+tags = ["lists", "short-circuit"]
+oracles = ["bash", "sh"]
+script = '''
+false && echo should-not-print
+echo after
+'''
+
+[[case]]
+name = "or-list-runs-rhs-on-failure"
+description = "`||` runs its right-hand side only when the left-hand side fails"
+tags = ["lists", "short-circuit"]
+oracles = ["bash", "sh"]
+script = '''
+false || echo fallback
+'''
+
+[[case]]
+name = "or-list-skips-rhs-on-success"
+description = "`||` skips its right-hand side when the left-hand side succeeds"
+tags = ["lists", "short-circuit"]
+oracles = ["bash", "sh"]
+script = '''
+true || echo should-not-print
+'''
+
+[[case]]
+name = "and-then-or-left-to-right-success-path"
+description = "`&&`/`||` chain left to right: a succeeding first clause takes the `&&` branch and skips the trailing `||` branch"
+tags = ["lists", "short-circuit"]
+oracles = ["bash", "sh"]
+script = '''
+true && echo a || echo b
+'''
+
+[[case]]
+name = "and-then-or-left-to-right-failure-path"
+description = "`&&`/`||` chain left to right: a failing first clause skips the `&&` branch and falls through to the `||` branch"
+tags = ["lists", "short-circuit"]
+oracles = ["bash", "sh"]
+script = '''
+false && echo a || echo b
+'''
+
+[[case]]
+name = "semicolon-preserves-individual-exit-status-tracking"
+description = "each `;`-separated command updates $? independently"
+tags = ["lists", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+false; echo $?; true; echo $?
+'''

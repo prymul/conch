@@ -1,0 +1,11 @@
+[package]
+name = "conch-shell-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shell state, execution engine, and builtin registry, used internally by the conch shell"
+repository.workspace = true
+
+[dependencies]
+conch-shell-parser = { workspace = true }
+thiserror = "2"

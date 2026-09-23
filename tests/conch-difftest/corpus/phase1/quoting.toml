@@ -1,0 +1,40 @@
+# Phase 1 -- quoting: single vs. double quotes and how adjacent
+# quoted/unquoted segments concatenate into one word. Variable-expansion
+# interaction with quoting lives in expansion.toml instead, to keep these
+# cases decoupled from expansion correctness.
+
+[[case]]
+name = "single-quotes-suppress-expansion"
+description = "single quotes suppress $-expansion; the literal text (including the $) is preserved"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+echo 'no expansion of $HOME here'
+'''
+
+[[case]]
+name = "hash-inside-single-quotes-is-literal"
+description = "a `#` inside single quotes is not a comment marker"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+echo 'value # not a comment'
+'''
+
+[[case]]
+name = "double-quotes-preserve-internal-spacing"
+description = "a double-quoted word with no expansion characters is still a single argument with its internal spacing intact"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+printf '[%s]\n' "a  b   c"
+'''
+
+[[case]]
+name = "adjacent-quotes-concatenate-into-one-word"
+description = "unquoted, single-quoted, and double-quoted segments with no space between them concatenate into a single argument"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+printf '[%s]\n' foo'bar'"baz"
+'''

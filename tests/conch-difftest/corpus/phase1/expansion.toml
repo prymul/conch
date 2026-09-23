@@ -1,0 +1,67 @@
+# Phase 1 -- variable expansion: `$VAR`/`${VAR}` in their simple form only
+# (per the Phase 1 plan). Deliberately NOT covered here:
+#   - unquoted-expansion word splitting on IFS (explicitly Phase 2 scope:
+#     "word splitting via IFS"). Every case here either double-quotes the
+#     expansion or expands a single-word value, so it doesn't depend on
+#     whether IFS splitting is implemented yet.
+#   - `${VAR:-default}` and the other parameter-expansion operators
+#     (Phase 2).
+
+[[case]]
+name = "simple-dollar-var-expansion"
+description = "$VAR expands to the value most recently assigned"
+tags = ["expansion"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello
+echo $x
+'''
+
+[[case]]
+name = "braced-var-expansion"
+description = "${VAR} is equivalent to $VAR when not immediately followed by more identifier characters"
+tags = ["expansion"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello
+echo ${x}
+'''
+
+[[case]]
+name = "braces-needed-to-append-literal-suffix"
+description = "${x}bar appends the literal suffix after expanding x, which $xbar could not do"
+tags = ["expansion"]
+oracles = ["bash", "sh"]
+script = '''
+x=foo
+echo ${x}bar
+'''
+
+[[case]]
+name = "bare-dollar-var-name-is-maximal-munch"
+description = "$xbar looks up a variable literally named xbar, not x followed by literal bar -- the contrasting case to braces-needed-to-append-literal-suffix"
+tags = ["expansion"]
+oracles = ["bash", "sh"]
+script = '''
+xbar=uhoh
+echo $xbar
+'''
+
+[[case]]
+name = "unset-var-expands-to-empty-string"
+description = "expanding an unset variable substitutes nothing (not an error, no :- operator involved)"
+tags = ["expansion"]
+oracles = ["bash", "sh"]
+script = '''
+echo before-${undefined_conch_difftest_var}-after
+'''
+
+[[case]]
+name = "double-quoted-var-preserves-internal-spacing"
+description = "a double-quoted expansion of a value containing internal spaces stays a single argument"
+tags = ["expansion", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+x="a   b"
+printf '[%s]\n' "$x"
+'''

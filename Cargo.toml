@@ -1,28 +1,29 @@
-[package]
-name = "conch-shell"
+[workspace]
+resolver = "3"
+members = [
+    "crates/conch-lexer",
+    "crates/conch-parser",
+    "crates/conch-core",
+    "crates/conch-builtins",
+    "crates/conch",
+    "tests/conch-difftest",
+]
+
+[workspace.package]
+# Kept in sync with main's already-published/tagged version (a bump landed
+# there for the docs/mdBook PR while this workspace conversion was in
+# flight on dev) so version numbering stays monotonic — the next release
+# becomes 0.3.0, correctly containing the actual Phase 1 shell rather than
+# clashing with the 0.2.0 already on crates.io.
 version = "0.2.0"
 edition = "2024"
-description = "Conch Shell"
 license = "MIT"
 repository = "https://github.com/prymul/conch"
 homepage = "https://github.com/prymul/conch"
-readme = "README.md"
 authors = ["Mateo Elias Martinez"]
 
-[[bin]]
-name = "conch"
-path = "src/main.rs"
-
-[dependencies]
-
-[package.metadata.deb]
-maintainer = "Mateo Elias Martinez <mateo.martinez.spc@icloud.com>"
-copyright = "2026, prymul"
-license-file = ["LICENSE", "4"]
-extended-description = "Conch Shell"
-depends = "$auto"
-section = "utils"
-priority = "optional"
-assets = [
-    ["target/release/conch", "usr/bin/", "755"],
-]
+[workspace.dependencies]
+conch-shell-lexer = { path = "crates/conch-lexer", version = "0.2.0" }
+conch-shell-parser = { path = "crates/conch-parser", version = "0.2.0" }
+conch-shell-core = { path = "crates/conch-core", version = "0.2.0" }
+conch-shell-builtins = { path = "crates/conch-builtins", version = "0.2.0" }

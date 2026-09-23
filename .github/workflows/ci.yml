@@ -47,3 +47,28 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  # Runs the conch-vs-bash/sh differential test suite (tests/conch-difftest)
+  # as its own labeled job so its pass/fail/skip counts are trackable
+  # independently of the general `test` job. `cargo test --all-features`
+  # above already exercises this crate too (it's a normal workspace
+  # member), but this job's `--nocapture` surfaces the harness's own
+  # categorized report (see runner::print_report) in CI logs.
+  #
+  # CONCH_DIFFTEST_STRICT=1 makes a failing corpus case fail the build.
+  # Phase 1 execution has landed and the corpus is 100/100 against real
+  # bash/sh, so this is now a hard gate rather than report-only.
+  difftest:
+    runs-on: ubuntu-latest
+    env:
+      CONCH_DIFFTEST_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify oracle shells are available
+        run: |
+          bash --version | head -1
+          sh -c 'echo sh ok'
+      - run: cargo build --release
+      - run: cargo test -p conch-difftest --all-features -- --nocapture

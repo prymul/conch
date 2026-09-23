@@ -1,0 +1,127 @@
+# Phase 1 -- simple commands: basic external-command dispatch, `$?` exit
+# status propagation, comments, and the lexer-level quoting/backslash
+# rules that apply even to a single unpiped command.
+#
+# Deliberately NOT covered here (out of Phase 1 scope, see
+# ../../README.md#scoping-notes):
+#   - `echo -n`/`echo -e` flags: not promised by the Phase 1 plan, and
+#     bash/dash/POSIX `echo` already disagree with each other on these, so
+#     conch's behavior here is an open design question, not yet a
+#     regression target.
+#   - leading `NAME=value command` prefix assignments: ambiguous whether
+#     Phase 1's "simple commands" grammar includes this POSIX production.
+
+[[case]]
+name = "echo-basic"
+description = "echo prints its arguments separated by single spaces"
+tags = ["builtins", "echo"]
+oracles = ["bash", "sh"]
+script = '''
+echo hello world
+'''
+
+[[case]]
+name = "echo-no-args"
+description = "echo with no arguments prints just a newline"
+tags = ["builtins", "echo"]
+oracles = ["bash", "sh"]
+script = '''
+echo
+'''
+
+[[case]]
+name = "echo-joins-multiple-args-with-single-space"
+description = "echo re-joins its argument list with exactly one space, regardless of original spacing"
+tags = ["builtins", "echo"]
+oracles = ["bash", "sh"]
+script = '''
+echo a b c
+'''
+
+[[case]]
+name = "exit-status-of-true-is-zero"
+description = "$? reflects the previous command's exit status"
+tags = ["exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+true
+echo $?
+'''
+
+[[case]]
+name = "exit-status-of-false-is-one"
+description = "$? reflects a failing command's non-zero exit status"
+tags = ["exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+false
+echo $?
+'''
+
+[[case]]
+name = "command-not-found-exit-code"
+description = "an unresolvable command exits 127; both bash and dash agree on the code even though their stderr wording differs, which is exactly why stderr isn't in the default compare set"
+tags = ["exit-status"]
+oracles = ["bash", "sh"]
+note = "stderr wording differs across shells (verified: bash says 'command not found', dash says 'not found') -- intentionally not compared"
+script = '''
+nonexistent-cmd-conch-difftest-xyz
+echo $?
+'''
+
+[[case]]
+name = "comment-lines-are-ignored"
+description = "a `#` starts a comment to end of line; comment-only lines execute nothing"
+tags = ["lexer", "comments"]
+oracles = ["bash", "sh"]
+script = '''
+echo shown # trailing comment
+# whole line comment
+echo also-shown
+'''
+
+[[case]]
+name = "hash-inside-double-quotes-is-literal"
+description = "a `#` inside double quotes is not a comment marker"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+echo "value # not a comment"
+'''
+
+[[case]]
+name = "printf-word-splitting-unquoted"
+description = "multiple literal spaces between unquoted words are just token separators, producing separate arguments"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+printf '[%s]\n' unquoted   spacing
+'''
+
+[[case]]
+name = "printf-double-quote-preserves-internal-spacing"
+description = "a double-quoted word is a single argument, internal spacing intact"
+tags = ["lexer", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+printf '[%s]\n' "quoted   spacing"
+'''
+
+[[case]]
+name = "backslash-escapes-space-in-unquoted-word"
+description = "a backslash-escaped space stays part of the same word instead of separating it"
+tags = ["lexer", "quoting", "backslash"]
+oracles = ["bash", "sh"]
+script = '''
+printf '[%s]\n' foo\ bar
+'''
+
+[[case]]
+name = "backslash-newline-is-line-continuation"
+description = "a backslash immediately followed by a newline is removed entirely, joining the next line onto the current token"
+tags = ["lexer", "backslash"]
+oracles = ["bash", "sh"]
+script = '''
+echo foo\
+bar
+'''

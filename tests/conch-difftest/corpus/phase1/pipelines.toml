@@ -1,0 +1,50 @@
+# Phase 1 -- pipelines: `|` wiring between external commands, and default
+# (non-`pipefail`) exit-status semantics. `set -o pipefail` itself is a
+# Phase 5 builtin (`set`), so these cases only exercise the default.
+
+[[case]]
+name = "two-stage-pipe-sort"
+description = "stdout of the first command becomes stdin of the second"
+tags = ["pipelines"]
+oracles = ["bash", "sh"]
+script = '''
+printf 'b\na\nc\n' | sort
+'''
+
+[[case]]
+name = "three-stage-pipe-sort-uniq"
+description = "a pipeline can chain more than two stages"
+tags = ["pipelines"]
+oracles = ["bash", "sh"]
+script = '''
+printf 'a\nb\na\nc\nb\n' | sort | uniq
+'''
+
+[[case]]
+name = "pipe-with-grep-filters-lines"
+description = "a filtering command in the middle of a pipe works as expected"
+tags = ["pipelines"]
+oracles = ["bash", "sh"]
+script = '''
+printf 'apple\nbanana\navocado\n' | grep '^a'
+'''
+
+[[case]]
+name = "pipeline-exit-status-is-last-command"
+description = "without pipefail, a pipeline's exit status is that of its last stage, even if an earlier stage failed"
+tags = ["pipelines", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+false | true
+echo $?
+'''
+
+[[case]]
+name = "pipeline-exit-status-reflects-failing-last-command"
+description = "a pipeline's exit status is that of its last stage, even if earlier stages succeeded"
+tags = ["pipelines", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+true | false
+echo $?
+'''
