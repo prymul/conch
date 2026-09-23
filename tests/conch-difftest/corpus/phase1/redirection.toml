@@ -1,0 +1,63 @@
+# Phase 1 -- redirection: `>`, `>>`, `<`. These cases only ever read back
+# file *contents*, never a path itself, so they don't need
+# `normalize = ["workdir"]` -- see builtins.toml for cases that do (cd/pwd).
+#
+# Note on the wc-based case: this harness never hardcodes a golden
+# expected value for external-command output. Since both conch's and the
+# oracle's invocation of `wc` run against the *same* `wc` binary on the
+# same machine, any formatting quirk (GNU vs. BSD column padding, etc.)
+# is identical on both sides of a live comparison -- it would only matter
+# for a pinned-golden-output test, which this harness deliberately avoids
+# for exactly this reason.
+
+[[case]]
+name = "output-redirect-truncates"
+description = "`>` truncates the target file on each use"
+tags = ["redirection"]
+oracles = ["bash", "sh"]
+script = '''
+echo first > out.txt
+echo second > out.txt
+cat out.txt
+'''
+
+[[case]]
+name = "output-redirect-append"
+description = "`>>` appends rather than truncating"
+tags = ["redirection"]
+oracles = ["bash", "sh"]
+script = '''
+echo first > out.txt
+echo second >> out.txt
+cat out.txt
+'''
+
+[[case]]
+name = "append-creates-file-if-missing"
+description = "`>>` creates the target file when it doesn't already exist"
+tags = ["redirection"]
+oracles = ["bash", "sh"]
+script = '''
+echo only >> out.txt
+cat out.txt
+'''
+
+[[case]]
+name = "input-redirect-feeds-stdin"
+description = "`<` feeds a file's contents to the command's stdin"
+tags = ["redirection"]
+oracles = ["bash", "sh"]
+script = '''
+printf 'line1\nline2\n' > in.txt
+cat < in.txt
+'''
+
+[[case]]
+name = "input-redirect-with-external-command"
+description = "`<` composes with an external command that reads stdin (not just cat)"
+tags = ["redirection"]
+oracles = ["bash", "sh"]
+script = '''
+printf 'line1\nline2\nline3\n' > in.txt
+wc -l < in.txt
+'''

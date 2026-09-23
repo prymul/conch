@@ -1,0 +1,23 @@
+[package]
+name = "conch-difftest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Differential test harness: runs the same script through conch and a real oracle shell (bash/sh) and diffs the result"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tempfile = "3"
+
+# Deliberately no dependency on `conch-shell` (the binary's package):
+# it's bin-only (no `[lib]` target), which Cargo can't link against, so a
+# normal path dependency here is silently dropped rather than making
+# Cargo set `CARGO_BIN_EXE_conch` -- confirmed while building this crate.
+# Cargo's artifact-dependencies (`bindeps`) feature is the real fix for
+# this shape of problem but is still nightly-only (`-Z bindeps`, also
+# confirmed against the toolchain this repo pins). `invoke::find_conch_binary`
+# instead locates `target/{release,debug}/conch` relative to the
+# workspace root directly -- see its doc comment and README.md ("Wiring
+# in real execution").

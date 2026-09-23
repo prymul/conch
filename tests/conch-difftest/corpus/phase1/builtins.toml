@@ -1,0 +1,67 @@
+# Phase 1 -- builtins: cd, exit, export, pwd. (echo is exercised in
+# simple_commands.toml.) `cd`/`pwd` cases need `normalize = ["workdir"]`
+# since every run happens in its own freshly created temp directory --
+# see ../../README.md#non-determinism-and-normalization.
+
+[[case]]
+name = "export-makes-var-visible-to-child-process"
+description = "export places a variable into the environment of subsequently launched child processes, provable via an external command (printenv) that only sees the real process environment"
+tags = ["builtins", "export"]
+oracles = ["bash", "sh"]
+script = '''
+export GREETING=hi
+printenv GREETING
+'''
+
+[[case]]
+name = "unexported-var-not-visible-to-child-process"
+description = "a shell variable that was never exported is not in a child process's environment"
+tags = ["builtins", "export"]
+oracles = ["bash", "sh"]
+script = '''
+GREETING=hi
+printenv GREETING
+'''
+
+[[case]]
+name = "cd-then-pwd-reflects-new-directory"
+description = "cd changes the shell's working directory, which pwd then reflects"
+tags = ["builtins", "cd", "pwd"]
+oracles = ["bash", "sh"]
+normalize = ["workdir"]
+script = '''
+mkdir sub
+cd sub
+pwd
+'''
+
+[[case]]
+name = "pwd-alone-prints-cwd"
+description = "pwd with no arguments prints the absolute current working directory"
+tags = ["builtins", "pwd"]
+oracles = ["bash", "sh"]
+normalize = ["workdir"]
+script = '''
+pwd
+'''
+
+[[case]]
+name = "exit-with-explicit-code"
+description = "exit N terminates the shell with exit status N"
+tags = ["builtins", "exit"]
+oracles = ["bash", "sh"]
+compare = ["exit-code"]
+script = '''
+exit 7
+'''
+
+[[case]]
+name = "exit-with-no-args-uses-last-status"
+description = "exit with no argument uses the exit status of the most recently executed command"
+tags = ["builtins", "exit"]
+oracles = ["bash", "sh"]
+compare = ["exit-code"]
+script = '''
+false
+exit
+'''

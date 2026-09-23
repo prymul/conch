@@ -47,3 +47,26 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  # Runs the conch-vs-bash/sh differential test suite (tests/conch-difftest)
+  # as its own labeled job so its pass/fail/skip counts are trackable
+  # independently of the general `test` job. `cargo test --all-features`
+  # above already exercises this crate too (it's a normal workspace
+  # member), but this job's `--nocapture` surfaces the harness's own
+  # categorized report (see runner::print_report) in CI logs.
+  #
+  # By default this stays green even when the conch binary can't yet run
+  # real scripts -- see tests/conch-difftest/README.md ("Wiring in real
+  # execution") for exactly how to flip CONCH_DIFFTEST_STRICT=1 here once
+  # Phase 1 execution semantics land and this should become a hard gate.
+  difftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify oracle shells are available
+        run: |
+          bash --version | head -1
+          sh -c 'echo sh ok'
+      - run: cargo test -p conch-difftest --all-features -- --nocapture

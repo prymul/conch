@@ -16,6 +16,7 @@ path = "src/main.rs"
 conch-shell-parser = { workspace = true }
 conch-shell-core = { workspace = true }
 conch-shell-builtins = { workspace = true }
+rustyline = "18"
 
 [package.metadata.deb]
 maintainer = "Mateo Elias Martinez <mateo.martinez.spc@icloud.com>"

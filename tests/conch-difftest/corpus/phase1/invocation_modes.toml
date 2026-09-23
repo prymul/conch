@@ -1,0 +1,50 @@
+# Phase 1 -- invocation modes: `-c`, script-file, and a non-PTY stdin-pipe
+# proxy for interactive-style input. True PTY-based interactive testing
+# (prompts, line editing, a fixed 24x80 terminal a la brush's e2e suite)
+# is out of scope until a later phase's line-editing/prompt work exists --
+# see ../../README.md#interactive-mode-scoping.
+
+[[case]]
+name = "dash-c-executes-inline-script"
+description = "`conch -c '<script>'` executes the script and exits"
+tags = ["invocation"]
+oracles = ["bash", "sh"]
+invocation = "dash-c"
+script = '''
+echo via dash c
+'''
+
+[[case]]
+name = "script-file-executes-multiple-commands"
+description = "`conch script.sh` executes every command in the file in order"
+tags = ["invocation"]
+oracles = ["bash", "sh"]
+invocation = "script-file"
+script = '''
+echo one
+echo two
+echo three
+'''
+
+[[case]]
+name = "script-file-propagates-exit-code"
+description = "the process exit code of script-file mode reflects the script's final command"
+tags = ["invocation", "exit-status"]
+oracles = ["bash", "sh"]
+invocation = "script-file"
+compare = ["stdout", "exit-code"]
+script = '''
+echo before exit
+exit 3
+'''
+
+[[case]]
+name = "stdin-pipe-executes-piped-commands"
+description = "commands piped in over stdin (non-interactively) execute in order, proxying interactive-style input without requiring a real PTY"
+tags = ["invocation"]
+oracles = ["bash", "sh"]
+invocation = "stdin-pipe"
+script = '''
+echo via stdin
+echo more
+'''

@@ -7,3 +7,4 @@ description = "POSIX/bash-compatible shell tokenizer, used internally by the con
 repository.workspace = true
 
 [dependencies]
+thiserror = "2"

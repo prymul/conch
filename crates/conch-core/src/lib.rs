@@ -1,11 +1,14 @@
-//! Shell state and the builtin-command registry.
-//!
-//! The executor (spawning external commands, wiring pipelines and
-//! redirection) is added once `conch-parser`'s AST lands; this module
-//! defines the pieces that don't depend on it.
+//! Shell state, word expansion, and the command executor.
+
+mod exec;
+mod expand;
+
+pub use exec::exec_command_list;
+pub use expand::{ExpandError, expand_word};
 
 use std::collections::HashMap;
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Mutable state for one shell session.
@@ -53,6 +56,15 @@ impl Shell {
     pub fn builtin(&self, name: &str) -> Option<&dyn Builtin> {
         self.builtins.get(name).map(AsRef::as_ref)
     }
+
+    /// Removes and returns the builtin registered under `name`, if any.
+    ///
+    /// Exists so callers can run a builtin with a `&mut Shell` in hand
+    /// without a self-referential borrow: take it out, call it, put it
+    /// back with [`Shell::register_builtin`].
+    pub fn take_builtin(&mut self, name: &str) -> Option<Box<dyn Builtin>> {
+        self.builtins.remove(name)
+    }
 }
 
 impl Default for Shell {
@@ -64,10 +76,22 @@ impl Default for Shell {
 /// A command conch runs in-process instead of spawning an external
 /// program — `cd`, `exit`, `export`, and similar commands that must
 /// mutate the shell's own state.
+///
+/// `stdout`/`stderr` are passed explicitly (rather than the builtin
+/// writing to the real process streams directly) so that redirecting a
+/// builtin's output (`echo hi > file`) works the same way it does for an
+/// external command, and so builtins are testable against an in-memory
+/// buffer instead of asserting on real stdout.
 pub trait Builtin {
     /// Runs the builtin with the given arguments (not including the
     /// builtin's own name) and returns its exit status.
-    fn run(&self, shell: &mut Shell, args: &[String]) -> i32;
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32;
 }
 
 #[cfg(test)]
@@ -76,7 +100,13 @@ mod tests {
 
     struct AlwaysZero;
     impl Builtin for AlwaysZero {
-        fn run(&self, _shell: &mut Shell, _args: &[String]) -> i32 {
+        fn run(
+            &self,
+            _shell: &mut Shell,
+            _args: &[String],
+            _stdout: &mut dyn Write,
+            _stderr: &mut dyn Write,
+        ) -> i32 {
             0
         }
     }

@@ -6,6 +6,7 @@ members = [
     "crates/conch-core",
     "crates/conch-builtins",
     "crates/conch",
+    "tests/conch-difftest",
 ]
 
 [workspace.package]
