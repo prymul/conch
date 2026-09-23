@@ -28,9 +28,24 @@ the full rationale.
 
 ## Status as of this writing
 
-The `conch` binary exists and compiles (`target/debug/conch`) but is a
-Phase 1-in-progress stub -- it doesn't yet parse or execute scripts. This
-crate is fully wired up and its own tests pass today:
+**Phase 1** (simple commands, pipelines, redirection, quoting, lists,
+basic `$VAR` expansion, invocation modes) is done: the `phase1/` corpus is
+wired as a hard CI gate (`CONCH_DIFFTEST_STRICT=1`, see "Wiring in real
+execution" below) and was last confirmed 100/100 against real bash/sh.
+
+**Phase 2** (full POSIX word expansion: brace expansion, tilde expansion,
+parameter-expansion operators, command substitution, arithmetic
+expansion, globbing, IFS word splitting) is in progress in
+`crates/conch-parser`/`crates/conch-core` at the time the `phase2/`
+corpus was written. That corpus (120 cases across 7 files) is fully
+built, self-validated, and oracle-verified against real bash/dash today,
+but deliberately runs in **report-only mode** against conch regardless of
+`CONCH_DIFFTEST_STRICT` -- see "Phase-specific strict gates" below for
+exactly how, and why that separation matters.
+
+Every phase's three-test pattern is the same (`{phase}_corpus_validation.rs`,
+`{phase}_oracle_selfcheck.rs`, `{phase}_differential.rs` -- Phase 1's
+happen to be un-prefixed since they were written first):
 
 - `corpus_validation.rs` -- loads and structurally validates every corpus
   file. No shell subprocess involved.
@@ -38,18 +53,37 @@ crate is fully wired up and its own tests pass today:
   *second, independent invocation of themselves* (bash vs. bash, sh vs.
   sh) and asserts they agree. This exercises the entire harness (process
   spawning, byte-safe capture, normalization, comparison) using a real,
-  deterministic shell as a stand-in for conch, so it's meaningful *today*
-  even though conch itself isn't ready.
-- `differential.rs` -- the real conch-vs-oracle suite. It runs today too,
-  but in **report-only mode**: it finds the conch binary (if any), runs
-  every case, prints a full categorized pass/fail/skip report, and then
-  returns success regardless of the result, so CI doesn't stay red for
-  functionality that's legitimately still under construction. See
-  "Wiring in real execution" below for how this becomes a hard gate with
-  zero code changes.
+  deterministic shell as a stand-in for conch, so it's meaningful even
+  for a phase whose conch-side execution isn't ready yet. This is a hard
+  gate for every phase, unconditionally -- it never depends on conch.
+- `differential.rs` -- the real conch-vs-oracle suite: finds the conch
+  binary (if any), runs every case, prints a full categorized
+  pass/fail/skip report. Whether it fails the build depends on that
+  phase's own strict-mode env var; see the next section.
 
 Run `cargo test -p conch-difftest -- --nocapture` from the workspace root
-to see all of this today, including the live report.
+to see all of this today, including every phase's live report.
+
+### Phase-specific strict gates
+
+Each phase's `{phase}_differential.rs` checks its **own**, separately
+named env var rather than a single shared one -- `differential.rs` (Phase
+1) checks `CONCH_DIFFTEST_STRICT`; `phase2_differential.rs` checks
+`CONCH_DIFFTEST_STRICT_PHASE2`; a hypothetical Phase 3 would check
+`CONCH_DIFFTEST_STRICT_PHASE3`; and so on. This is deliberate and is the
+whole mechanism that keeps phases independent: CI's `difftest` job runs
+`cargo test -p conch-difftest`, which builds and runs *every* test binary
+in this crate regardless of which corpora are actually finished, so
+turning one phase's corpus into a hard gate must never silently pull a
+still-in-progress later phase's corpus along with it (and, symmetrically,
+a later phase going green shouldn't require touching the earlier phase's
+gate). Flip a phase to strict by setting its own var to `1` -- locally,
+or by adding it to the `difftest` job's `env:` in
+`.github/workflows/ci.yml` -- once that phase's execution has landed and
+its corpus is expected to be fully green. Don't reuse
+`CONCH_DIFFTEST_STRICT` itself for a later phase; a shared flag would
+mean the day Phase 1 legitimately earns a hard gate is the same day every
+not-yet-implemented later phase starts failing the build too.
 
 ## Directory layout
 
@@ -67,19 +101,30 @@ tests/conch-difftest/
 │   ├── compare.rs                <- diffs a candidate run against an oracle run
 │   └── runner.rs                  <- orchestration + trackable pass/fail/skip summary
 ├── corpus/
-│   └── phase1/                     <- one *.toml file per category, several
-│       ├── simple_commands.toml       cases per file, oils-spec-test style
-│       ├── pipelines.toml
-│       ├── lists.toml
-│       ├── redirection.toml
-│       ├── quoting.toml
-│       ├── expansion.toml
-│       ├── builtins.toml
-│       └── invocation_modes.toml
+│   ├── phase1/                      <- one *.toml file per category, several
+│   │   ├── simple_commands.toml        cases per file, oils-spec-test style
+│   │   ├── pipelines.toml
+│   │   ├── lists.toml
+│   │   ├── redirection.toml
+│   │   ├── quoting.toml
+│   │   ├── expansion.toml
+│   │   ├── builtins.toml
+│   │   └── invocation_modes.toml
+│   └── phase2/                      <- same style, one file per expansion kind
+│       ├── brace_expansion.toml
+│       ├── tilde_expansion.toml
+│       ├── parameter_expansion.toml
+│       ├── command_substitution.toml
+│       ├── arithmetic_expansion.toml
+│       ├── globbing.toml
+│       └── word_splitting.toml
 └── tests/
     ├── corpus_validation.rs
     ├── oracle_selfcheck.rs
-    └── differential.rs
+    ├── differential.rs
+    ├── phase2_corpus_validation.rs
+    ├── phase2_oracle_selfcheck.rs
+    └── phase2_differential.rs
 ```
 
 Why a workspace member under `tests/`, not a bare `tests/*.rs` at the
@@ -144,10 +189,15 @@ script = '''
 When set, the case is checked against conch's own pinned expectation
 instead of a live oracle run, and `oracles` may be omitted. Every such case
 must have a matching entry in `known-differences.md` explaining *why*.
-**There are no real entries yet** -- Phase 1 hasn't run against a working
-conch, so no divergence has actually been found or decided on. Don't
-pre-emptively invent one; add an entry (and a case) only once a real,
-deliberate divergence is decided.
+**There are no `known_difference` cases yet** -- no genuinely deliberate,
+permanent conch-vs-bash/sh divergence has actually been decided on. A
+conch output that merely doesn't match bash/sh yet (an unimplemented
+feature, or a regression) is not a known difference and does not belong
+here -- see `known-differences.md`'s own header for the distinction.
+`known-differences.md` does separately track divergences *between bash
+and POSIX sh themselves* (found while building the Phase 2 corpus) --
+that's a different, non-`known_difference`-schema section of the same
+file, for context rather than for a specific case's pinned expectation.
 
 ## How the harness works mechanically
 
@@ -260,10 +310,35 @@ promised yet:
   target. Worth a `known-differences.md` entry once conch's echo flag
   behavior is actually decided.
 
-If you add a Phase 2 (or later) corpus, put it in a sibling
-`corpus/phase2/` directory and a corresponding `tests/phase2_*.rs` file
-following the same `corpus::load_dir` / `runner::run_*` pattern -- nothing
-about the harness itself is phase-specific.
+Phase 2's corpus (`corpus/phase2/`, `tests/phase2_*.rs`) follows exactly
+this pattern -- see "Directory layout" and "Phase-specific strict gates"
+above. If you add a Phase 3 (or later) corpus, do the same: a sibling
+`corpus/phase3/` directory, `tests/phase3_{corpus_validation,
+oracle_selfcheck,differential}.rs` following the same `corpus::load_dir`
+/ `runner::run_*` pattern, and its own `CONCH_DIFFTEST_STRICT_PHASE3` --
+nothing about the harness itself is phase-specific.
+
+### Phase 2 scoping notes
+
+`corpus/phase2/` covers the full Phase 2 plan bullet (brace expansion,
+tilde expansion, parameter-expansion operators, command substitution,
+arithmetic expansion, globbing, IFS word splitting) evaluated in POSIX's
+specified order. Two things worth knowing about how it's organized:
+
+- Every file is split (where applicable) into a POSIX-baseline half using
+  `oracles = ["bash", "sh"]` and a bash-only-extension half using
+  `oracles = ["bash"]` -- see each file's own header comment for exactly
+  which constructs landed in which half, and `known-differences.md`
+  ("Bash extensions not in the POSIX baseline") for the consolidated
+  list plus two further cross-shell quirks that aren't extensions at all,
+  just edge-case disagreements, found while verifying every case against
+  real bash and dash directly (not only through this harness's own `sh`,
+  which resolves to a non-dash POSIX-compatible shell in some dev
+  environments -- see that doc's cross-shell-quirks section).
+- Arrays are out of scope for this corpus (not part of the Phase 2 plan
+  bullet), so no case here depends on `${arr[@]}`-style expansion, even
+  though brace expansion's "empty alternative disappears via ordinary
+  unquoted-word elision" behavior is most easily demonstrated with one.
 
 ## Wiring in real execution
 
@@ -311,4 +386,18 @@ CONCH_DIFFTEST_STRICT=1 cargo test -p conch-difftest --test differential -- --no
 
 # Against a specific binary:
 CONCH_BIN=/path/to/conch cargo test -p conch-difftest --test differential -- --nocapture
+```
+
+The same steps apply verbatim to Phase 2 once its execution semantics
+land in `crates/conch-core`, substituting `phase2_differential` for
+`differential` and `CONCH_DIFFTEST_STRICT_PHASE2` for
+`CONCH_DIFFTEST_STRICT` (see "Phase-specific strict gates" above for why
+they're separate flags):
+
+```sh
+# Phase 2 full report, report-only (today's state):
+cargo test -p conch-difftest --test phase2_differential -- --nocapture
+
+# Phase 2 hard gate, once warranted:
+CONCH_DIFFTEST_STRICT_PHASE2=1 cargo test -p conch-difftest --test phase2_differential -- --nocapture
 ```

@@ -1,0 +1,245 @@
+# Phase 2 -- arithmetic expansion: `$((...))`.
+#
+# Split the same way as parameter_expansion.toml:
+#
+#   1. POSIX-baseline arithmetic (the four basic operators, precedence,
+#      variable references by bare name, comparison/logical/ternary,
+#      bitwise, shifts, unary negation/not, hex/octal literals, and
+#      compound assignment operators like `+=` -- all verified to agree
+#      between bash and dash). `oracles = ["bash", "sh"]`.
+#
+#   2. bash-only arithmetic extensions: `**` exponentiation, `++`/`--`
+#      increment/decrement, the comma operator, and treating a
+#      non-numeric variable value as the *name* of another variable to
+#      look up recursively. dash rejects each of these (a parse error for
+#      the first three, "Illegal number" for the last) so these use
+#      `oracles = ["bash"]` only. See `../../known-differences.md`.
+#
+# `arithmetic-division-by-zero-halts-dash-but-not-bash-on-the-next-line` is
+# `oracles = ["bash"]` only, unlike `param-error-if-unset-*` in
+# parameter_expansion.toml which merely restricts `compare` to
+# `["stdout"]`: division by zero was found to produce *different stdout
+# content*, not just a different exit code, between bash and dash -- bash
+# keeps executing the line after the failing one (in a newline-separated
+# script; verified this is specific to line-at-a-time execution, not
+# `;`-joined commands), while dash aborts the whole script immediately.
+# See that case's own `note` and `../../known-differences.md`.
+
+[[case]]
+name = "arithmetic-basic-addition"
+description = "$((...)) evaluates a simple integer expression"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((2+3))
+'''
+
+[[case]]
+name = "arithmetic-division-truncates-toward-zero"
+description = "integer division truncates rather than rounding"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((10/3))
+'''
+
+[[case]]
+name = "arithmetic-modulo"
+description = "% computes the remainder"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((10%3))
+'''
+
+[[case]]
+name = "arithmetic-operator-precedence-and-parens"
+description = "standard operator precedence applies, and parentheses override it"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $(( (2+3)*4 ))
+'''
+
+[[case]]
+name = "arithmetic-bare-variable-name-is-looked-up-without-dollar"
+description = "inside $((...)), a bare identifier is looked up as a variable automatically -- no $ prefix needed (though $x also works)"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+x=5
+echo $((x+1))
+'''
+
+[[case]]
+name = "arithmetic-unset-variable-defaults-to-zero"
+description = "an unset variable used as an arithmetic operand evaluates as 0, not an error"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+unset y
+echo $((y+1))
+'''
+
+[[case]]
+name = "arithmetic-equality-comparison"
+description = "comparison operators evaluate to 1 (true) or 0 (false)"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((1==1))
+echo $((1==2))
+'''
+
+[[case]]
+name = "arithmetic-logical-and-or"
+description = "&& and || are short-circuiting logical operators, also yielding 1/0"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((1<2 && 2<3))
+echo $((1>2 || 2<3))
+'''
+
+[[case]]
+name = "arithmetic-ternary-conditional"
+description = "the C-style a?b:c ternary operator is POSIX-baseline arithmetic syntax"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((5>3?100:200))
+'''
+
+[[case]]
+name = "arithmetic-bitwise-operators"
+description = "bitwise NOT, AND, OR, and XOR"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((~0))
+echo $((5 & 3))
+echo $((5 | 2))
+echo $((5 ^ 1))
+'''
+
+[[case]]
+name = "arithmetic-shift-operators"
+description = "left and right bit-shift operators"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((1 << 4))
+echo $((256 >> 4))
+'''
+
+[[case]]
+name = "arithmetic-unary-negation"
+description = "unary minus negates a value"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((-5))
+echo $((-(-5)))
+'''
+
+[[case]]
+name = "arithmetic-logical-not"
+description = "! is logical (not bitwise) negation: any non-zero value becomes 0, and 0 becomes 1"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((!0))
+echo $((!5))
+'''
+
+[[case]]
+name = "arithmetic-hex-literal"
+description = "0x-prefixed literals are parsed as hexadecimal"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((0x1A))
+'''
+
+[[case]]
+name = "arithmetic-octal-literal"
+description = "a 0-prefixed literal (with no x) is parsed as octal"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+echo $((010))
+'''
+
+[[case]]
+name = "arithmetic-compound-assignment-inside-expansion"
+description = "compound assignment operators like += are POSIX-baseline *inside* an arithmetic expansion (contrast with the bash-only += used as a plain shell assignment, exercised elsewhere) -- the expansion's value is the assignment's result, and the variable itself is updated"
+tags = ["expansion", "arithmetic"]
+oracles = ["bash", "sh"]
+script = '''
+x=5
+echo $((x+=3))
+echo $x
+'''
+
+[[case]]
+name = "arithmetic-division-by-zero-halts-dash-but-not-bash-on-the-next-line"
+description = "dividing by zero is an error on both shells, but what happens next genuinely differs: dash aborts the whole script (nothing after the failing line runs), while bash reports the error and then keeps executing the *next physical line* of a non-semicolon-separated script. This is a real bash-vs-dash divergence in observable stdout, not just exit-code/stderr wording, so this case is bash-only rather than a shared oracle -- see ../../known-differences.md"
+tags = ["expansion", "arithmetic", "bash-extension"]
+oracles = ["bash"]
+note = "verified empirically: the same script joined with ';' instead of newlines makes even bash abort the whole thing -- bash's continue-after-error behavior here is specific to separately-parsed lines, not `;`-joined commands on one line"
+script = '''
+echo before
+echo $((1/0))
+echo after
+'''
+
+[[case]]
+name = "arithmetic-exponentiation-bash-extension"
+description = "** (bash extension, not POSIX) is exponentiation"
+tags = ["expansion", "arithmetic", "bash-extension"]
+oracles = ["bash"]
+script = '''
+echo $((2**10))
+'''
+
+[[case]]
+name = "arithmetic-post-increment-bash-extension"
+description = "x++ (bash extension, not POSIX) evaluates to x's old value, then increments it"
+tags = ["expansion", "arithmetic", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=5
+echo $((x++))
+echo $x
+'''
+
+[[case]]
+name = "arithmetic-pre-increment-bash-extension"
+description = "++x (bash extension, not POSIX) increments x first, then evaluates to the new value"
+tags = ["expansion", "arithmetic", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=5
+echo $((++x))
+echo $x
+'''
+
+[[case]]
+name = "arithmetic-comma-operator-bash-extension"
+description = "the C-style comma operator (bash extension, not POSIX) evaluates each expression left to right and yields the last one's value"
+tags = ["expansion", "arithmetic", "bash-extension"]
+oracles = ["bash"]
+script = '''
+echo $(( (1,2,3) ))
+'''
+
+[[case]]
+name = "arithmetic-nonnumeric-variable-value-treated-as-nested-variable-name-bash-extension"
+description = "bash extension: when a variable's value isn't itself numeric, bash treats it as the NAME of another variable and looks that up recursively (an unset result becomes 0); POSIX doesn't define this and dash simply errors instead"
+tags = ["expansion", "arithmetic", "bash-extension"]
+oracles = ["bash"]
+note = "x holds the string \"abc\"; abc itself is unset, so bash's recursive lookup bottoms out at 0, making x+1 == 1"
+script = '''
+x=abc
+echo $((x+1))
+'''

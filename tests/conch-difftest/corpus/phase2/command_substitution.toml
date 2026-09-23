@@ -1,0 +1,141 @@
+# Phase 2 -- command substitution: `$(...)` and the legacy `` `...` ``
+# backtick form, including nesting.
+#
+# Both forms are POSIX baseline, agree fully between bash and dash for
+# every case in this file, and are semantically equivalent except for
+# backtick's need for backslash-escaping when nesting (see
+# `command-substitution-nested-backticks-require-escaping` below, the one
+# case that specifically exercises that wrinkle) -- so every case here
+# uses `oracles = ["bash", "sh"]`.
+
+[[case]]
+name = "command-substitution-dollar-paren-basic"
+description = "$(...) runs a command and substitutes its captured stdout"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo $(echo inner)
+'''
+
+[[case]]
+name = "command-substitution-backtick-basic"
+description = "the legacy `...` backtick form is equivalent to $(...) for a simple case"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo `echo inner`
+'''
+
+[[case]]
+name = "command-substitution-multiple-lines-become-space-joined"
+description = "multiple commands inside $(...) run in sequence; their combined stdout (multiple lines) is then word-split like any other unquoted expansion"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo $(echo one; echo two)
+'''
+
+[[case]]
+name = "command-substitution-strips-trailing-newlines"
+description = "$(...) strips every trailing newline from the captured output, however many there are"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+x=$(printf "trailing\n\n\n")
+printf '[%s]\n' "$x"
+'''
+
+[[case]]
+name = "command-substitution-preserves-output-with-no-trailing-newline"
+description = "$(...) doesn't add a newline that wasn't there -- captured output with none stays exactly as printed"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+x=$(printf "no newline")
+printf '[%s]\n' "$x"
+'''
+
+[[case]]
+name = "command-substitution-preserves-trailing-spaces-before-the-stripped-newline"
+description = "only trailing newline characters are stripped -- trailing spaces immediately before them are preserved"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+x=$(printf "trimmed   \n")
+printf '[%s]\n' "$x"
+'''
+
+[[case]]
+name = "command-substitution-embeds-newlines-when-double-quoted"
+description = "internal (non-trailing) newlines in the captured output survive intact when the substitution is double-quoted"
+tags = ["expansion", "command-substitution", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+x=$(printf "a\nb\nc")
+echo "$x"
+'''
+
+[[case]]
+name = "command-substitution-unquoted-result-is-word-split"
+description = "the same embedded newlines are treated as ordinary IFS whitespace and word-split away when the substitution is left unquoted"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo $(printf "a\nb\nc")
+'''
+
+[[case]]
+name = "command-substitution-nested-dollar-paren"
+description = "$(...) forms nest freely without any escaping, since $( starts a new parse context"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo $(echo $(echo nested))
+'''
+
+[[case]]
+name = "command-substitution-mixed-with-surrounding-literal-text"
+description = "a command substitution can appear in the middle of a double-quoted word alongside literal text"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo "outer $(echo inner) text"
+'''
+
+[[case]]
+name = "command-substitution-nested-backticks-require-escaping"
+description = "unlike $(...), nesting backticks inside backticks requires backslash-escaping the inner pair"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo `echo \`echo nested-backtick\``
+'''
+
+[[case]]
+name = "command-substitution-exit-status-not-propagated-to-caller"
+description = "the exit status of the command inside $(...) does NOT become $? for the enclosing command -- only the enclosing command's own exit status does"
+tags = ["expansion", "command-substitution", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+echo $(exit 3)
+echo "status=$?"
+'''
+
+[[case]]
+name = "command-substitution-empty-output-unquoted-vanishes"
+description = "when the substituted command produces no output at all, the unquoted expansion contributes nothing -- not even an extra word boundary"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+echo a$(true)b
+'''
+
+[[case]]
+name = "command-substitution-captures-stdout-only-not-stderr"
+description = "$(...) only captures the inner command's stdout -- anything it writes to stderr goes straight to the enclosing script's own stderr instead"
+tags = ["expansion", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+x=$(echo captured; echo not-captured >&2)
+echo "$x"
+'''

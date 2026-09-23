@@ -547,6 +547,141 @@ fn bare_brace_is_not_depth_tracked_inside_parameter_expansion() {
     );
 }
 
+// ---- Phase 2 re-lexing entry points ----------------------------------------
+
+#[test]
+fn lex_word_body_runs_to_eof_ignoring_blanks_and_operators() {
+    // Unlike scan_word (and thus `lex`), lex_word_body must NOT stop at a
+    // blank or an operator character — those are ordinary content in a
+    // `${var:-word}` operand.
+    assert_eq!(
+        lex_word_body("a b|c").unwrap(),
+        Word::new(vec![WordSegment::Literal("a b|c".into())])
+    );
+}
+
+#[test]
+fn lex_word_body_recognizes_quotes_and_expansions() {
+    assert_eq!(
+        lex_word_body("'a b' \"$x\" $y").unwrap(),
+        Word::new(vec![
+            WordSegment::SingleQuoted("a b".into()),
+            WordSegment::Literal(" ".into()),
+            WordSegment::DoubleQuoted(vec![WordSegment::Parameter(Parameter::Name("x".into()))]),
+            WordSegment::Literal(" ".into()),
+            WordSegment::Parameter(Parameter::Name("y".into())),
+        ])
+    );
+}
+
+#[test]
+fn lex_word_body_matches_unquoted_ctxt_param_expansion_operand_bash_behavior() {
+    // Confirmed against real bash: `${x:-'a b' c}` unquoted, x unset,
+    // keeps 'a b' as real single-quoting (later split from `c` only on
+    // the unquoted space between them).
+    assert_eq!(
+        lex_word_body("'a b' c").unwrap(),
+        Word::new(vec![
+            WordSegment::SingleQuoted("a b".into()),
+            WordSegment::Literal(" c".into()),
+        ])
+    );
+}
+
+#[test]
+fn lex_double_quoted_body_treats_single_quote_as_literal() {
+    // Confirmed against real bash: echo "${x:-'a b'}" (x unset) prints
+    // `'a b'` — the quote characters survive literally, unlike the
+    // unquoted-context case (lex_word_body, above).
+    assert_eq!(
+        lex_double_quoted_body("'a b'").unwrap(),
+        vec![WordSegment::Literal("'a b'".into())]
+    );
+}
+
+#[test]
+fn lex_double_quoted_body_still_allows_nested_double_quotes() {
+    // Confirmed against real bash: echo "${x:-"y"}" (x unset) prints
+    // `y`, not `"y"` — a nested "..." still really quotes here (POSIX
+    // 2.6.2/2.6.3's recursive tokenizing rules), unlike a nested '...'.
+    assert_eq!(
+        lex_double_quoted_body("\"y\"").unwrap(),
+        vec![WordSegment::DoubleQuoted(vec![WordSegment::Literal(
+            "y".into()
+        )])]
+    );
+}
+
+#[test]
+fn lex_double_quoted_body_uses_the_double_quote_escape_set() {
+    // Confirmed against real bash: echo "${x:-a\ b}" (x unset) prints
+    // `a\ b` — backslash-space isn't in the double-quote escape set, so
+    // both characters stay literal (unlike lex_word_body, where a
+    // backslash escapes any next character unconditionally).
+    assert_eq!(
+        lex_double_quoted_body(r"a\ b").unwrap(),
+        vec![WordSegment::Literal(r"a\ b".into())]
+    );
+}
+
+#[test]
+fn lex_dollar_expansion_recognizes_command_substitution_and_reports_len() {
+    let (segment, len) = lex_dollar_expansion("$(cmd) rest").unwrap();
+    assert_eq!(
+        segment,
+        WordSegment::CommandSubstitution(CommandSubstitution {
+            style: SubstitutionStyle::DollarParen,
+            body: "cmd".into(),
+        })
+    );
+    assert_eq!(len, "$(cmd)".len());
+}
+
+#[test]
+fn lex_dollar_expansion_falls_back_to_literal_dollar() {
+    let (segment, len) = lex_dollar_expansion("$.rest").unwrap();
+    assert_eq!(segment, WordSegment::Literal("$".into()));
+    assert_eq!(len, 1);
+}
+
+#[test]
+#[should_panic(expected = "requires input starting with '$'")]
+fn lex_dollar_expansion_panics_without_leading_dollar() {
+    let _ = lex_dollar_expansion("no dollar here");
+}
+
+#[test]
+fn lex_backquote_expansion_recognizes_backtick_substitution_and_reports_len() {
+    let (segment, len) = lex_backquote_expansion("`cmd` rest").unwrap();
+    assert_eq!(
+        segment,
+        WordSegment::CommandSubstitution(CommandSubstitution {
+            style: SubstitutionStyle::Backtick,
+            body: "cmd".into(),
+        })
+    );
+    assert_eq!(len, "`cmd`".len());
+}
+
+#[test]
+#[should_panic(expected = "requires input starting with '`'")]
+fn lex_backquote_expansion_panics_without_leading_backquote() {
+    let _ = lex_backquote_expansion("no backquote here");
+}
+
+#[test]
+fn match_bare_parameter_reports_bytes_consumed_for_length_form_disambiguation() {
+    // conch-shell-parser's `${#parameter}` handling relies on this: the
+    // length form only applies when the match consumes the *entire*
+    // remaining string.
+    let (param, len) = match_bare_parameter("x", true).unwrap();
+    assert_eq!(param, Parameter::Name("x".into()));
+    assert_eq!(len, 1); // consumes all of "x" -> ${#x} is valid length form
+    let (param, len) = match_bare_parameter("x#l", true).unwrap();
+    assert_eq!(param, Parameter::Name("x".into()));
+    assert_eq!(len, 1); // stops before "#l" -> leftover means NOT length form
+}
+
 // ---- error cases -----------------------------------------------------------
 
 #[test]
@@ -610,4 +745,23 @@ fn empty_input_lexes_to_no_tokens() {
 #[test]
 fn whitespace_only_input_lexes_to_no_tokens() {
     assert_eq!(lex("   \t  "), Ok(Vec::new()));
+}
+
+#[test]
+fn backslash_escaped_space_stays_one_word() {
+    // Confirmed against real bash: `printf '[%s]\n' foo\ bar` prints
+    // `[foo bar]` (one argument) — the escaped space must never cause a
+    // second Word token, and by the time it's a Literal segment it's
+    // indistinguishable from an always-literal space (this crate's own
+    // docs: "an unquoted \X has already become literal X"), which is
+    // exactly why word-splitting during *expansion* must never re-split
+    // plain Literal-segment text, only genuine expansion results.
+    let tokens = lex_ok(r"foo\ bar");
+    assert_eq!(
+        tokens,
+        vec![Token::new(
+            TokenKind::Word(Word::new(vec![WordSegment::Literal("foo bar".into())])),
+            Span::new(0, 8),
+        )]
+    );
 }

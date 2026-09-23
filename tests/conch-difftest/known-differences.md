@@ -13,11 +13,82 @@ hasn't built yet (most of the shell language, as of Phase 1) is not a
 Only add an entry once a divergence has been *decided*: conch will never
 match bash/sh for this specific case, and here's why.
 
-## There are no entries yet
+## There are no KD-numbered entries yet
 
-Phase 1 hasn't run its corpus against a working conch (see
-`README.md#status-as-of-this-writing`), so no real divergence has been
-found or decided on. This file is a template for when one is.
+No genuinely *deliberate, permanent* conch-vs-bash/sh divergence has been
+found or decided on yet (see `README.md#status-as-of-this-writing`) --
+including any output mismatch the differential suite turns up along the
+way, which is a bug/regression to fix, not a candidate for this section,
+until someone actually decides conch should keep behaving that way on
+purpose. The two sections below are a different, complementary kind of
+record: not conch decisions at all, but
+divergences *between the two oracle shells themselves* (bash and dash),
+found and verified while building the Phase 2 (`corpus/phase2/`)
+word-expansion corpus. They exist so a case's `oracles = ["bash"]`
+(rather than `["bash", "sh"]`) is never mistaken for an oversight, and so
+nobody re-derives these from scratch once conch actually has to decide
+which one (if either) to match.
+
+## Bash extensions not in the POSIX baseline
+
+Every construct below is something bash supports that POSIX `sh` (and
+dash, the `sh` used as this repo's POSIX oracle) does not -- dash either
+leaves the syntax as literal text or raises a parse error. Every
+corresponding corpus case therefore uses `oracles = ["bash"]` only; there
+is no dash behavior to agree with. This is **not** a statement that conch
+won't implement these -- the Phase 2 plan explicitly includes brace
+expansion, which is on this very list -- it's purely a note on why these
+cases can't be (and shouldn't be made to look like they're) checked
+against two oracles.
+
+| Construct | dash's behavior instead | Corpus |
+|---|---|---|
+| Brace expansion: `{a,b,c}`, `{1..5}`, `{1..10..2}`, `{a..e}` | Passed through as literal text -- no expansion at all | `corpus/phase2/brace_expansion.toml` (whole file) |
+| Tilde `~+` / `~-` (expand to `$PWD` / `$OLDPWD`) | Left as literal `~+`/`~-` text | `corpus/phase2/tilde_expansion.toml` |
+| Case-modifying parameter expansion: `${var^}`, `${var^^}`, `${var,}`, `${var,,}` (with or without a match pattern) | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
+| Substring parameter expansion: `${var:offset}`, `${var:offset:length}`, including negative offsets | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
+| Pattern-substitution parameter expansion: `${var/pat/rep}`, `${var//pat/rep}`, `${var/#pat/rep}`, `${var/%pat/rep}` | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
+| Indirect parameter expansion: `${!var}` | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
+| Plain (non-arithmetic-context) `+=` assignment, e.g. `x+=3` as a standalone statement | `x+=3: not found` -- dash tries to run it as a command, since `+=` isn't assignment syntax to it at all | not currently in the corpus (arithmetic `$((x+=3))`, which *is* POSIX baseline, is; see `arithmetic_expansion.toml`) |
+| Arithmetic `**` (exponentiation) | `expecting primary` parse error | `corpus/phase2/arithmetic_expansion.toml` |
+| Arithmetic `++`/`--` (pre/post increment/decrement) | `expecting primary` parse error | `corpus/phase2/arithmetic_expansion.toml` |
+| Arithmetic comma operator `(a,b,c)` | `expecting ')'` parse error | `corpus/phase2/arithmetic_expansion.toml` |
+| Arithmetic: a non-numeric variable value is recursively treated as another variable's *name* (e.g. `x=abc; $((x+1))` looks up `abc`, finds it unset, uses 0) | `Illegal number: abc` -- an immediate error, no recursive lookup | `corpus/phase2/arithmetic_expansion.toml` |
+| Glob bracket-expression `^` as a negation synonym for `!` (a glibc `fnmatch()` extension bash's linked libc happens to support) | `^` is an ordinary literal character inside the bracket set -- POSIX only defines `!` for negation | `corpus/phase2/globbing.toml` |
+
+## Cross-shell quirks worth knowing (neither shell is simply "wrong")
+
+These aren't bash extensions -- both shells implement the relevant POSIX
+feature -- but their behavior at the edges (mostly: exactly what happens
+when an expansion produces an error partway through a command) was found
+to genuinely differ, sometimes in ways that don't even depend on which
+shell it is so much as *how* the script was written. Corpus cases
+affected either drop to `oracles = ["bash"]` (when the divergence is in
+actual stdout content, not just exit code/stderr) or narrow `compare` to
+just the target(s) that do agree.
+
+- **`${var:?message}` on an unset variable: exit code varies by shell
+  *and by bash's own invocation mode*.** bash aborts the script (nothing
+  after the failing expansion runs) with exit code 127 when the script
+  came in via `-c '...'`, but exit code 1 when the identical script runs
+  from a file. dash aborts the same way but with exit code 2, regardless
+  of invocation mode. stdout produced before the failing expansion is the
+  one thing every combination agrees on. See
+  `corpus/phase2/parameter_expansion.toml`'s
+  `param-error-if-unset-suppresses-rest-of-script`, which is why it
+  narrows `compare` to `["stdout"]`.
+
+- **Division by zero: dash halts the script, bash may not.** Both shells
+  treat `$((1/0))` as an error, but what happens to the *rest of the
+  script* differs, and for bash it further depends on whether the
+  remaining commands are on the same source line (joined by `;`) as the
+  failing one or on a later line: bash aborts entirely for the `;`-joined
+  case, but only aborts the *current* command and continues to the next
+  line otherwise. dash aborts the whole script in both cases. This is a
+  difference in actual stdout content, not just exit code, so
+  `corpus/phase2/arithmetic_expansion.toml`'s
+  `arithmetic-division-by-zero-halts-dash-but-not-bash-on-the-next-line`
+  is `oracles = ["bash"]` only rather than narrowing `compare`.
 
 ## Entry format
 

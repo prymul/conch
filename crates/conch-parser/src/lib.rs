@@ -26,13 +26,31 @@
 //! [`ParseError::UnsupportedConstruct`] naming which later phase adds
 //! them — see [`ast::Command`] and [`ast::RedirectOperator`].
 //!
-//! Full parameter-expansion operators, command substitution, arithmetic
-//! evaluation, pathname expansion, and word splitting are Phase 2 scope
-//! (expansion, not grammar) and live in `conch-shell-core`; this crate's
-//! job is only to make sure those constructs parse into a
-//! `conch-shell-lexer` [`Word`]/[`WordSegment`] shape Phase 2 can evaluate
-//! without re-lexing — see `conch-shell-lexer`'s crate docs for that
-//! contract in full.
+//! Command substitution *evaluation* (recursively running the shell
+//! script inside `` $(...) ``/`` `...` ``), pathname expansion, word
+//! splitting, and tilde expansion are Phase 2 *evaluation* scope and live
+//! in `conch-shell-core`, not here — this crate's job is only to make
+//! sure those constructs parse into a `conch-shell-lexer`
+//! [`Word`]/[`WordSegment`] shape the evaluator can consume without
+//! re-lexing (see `conch-shell-lexer`'s crate docs for that contract in
+//! full).
+//!
+//! Full parameter-expansion *operator* parsing (POSIX 2.6.2's
+//! `${parameter:-word}` and its siblings — see the [`parameter_expansion`]
+//! module, re-exported at the crate root) and arithmetic-expansion
+//! *grammar* parsing (POSIX 2.6.4's `$((expression))`, ISO C precedence —
+//! see the [`arithmetic`] module, also re-exported) **do** live in this
+//! crate, even though they're triggered by Phase 2 word expansion rather
+//! than by [`parse`] itself: both operate on a raw string a
+//! [`WordSegment`] already carries (`ComplexParameterExpansion`'s body,
+//! `ArithmeticExpansion`'s body) with no shell state required to build
+//! their respective trees — exactly the same "parsing, not evaluation"
+//! boundary the rest of this crate draws. `conch-shell-core` calls these
+//! entry points directly (not through [`parse`]) once it actually needs
+//! to expand one of those segments; see each module's docs ([`parameter_expansion`],
+//! [`arithmetic`]) for the precise integration contract, including — for
+//! parameter expansion — a quoting-context flag that's easy to get
+//! backwards without realizing it.
 //!
 //! # Example
 //!
@@ -54,10 +72,16 @@
 //! assert_eq!(cmd.name.as_ref().unwrap().as_plain_literal(), Some("sleep"));
 //! ```
 
+mod arithmetic;
 mod ast;
 mod error;
+mod parameter_expansion;
 mod parser;
 
+pub use arithmetic::{
+    ArithAssignOp, ArithBinaryOp, ArithError, ArithExpr, ArithUnaryOp, IncrDecrOp,
+    parse_arithmetic_body, parse_arithmetic_expr,
+};
 pub use ast::{
     AndOrList, Assignment, Command, CommandList, CommandListItem, LogicalOp, Pipeline, Redirect,
     RedirectOperator, Separator, SimpleCommand,
@@ -67,6 +91,9 @@ pub use conch_shell_lexer::{
     WordSegment,
 };
 pub use error::ParseError;
+pub use parameter_expansion::{
+    NullMode, ParamExpansionError, ParameterExpansion, ParameterOperator, parse_parameter_expansion,
+};
 pub use parser::parse;
 
 #[cfg(test)]
