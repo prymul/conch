@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [0.3.1](https://github.com/prymul/conch/compare/5df9019bf865923db797e963a137e1d3458d9937..0.3.1) - 2026-09-23
+#### Bug Fixes
+- use a non-interactive Homebrew test invocation - ([21c4615](https://github.com/prymul/conch/commit/21c461524331a9e844768141698ab9210d6936ab)) - [@mmat30](https://github.com/mmat30)
+#### Continuous Integration
+- publish to crates.io via Trusted Publishing (OIDC) instead of a static token - ([5df9019](https://github.com/prymul/conch/commit/5df9019bf865923db797e963a137e1d3458d9937)) - [@mmat30](https://github.com/mmat30)
+
+- - -
+
 ## [0.3.0](https://github.com/prymul/conch/compare/b69286f81b08f23724b656e7173ad9261d7923f7..0.3.0) - 2026-09-23
 #### Features
 - Phase 1 shell — lexer, parser, executor, and 100/100 differential tests - ([bbeba03](https://github.com/prymul/conch/commit/bbeba036b59252d7696a8e56a60e68500c349477)) - [@mmat30](https://github.com/mmat30)
