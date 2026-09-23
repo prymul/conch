@@ -1,0 +1,108 @@
+# Phase 2 -- tilde expansion: `~`, `~user`, and the bash-only `~+`/`~-`
+# forms.
+#
+# `~` and `~user` (including a `~user` naming a user that doesn't exist,
+# which stays literal rather than erroring) are POSIX baseline and are
+# exercised here with both oracles. `~+` (expands to $PWD) and `~-`
+# (expands to $OLDPWD) are bash/ksh extensions with no POSIX `sh`
+# equivalent -- dash leaves them as literal text -- so those two cases use
+# `oracles = ["bash"]` only. See `../../known-differences.md`.
+#
+# None of these cases need `normalize = ["workdir"]`: they resolve $HOME
+# (or, for the `~+`/`~-` cases, an absolute path this script itself `cd`s
+# to), not this harness's own per-run temp directory, so candidate and
+# oracle see the identical literal string without any substitution.
+
+[[case]]
+name = "tilde-alone-expands-to-home"
+description = "a bare ~ expands to $HOME"
+tags = ["expansion", "tilde"]
+oracles = ["bash", "sh"]
+script = '''
+echo ~
+'''
+
+[[case]]
+name = "tilde-user-expands-to-named-users-home"
+description = "~user expands to that user's home directory (root always exists and its home is stable for the duration of one test run)"
+tags = ["expansion", "tilde"]
+oracles = ["bash", "sh"]
+script = '''
+echo ~root
+'''
+
+[[case]]
+name = "tilde-unknown-user-stays-literal"
+description = "~name for a user that doesn't exist is left as literal text rather than erroring"
+tags = ["expansion", "tilde"]
+oracles = ["bash", "sh"]
+script = '''
+echo ~this-user-should-not-exist-anywhere-12345
+'''
+
+[[case]]
+name = "tilde-plus-expands-to-pwd"
+description = "~+ (bash extension, not POSIX) expands to the current value of $PWD"
+tags = ["expansion", "tilde"]
+oracles = ["bash"]
+script = '''
+cd /tmp
+echo ~+
+'''
+
+[[case]]
+name = "tilde-minus-expands-to-oldpwd"
+description = "~- (bash extension, not POSIX) expands to the current value of $OLDPWD, i.e. the directory cd last moved away from"
+tags = ["expansion", "tilde"]
+oracles = ["bash"]
+script = '''
+cd /tmp
+cd /var
+echo ~-
+'''
+
+[[case]]
+name = "tilde-inside-double-quotes-is-literal"
+description = "a double-quoted ~ suppresses tilde expansion, same as it suppresses $-expansion's special meaning of other characters"
+tags = ["expansion", "tilde", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+echo "~"
+'''
+
+[[case]]
+name = "tilde-inside-single-quotes-is-literal"
+description = "a single-quoted ~ suppresses tilde expansion"
+tags = ["expansion", "tilde", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+echo '~'
+'''
+
+[[case]]
+name = "tilde-mid-word-is-not-expanded"
+description = "~ only triggers tilde expansion at the start of a word, not in the middle"
+tags = ["expansion", "tilde"]
+oracles = ["bash", "sh"]
+script = '''
+echo a~b
+'''
+
+[[case]]
+name = "tilde-expands-in-assignment-rhs"
+description = "~ expands even though it's on the right-hand side of a plain variable assignment, a position that otherwise mostly suppresses expansions like globbing"
+tags = ["expansion", "tilde"]
+oracles = ["bash", "sh"]
+script = '''
+x=~
+echo $x
+'''
+
+[[case]]
+name = "tilde-with-trailing-path-segment"
+description = "~ expands and the rest of the word (a /-prefixed path segment) is appended literally"
+tags = ["expansion", "tilde"]
+oracles = ["bash", "sh"]
+script = '''
+echo ~/some/path
+'''

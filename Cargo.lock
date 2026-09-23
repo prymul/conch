@@ -60,6 +60,7 @@ name = "conch-shell-core"
 version = "0.2.0"
 dependencies = [
  "conch-shell-parser",
+ "tempfile",
  "thiserror",
 ]
 

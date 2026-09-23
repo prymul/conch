@@ -1,0 +1,396 @@
+# Phase 2 -- parameter expansion operators: `${var:-word}`, `${var#pattern}`,
+# and the rest of the `${...}` operator family.
+#
+# This file is split into two halves:
+#
+#   1. POSIX-baseline operators (length `${#var}`, the four default/error
+#      operators in both their `:`-and-bare forms, and the four
+#      prefix/suffix pattern-removal operators). These are exercised with
+#      both `bash` and `sh` oracles since dash agrees with bash on every
+#      one of them (verified empirically while building this corpus).
+#
+#   2. bash-only extension operators: case modification (`${var^}`,
+#      `${var^^}`, `${var,}`, `${var,,}`), substring (`${var:offset:length}`),
+#      pattern substitution (`${var/pat/rep}`, `${var//pat/rep}`,
+#      `${var/#pat/rep}`, `${var/%pat/rep}`), and indirect expansion
+#      (`${!var}`). dash rejects every one of these with "Bad
+#      substitution", so these cases use `oracles = ["bash"]` only. See
+#      `../../known-differences.md`.
+#
+# Two cases below (`param-error-if-unset-*`) deliberately restrict
+# `compare` to `["stdout"]`: `${var:?message}` on an unset variable was
+# verified to abort the shell with a *different* exit code on bash (127
+# under `-c`, but 1 when the same script instead runs from a file -- an
+# invocation-mode-dependent bash quirk, not a bash/dash difference) versus
+# dash (2), and with shell-specific stderr wording. stdout -- specifically
+# that nothing after the failing expansion ever gets printed -- is the
+# part of the behavior all shells agree on, so it's what these cases
+# check. See `../../known-differences.md` for the full writeup.
+
+[[case]]
+name = "param-length-of-set-variable"
+description = "${#var} expands to the character length of var's value"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello
+echo ${#x}
+'''
+
+[[case]]
+name = "param-length-of-unset-variable"
+description = "${#var} on an unset variable is 0, not an error"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+unset x
+echo ${#x}
+'''
+
+[[case]]
+name = "param-default-value-colon-dash-on-unset"
+description = "${var:-word} substitutes word when var is unset"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+unset x
+echo ${x:-default}
+'''
+
+[[case]]
+name = "param-default-value-colon-dash-on-empty"
+description = "${var:-word} substitutes word when var is set but empty -- the colon form treats null and unset the same"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=
+echo ${x:-default}
+'''
+
+[[case]]
+name = "param-default-value-colon-dash-on-set-uses-value"
+description = "${var:-word} uses var's own value when it's set and non-empty"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=set
+echo ${x:-default}
+'''
+
+[[case]]
+name = "param-default-value-bare-dash-treats-empty-as-set"
+description = "the bare (non-colon) ${var-word} form only checks whether var is set, not whether it's empty -- a set-but-empty var uses its own (empty) value"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=
+printf '[%s]\n' ${x-default}
+'''
+
+[[case]]
+name = "param-default-value-bare-dash-on-unset"
+description = "the bare ${var-word} form substitutes word when var is genuinely unset"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+unset x
+echo ${x-default}
+'''
+
+[[case]]
+name = "param-assign-default-colon-equals-sets-variable"
+description = "${var:=word} substitutes word AND assigns it to var, so a later reference to var also sees it"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+unset x
+y=${x:=default}
+echo "$y-$x"
+'''
+
+[[case]]
+name = "param-assign-default-does-not-override-existing-value"
+description = "${var:=word} leaves an already-set, non-empty var untouched"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=set
+y=${x:=default}
+echo "$y-$x"
+'''
+
+[[case]]
+name = "param-alternative-value-colon-plus-on-set"
+description = "${var:+word} substitutes word (not var's own value) when var is set and non-empty"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=set
+echo ${x:+alt}
+'''
+
+[[case]]
+name = "param-alternative-value-colon-plus-on-unset"
+description = "${var:+word} substitutes nothing when var is unset"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+unset x
+printf '[%s]\n' ${x:+alt}
+'''
+
+[[case]]
+name = "param-alternative-value-colon-plus-on-empty"
+description = "the colon form ${var:+word} substitutes nothing when var is set but empty -- null and unset are treated the same"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=
+printf '[%s]\n' ${x:+alt}
+'''
+
+[[case]]
+name = "param-alternative-value-bare-plus-treats-empty-as-set"
+description = "the bare (non-colon) ${var+word} form substitutes word for a set-but-empty var too, unlike the colon form"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=
+echo ${x+alt}
+'''
+
+[[case]]
+name = "param-error-if-unset-suppresses-rest-of-script"
+description = "${var:?message} on an unset var prints an error and aborts the shell before anything after it runs; stdout produced before the failing expansion is unaffected"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+compare = ["stdout"]
+note = "exit code and stderr text both vary by shell/invocation mode here -- see the file header and known-differences.md"
+script = '''
+unset x
+echo before
+echo ${x:?custom error message}
+echo after
+'''
+
+[[case]]
+name = "param-error-if-unset-succeeds-when-var-is-set"
+description = "${var:?message} is a no-op (uses var's value, no error) when var is already set and non-empty"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+x=set
+echo before
+echo ${x:?message not triggered}
+echo after
+'''
+
+[[case]]
+name = "param-remove-smallest-matching-prefix"
+description = "${var#pattern} removes the shortest prefix match of pattern from var's value"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello.tar.gz
+echo ${x#*.}
+'''
+
+[[case]]
+name = "param-remove-largest-matching-prefix"
+description = "${var##pattern} removes the longest (greedy) prefix match of pattern"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello.tar.gz
+echo ${x##*.}
+'''
+
+[[case]]
+name = "param-remove-smallest-matching-suffix"
+description = "${var%pattern} removes the shortest suffix match of pattern"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello.tar.gz
+echo ${x%.*}
+'''
+
+[[case]]
+name = "param-remove-largest-matching-suffix"
+description = "${var%%pattern} removes the longest (greedy) suffix match of pattern"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=hello.tar.gz
+echo ${x%%.*}
+'''
+
+[[case]]
+name = "param-remove-prefix-no-match-leaves-value-unchanged"
+description = "if pattern doesn't match, ${var%pattern} (and the other three removal operators) leave the value completely unchanged, not an error"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=noext
+echo ${x%.*}
+'''
+
+[[case]]
+name = "param-remove-prefix-with-bracket-pattern"
+description = "the pattern in a removal operator supports the same bracket-expression glob syntax as pathname expansion"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=a.b.c
+echo ${x#[a-z].}
+'''
+
+[[case]]
+name = "param-remove-leading-slash-path-style"
+description = "a common idiom: ${var#/} strips exactly one leading slash"
+tags = ["expansion", "parameter", "pattern-removal"]
+oracles = ["bash", "sh"]
+script = '''
+x=/usr/local/bin
+echo ${x#/}
+'''
+
+[[case]]
+name = "param-default-value-can-be-a-command-substitution"
+description = "the replacement word in ${var:-word} is itself fully expanded, including running a command substitution, only when actually needed"
+tags = ["expansion", "parameter"]
+oracles = ["bash", "sh"]
+script = '''
+echo ${undefined_conch_difftest_var:-$(echo cmdsub-default)}
+'''
+
+[[case]]
+name = "param-case-modify-uppercase-all-bash-extension"
+description = "${var^^} (bash extension) uppercases every character"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=HelloWorld
+echo ${x^^}
+'''
+
+[[case]]
+name = "param-case-modify-lowercase-all-bash-extension"
+description = "${var,,} (bash extension) lowercases every character"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=HelloWorld
+echo ${x,,}
+'''
+
+[[case]]
+name = "param-case-modify-uppercase-first-bash-extension"
+description = "${var^} (bash extension) uppercases only the first character"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=helloWorld
+echo ${x^}
+'''
+
+[[case]]
+name = "param-case-modify-lowercase-first-bash-extension"
+description = "${var,} (bash extension) lowercases only the first character"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=HelloWorld
+echo ${x,}
+'''
+
+[[case]]
+name = "param-case-modify-with-match-pattern-bash-extension"
+description = "${var^^pattern} (bash extension) uppercases only characters matching pattern, leaving the rest untouched"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=hello
+echo ${x^^l}
+'''
+
+[[case]]
+name = "param-substring-offset-and-length-bash-extension"
+description = "${var:offset:length} (bash extension) extracts a substring by character offset and length"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x="hello world"
+echo ${x:6:5}
+'''
+
+[[case]]
+name = "param-substring-offset-only-bash-extension"
+description = "${var:offset} (bash extension) with no length extracts through the end of the string"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x="hello world"
+echo ${x:6}
+'''
+
+[[case]]
+name = "param-substring-negative-offset-bash-extension"
+description = "${var: -offset} (bash extension; the space before the minus is required so it isn't parsed as ${var:-default}) counts from the end of the string"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x="hello world"
+echo ${x: -5}
+'''
+
+[[case]]
+name = "param-pattern-substitution-first-match-bash-extension"
+description = "${var/pattern/replacement} (bash extension) replaces only the first match"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=aXbXcXd
+echo ${x/X/-}
+'''
+
+[[case]]
+name = "param-pattern-substitution-all-matches-bash-extension"
+description = "${var//pattern/replacement} (bash extension) replaces every match, not just the first"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=aXbXcXd
+echo ${x//X/-}
+'''
+
+[[case]]
+name = "param-pattern-substitution-anchored-at-start-bash-extension"
+description = "${var/#pattern/replacement} (bash extension) only replaces a match anchored at the very start of the value"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=aXbXcXd
+echo ${x/#a/START-}
+'''
+
+[[case]]
+name = "param-pattern-substitution-anchored-at-end-bash-extension"
+description = "${var/%pattern/replacement} (bash extension) only replaces a match anchored at the very end of the value"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+x=aXbXcXd
+echo ${x/%d/-END}
+'''
+
+[[case]]
+name = "param-indirect-expansion-bash-extension"
+description = "${!var} (bash extension) expands to the value of the variable NAMED by var's own value -- one level of indirection"
+tags = ["expansion", "parameter", "bash-extension"]
+oracles = ["bash"]
+script = '''
+name=world
+y=name
+echo ${!y}
+'''

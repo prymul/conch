@@ -1,10 +1,12 @@
 //! Shell state, word expansion, and the command executor.
 
+mod brace;
 mod exec;
 mod expand;
 
+pub use brace::brace_expand;
 pub use exec::exec_command_list;
-pub use expand::{ExpandError, expand_word};
+pub use expand::{ExpandError, expand_word_fields, expand_word_single};
 
 use std::collections::HashMap;
 use std::env;

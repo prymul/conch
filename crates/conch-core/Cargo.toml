@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 conch-shell-parser = { workspace = true }
 thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -20,10 +20,28 @@ use std::io::Write as _;
 use std::process::Stdio;
 
 use conch_shell_parser::{
-    AndOrList, Command, CommandList, LogicalOp, Pipeline, Redirect, RedirectOperator, SimpleCommand,
+    AndOrList, Command, CommandList, LogicalOp, Pipeline, Redirect, RedirectOperator,
+    SimpleCommand, Word,
 };
 
-use crate::{Shell, expand_word};
+use crate::{ExpandError, Shell, brace_expand, expand_word_fields, expand_word_single};
+
+/// Brace-expands then field-expands each word in `words`, in order,
+/// flattening every resulting field into one sequence — the combined
+/// pass command names and arguments both go through (POSIX doesn't
+/// special-case either position for brace expansion or splitting).
+fn expand_words_fields<'a>(
+    words: impl Iterator<Item = &'a Word>,
+    shell: &mut Shell,
+) -> Result<Vec<String>, ExpandError> {
+    let mut fields = Vec::new();
+    for word in words {
+        for variant in brace_expand(word) {
+            fields.extend(expand_word_fields(&variant, shell)?);
+        }
+    }
+    Ok(fields)
+}
 
 /// Runs a full parsed command list against `shell`, returning the exit
 /// status of the last command run (POSIX `$?`).
@@ -104,26 +122,34 @@ fn exec_simple(
         return (0, None);
     };
 
-    let name = match expand_word(name_word, shell) {
-        Ok(name) => name,
+    // Brace expansion (`{a,b,c}`) runs before anything else and can turn
+    // one word into several; the command name undergoes the same
+    // brace/field-splitting/globbing as any other word (POSIX doesn't
+    // special-case cmd_word here), so if it produces more than one
+    // resulting field, the first becomes the command name and the rest
+    // become leading arguments — e.g. `$CMD` with CMD="echo hi" runs
+    // `echo` with `hi` prepended before any other args.
+    let mut all_fields = match expand_words_fields(std::iter::once(name_word), shell) {
+        Ok(fields) => fields.into_iter(),
         Err(err) => {
             eprintln!("conch: {err}");
             return (1, None);
         }
+    };
+    let Some(name) = all_fields.next() else {
+        // Expanded to zero fields (e.g. an unset, unquoted parameter) —
+        // nothing to run, matching real shells treating this as a no-op.
+        return (0, None);
     };
 
-    let args = match cmd
-        .args
-        .iter()
-        .map(|word| expand_word(word, shell))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(args) => args,
+    let mut args: Vec<String> = all_fields.collect();
+    match expand_words_fields(cmd.args.iter(), shell) {
+        Ok(fields) => args.extend(fields),
         Err(err) => {
             eprintln!("conch: {err}");
             return (1, None);
         }
-    };
+    }
 
     let redirects = match expand_redirects(cmd, shell) {
         Ok(redirects) => redirects,
@@ -156,11 +182,17 @@ fn exec_simple(
 }
 
 /// `NAME=value` prefix assignments, expanded to their final strings.
-fn expand_assignments(cmd: &SimpleCommand, shell: &Shell) -> Result<Vec<(String, String)>, String> {
+/// Assignment values never undergo field splitting or pathname expansion
+/// (POSIX 2.6) — `expand_word_single` is the correct mode here, not
+/// `expand_word_fields`.
+fn expand_assignments(
+    cmd: &SimpleCommand,
+    shell: &mut Shell,
+) -> Result<Vec<(String, String)>, String> {
     cmd.assignments
         .iter()
         .map(|assignment| {
-            expand_word(&assignment.value, shell)
+            expand_word_single(&assignment.value, shell)
                 .map(|value| (assignment.name.clone(), value))
                 .map_err(|err| err.to_string())
         })
@@ -173,11 +205,15 @@ struct ExpandedRedirect {
     target: String,
 }
 
-fn expand_redirects(cmd: &SimpleCommand, shell: &Shell) -> Result<Vec<ExpandedRedirect>, String> {
+fn expand_redirects(
+    cmd: &SimpleCommand,
+    shell: &mut Shell,
+) -> Result<Vec<ExpandedRedirect>, String> {
     cmd.redirects
         .iter()
         .map(|redirect: &Redirect| {
-            let target = expand_word(&redirect.target, shell).map_err(|err| err.to_string())?;
+            let target =
+                expand_word_single(&redirect.target, shell).map_err(|err| err.to_string())?;
             let default_fd = match redirect.operator {
                 RedirectOperator::Input => 0,
                 RedirectOperator::Output | RedirectOperator::Append => 1,
