@@ -1,5 +1,6 @@
-//! Phase 1 command execution: simple commands, pipelines, and
-//! `;`/`&&`/`||`-joined lists.
+//! Command execution: simple commands, pipelines, `;`/`&&`/`||`-joined
+//! lists (Phase 1), and compound commands — `if`/`for`/`while`/`until`/
+//! `case`, subshells, and brace groups, with `break`/`continue` (Phase 3).
 //!
 //! **Known Phase 1 simplification:** pipeline stages are run sequentially,
 //! with each stage's stdout fully buffered in memory before the next stage
@@ -9,22 +10,65 @@
 //! external commands without special-casing. The real cost: an infinite or
 //! very large producer (`yes | head`) will hang or exhaust memory instead
 //! of streaming. Concurrent OS-pipe wiring for all-external pipeline runs
-//! is a reasonable later improvement; not attempted in Phase 1.
+//! is a reasonable later improvement; not attempted here.
+//!
+//! **Known Phase 3 simplification, for the same underlying reason:** a
+//! *compound* command used as a pipeline stage (`(cmd) | grep x`, `{
+//! cmd; } | grep x`, `if ...; fi | grep x`, ...) doesn't participate in
+//! that same stdin/stdout buffering — it always reads/writes the real
+//! inherited streams, rather than having its combined output captured and
+//! piped the way a simple command's is. Only `exec_simple` has the
+//! in-memory buffer plumbing today; extending that same treatment to an
+//! entire compound command's body (potentially many nested commands) is a
+//! reasonable later improvement, not attempted here. Relatedly, a
+//! compound command's own trailing redirect (`{ ...; } > file`, `if
+//! ...; fi > file`, ...) is parsed (`conch-shell-parser`) but not yet
+//! executed — seeing one is a clear "not yet supported" error rather than
+//! silently running the body with its output going to the wrong place;
+//! see [`exec_compound`].
 //!
 //! Async (`&`) pipelines are parsed (see [`conch_shell_parser::Separator`])
-//! but Phase 1 always runs them synchronously in the foreground — real
-//! backgrounding is Phase 4 job control, per the project roadmap.
+//! but always run synchronously in the foreground — real backgrounding is
+//! Phase 4 job control, per the project roadmap.
+//!
+//! # `break`/`continue` propagation
+//!
+//! The `break`/`continue` builtins (`conch-shell-builtins`) can only
+//! communicate through [`Shell::pending_control_flow`] — see
+//! [`crate::ControlFlow`]'s docs for why. Every function in this module
+//! that runs a sequence of things ([`exec_command_list`], [`exec_and_or`])
+//! checks it after each step and stops early if it's set, so a pending
+//! signal reaches the nearest loop-execution code
+//! ([`exec_while_or_until`], [`exec_for`]) without whatever would
+//! otherwise run next (another `&&`/`||` pipeline, another list item)
+//! running in between — confirmed against real bash this matters even for
+//! exit status: `break && echo unreached` must not run the `echo`, even
+//! though `break`'s own exit status is `0` (which `&&` would otherwise
+//! treat as "keep going"). Each loop level a signal passes through
+//! decrements its `n` by one ([`take_loop_control_flow`]), stopping there
+//! once `n` reaches `1`.
+//!
+//! A subshell ([`exec_subshell`]) never has to sever this propagation at
+//! all, let alone specially: it runs as a genuinely separate process
+//! (see that function's docs for why that's a hard requirement, not a
+//! style choice), so its own `break`/`continue`s only ever exist in that
+//! child's own, entirely separate [`Shell`] — there's no shared
+//! `pending_control_flow`/`loop_depth` state to leak *into* in the first
+//! place.
 
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::process::Stdio;
 
 use conch_shell_parser::{
-    AndOrList, Command, CommandList, LogicalOp, Pipeline, Redirect, RedirectOperator,
-    SimpleCommand, Word,
+    AndOrList, CaseClause, Command, CommandList, CompoundCommand, CompoundCommandKind, ForClause,
+    IfClause, LogicalOp, Pipeline, Redirect, RedirectOperator, SimpleCommand, Word,
 };
 
-use crate::{ExpandError, Shell, brace_expand, expand_word_fields, expand_word_single};
+use crate::expand::{expand_word_as_pattern, glob_match};
+use crate::{
+    ControlFlow, ExpandError, Shell, brace_expand, expand_word_fields, expand_word_single,
+};
 
 /// Brace-expands then field-expands each word in `words`, in order,
 /// flattening every resulting field into one sequence — the combined
@@ -45,17 +89,74 @@ fn expand_words_fields<'a>(
 
 /// Runs a full parsed command list against `shell`, returning the exit
 /// status of the last command run (POSIX `$?`).
+///
+/// Also the function that runs the *body* of every compound command
+/// (POSIX `compound_list` — an `if`/`while`/`until`/`for`'s condition and
+/// body, a brace group's or subshell's contents, one `case` arm) — see
+/// the module docs for why an early stop here (on a pending `break`/
+/// `continue`) is important even for the top-level program, not just
+/// loop bodies specifically.
 pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
     let mut status = shell.last_status;
     for item in &list.items {
         status = exec_and_or(&item.and_or, shell);
         shell.last_status = status;
+        match shell.pending_control_flow {
+            // A break/continue level exceeding every loop that actually
+            // encloses it (`shell.loop_depth == 0` here means: none do,
+            // not even one level up) has nowhere left to go — confirmed
+            // against real bash/dash this discards the signal (with the
+            // same diagnostic) and *keeps running* the rest of this
+            // list, rather than treating it as fatal to the whole list
+            // the way a level that's still headed for a real enclosing
+            // loop must.
+            Some(ControlFlow::Break(_) | ControlFlow::Continue(_)) if shell.loop_depth == 0 => {
+                warn_on_unhandled_control_flow(shell);
+            }
+            Some(_) => break,
+            None => {}
+        }
     }
     status
 }
 
+/// Runs a full parsed *program* (the top-level input — a whole `-c`
+/// string, script file, or one interactive line) against `shell`. This
+/// is what `conch`'s binary crate should call, not [`exec_command_list`]
+/// directly — it's [`exec_command_list`] plus the one thing only a true
+/// top-level call needs: discarding (with the same diagnostic real
+/// bash's own "only meaningful in a `for', `while', or `until' loop"
+/// message conveys) any `break`/`continue` still pending once there's
+/// truly no more program left to run it against.
+///
+/// Confirmed against real bash this is exactly what happens for `break
+/// n`/`continue n` with `n` greater than the current loop nesting depth:
+/// it unwinds *every* enclosing loop (same as `n` exactly matching the
+/// depth — see [`take_loop_control_flow`]) *and* prints that same
+/// diagnostic, since by the time the outermost loop's own level is
+/// reached there's nothing left to catch the remainder. [`exec_command_list`]
+/// itself can't be the one to do this discarding: it's also the function
+/// every loop body/if branch recurses through (a subshell body doesn't —
+/// see [`exec_subshell`]'s docs), and *those* callers need to still see
+/// a pending signal after it returns in order to act on it correctly.
+pub fn exec_program(list: &CommandList, shell: &mut Shell) -> i32 {
+    let status = exec_command_list(list, shell);
+    warn_on_unhandled_control_flow(shell);
+    status
+}
+
+/// See [`exec_program`]'s docs.
+fn warn_on_unhandled_control_flow(shell: &mut Shell) {
+    if shell.pending_control_flow.take().is_some() {
+        eprintln!("conch: break/continue: only meaningful in a `for', `while', or `until' loop");
+    }
+}
+
 fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
     let mut status = exec_pipeline(&and_or.first, shell);
+    if shell.pending_control_flow.is_some() {
+        return status;
+    }
     for (op, pipeline) in &and_or.rest {
         let should_run = match op {
             LogicalOp::And => status == 0,
@@ -63,6 +164,9 @@ fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
         };
         if should_run {
             status = exec_pipeline(pipeline, shell);
+            if shell.pending_control_flow.is_some() {
+                return status;
+            }
         }
     }
     status
@@ -74,19 +178,318 @@ fn exec_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> i32 {
 
     for (i, command) in pipeline.commands.iter().enumerate() {
         let is_last = i == pipeline.commands.len() - 1;
-        let Command::Simple(simple) = command else {
-            // Command is #[non_exhaustive] for future compound-command
-            // variants (Phase 3); conch-shell-parser only ever produces
-            // Simple today, and rejects anything else at parse time with
-            // ParseError::UnsupportedConstruct.
-            unreachable!("conch-shell-parser only produces Command::Simple in Phase 1")
+        let (this_status, output) = match command {
+            Command::Simple(simple) => exec_simple(simple, shell, carry_in.take(), !is_last),
+            Command::Compound(compound) => {
+                // Known simplification — see the module docs. Any
+                // stdin_data carried in from a previous stage is
+                // dropped here (carry_in.take() below discards it via
+                // the loop's own bookkeeping), matching "reads the real
+                // inherited stdin instead".
+                let _ = carry_in.take();
+                (exec_compound(compound, shell), None)
+            }
+            // Command is #[non_exhaustive] in conch-shell-parser for a
+            // future function_definition variant (a deliberate Phase 3
+            // follow-up — see conch-shell-parser::ast's module docs);
+            // conch-shell-parser itself never produces anything but
+            // Simple/Compound today.
+            _ => unreachable!("conch-shell-parser only produces Simple/Compound commands"),
         };
-        let (this_status, output) = exec_simple(simple, shell, carry_in.take(), !is_last);
         status = this_status;
         carry_in = output;
     }
 
     status
+}
+
+// ---- compound commands (POSIX 2.10.2's `compound_command`) --------------
+
+/// Runs a [`CompoundCommand`], dispatching on its kind.
+///
+/// A compound command's own trailing redirect (`command : compound_command
+/// redirect_list`) is parsed but not yet executed (see the module docs)
+/// — deliberately checked *before* running the body at all, rather than
+/// after, so a `{ side_effect; } > file` we can't correctly redirect
+/// doesn't still run `side_effect` with its output going to the wrong
+/// place.
+fn exec_compound(compound: &CompoundCommand, shell: &mut Shell) -> i32 {
+    if !compound.redirects.is_empty() {
+        eprintln!(
+            "conch: a compound command's own trailing redirect (`{{ ...; }} > file`, `if ...; fi > file`, `(...) > file`, ...) is not yet supported"
+        );
+        return 1;
+    }
+    match &compound.kind {
+        CompoundCommandKind::BraceGroup(body) => {
+            // Runs in the *current* environment — no isolation, no
+            // loop_depth/pending_control_flow interception; a `break`
+            // lexically inside a brace group correctly reaches whatever
+            // loop encloses the brace group itself.
+            exec_command_list(body, shell)
+        }
+        CompoundCommandKind::Subshell(subshell) => exec_subshell(&subshell.source, shell),
+        CompoundCommandKind::If(clause) => exec_if(clause, shell),
+        CompoundCommandKind::While(clause) => {
+            exec_while_or_until(&clause.condition, &clause.body, true, shell)
+        }
+        CompoundCommandKind::Until(clause) => {
+            exec_while_or_until(&clause.condition, &clause.body, false, shell)
+        }
+        CompoundCommandKind::For(clause) => exec_for(clause, shell),
+        CompoundCommandKind::Case(clause) => exec_case(clause, shell),
+        // CompoundCommandKind is #[non_exhaustive] in conch-shell-parser
+        // purely as a general forward-compatibility precaution; it
+        // already covers all seven POSIX compound_command alternatives.
+        _ => unreachable!("conch-shell-parser only produces the seven documented kinds"),
+    }
+}
+
+/// POSIX `subshell : '(' compound_list ')'` — runs `source` (the
+/// subshell body's *raw* text — see [`conch_shell_parser::SubshellBody`]'s
+/// docs for why the parsed body isn't what gets executed) with real
+/// isolation from the parent `shell`: a variable assignment, `cd`, or
+/// `exit` inside must never affect the parent.
+///
+/// Implemented by re-exec'ing `conch -c <source>` as a genuine child
+/// process — exactly [`run_command_substitution`]'s own pattern in
+/// `conch-shell-core::expand`, minus the stdout capture (a subshell's
+/// output goes to the real inherited streams, the same as any other
+/// compound command — see the module docs' "Known Phase 3
+/// simplification" for the one place that still falls short of full
+/// pipeline integration). This isn't just the simplest correct option;
+/// it's the *only* correct one available: `cd`'s underlying
+/// `std::env::set_current_dir` and `exit`'s `std::process::exit` both
+/// mutate real OS-level process state that no amount of restoring
+/// `Shell`'s own fields afterward could undo, so an in-process
+/// snapshot/restore of `Shell` (an earlier design this went through)
+/// is fundamentally unable to isolate a subshell correctly — only a
+/// genuinely separate process can. `last_status` (`$?`) doesn't need
+/// any special handling here: POSIX gives a subshell the same
+/// exit-status-propagation behavior as any other command, and the
+/// child's own exit code, used directly as this function's return
+/// value, already *is* that.
+///
+/// Known gap, shared with command substitution: only *exported*
+/// variables (`shell.env_vars`) reach the child; a shell-local variable
+/// (`shell.shell_vars`) does not, so `x=1; (echo $x)` prints nothing,
+/// same as `x=1; echo $(echo $x)` already does today. Deliberately not
+/// fixed by serializing `shell_vars` through an environment variable for
+/// the child to parse back out — that shape (interpreter state
+/// serialized into an env var, later parsed back out by a re-invoked
+/// interpreter) is structurally the same one Shellshock (CVE-2014-6271)
+/// exploited, and isn't worth the scrutiny it would need to get right
+/// unless this gap turns out to matter in practice.
+fn exec_subshell(source: &str, shell: &Shell) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            eprintln!("conch: subshell: {err}");
+            return 1;
+        }
+    };
+    let status = std::process::Command::new(exe)
+        .arg("-c")
+        .arg(source)
+        .current_dir(&shell.cwd)
+        .env_clear()
+        .envs(&shell.env_vars)
+        .status();
+    match status {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("conch: subshell: {err}");
+            1
+        }
+    }
+}
+
+/// POSIX `if_clause`/`else_part` — see
+/// [`conch_shell_parser::IfClause`]'s docs for how the AST already
+/// flattens the `elif` chain, which is what keeps this a single loop
+/// rather than needing recursion to mirror the grammar's own nesting.
+fn exec_if(clause: &IfClause, shell: &mut Shell) -> i32 {
+    for (condition, body) in &clause.branches {
+        let cond_status = exec_command_list(condition, shell);
+        if shell.pending_control_flow.is_some() {
+            return cond_status;
+        }
+        if cond_status == 0 {
+            return exec_command_list(body, shell);
+        }
+    }
+    if let Some(else_branch) = &clause.else_branch {
+        return exec_command_list(else_branch, shell);
+    }
+    // POSIX: no branch taken and no `else` — exit status 0.
+    0
+}
+
+/// Shared `while_clause`/`until_clause` execution (`continue_while`:
+/// `true` for `while`, `false` for `until` — POSIX's only difference
+/// between the two is which way the condition's exit status is read).
+///
+/// POSIX: "The exit status of the while/until command shall be the exit
+/// status of the last compound-list-2 [body] that was executed, or zero
+/// if none was executed" — confirmed against real bash (a loop that runs
+/// its body and then stops normally keeps the *body's* last exit status,
+/// not `0`; only a loop whose body never ran at all reports `0`), which
+/// is why `status` is only ever assigned from a body execution, never
+/// reset back to `0` when the condition later becomes false.
+fn exec_while_or_until(
+    condition: &CommandList,
+    body: &CommandList,
+    continue_while: bool,
+    shell: &mut Shell,
+) -> i32 {
+    shell.loop_depth += 1;
+    let mut status = 0;
+    loop {
+        let cond_status = exec_command_list(condition, shell);
+        if shell.pending_control_flow.is_some() {
+            status = cond_status;
+            if matches!(take_loop_control_flow(shell), LoopStep::Continue) {
+                continue;
+            }
+            break;
+        }
+        if (cond_status == 0) != continue_while {
+            break;
+        }
+        status = exec_command_list(body, shell);
+        if matches!(take_loop_control_flow(shell), LoopStep::Break) {
+            break;
+        }
+    }
+    shell.loop_depth -= 1;
+    status
+}
+
+/// POSIX `for_clause` — see
+/// [`conch_shell_parser::ForClause`]'s docs for the `words: None` (no
+/// `in` clause) case this treats as a documented "not yet supported"
+/// error rather than silently iterating zero times (which would be
+/// indistinguishable from a real, empty `"$@"`, and so more misleading
+/// than an explicit error) — positional-parameter shell state is a
+/// deliberate Phase 3 follow-up, not implemented yet.
+fn exec_for(clause: &ForClause, shell: &mut Shell) -> i32 {
+    let Some(words) = &clause.words else {
+        eprintln!(
+            "conch: for {} (no 'in' clause, implicitly \"$@\"): positional parameters are not yet supported",
+            clause.name
+        );
+        return 1;
+    };
+
+    // Each wordlist item undergoes the exact same brace/field-splitting/
+    // globbing expansion a command argument would (POSIX: `wordlist`'s
+    // `WORD`s are ordinary words), flattened into one sequence of
+    // iteration values — reusing expand_words_fields is what makes
+    // `for f in *.txt; do ...; done` (one AST word, many loop iterations
+    // once the glob expands) work correctly.
+    let values = match expand_words_fields(words.iter(), shell) {
+        Ok(values) => values,
+        Err(err) => {
+            report_expand_error(&err, shell);
+            return 1;
+        }
+    };
+
+    shell.loop_depth += 1;
+    let mut status = 0;
+    for value in values {
+        shell.shell_vars.insert(clause.name.clone(), value);
+        status = exec_command_list(&clause.body, shell);
+        if matches!(take_loop_control_flow(shell), LoopStep::Break) {
+            break;
+        }
+    }
+    shell.loop_depth -= 1;
+    status
+}
+
+/// POSIX `case_clause`. Pattern matching reuses
+/// `conch-shell-core::expand`'s [`glob_match`] (the same POSIX 2.13
+/// pattern engine pathname expansion uses) via [`expand_word_as_pattern`]
+/// for the same quote-aware pattern text — see that function's docs.
+fn exec_case(clause: &CaseClause, shell: &mut Shell) -> i32 {
+    let word = match expand_word_single(&clause.word, shell) {
+        Ok(word) => word,
+        Err(err) => {
+            report_expand_error(&err, shell);
+            return 1;
+        }
+    };
+    for arm in &clause.arms {
+        for pattern in &arm.patterns {
+            let pattern_text = match expand_word_as_pattern(pattern, shell) {
+                Ok(text) => text,
+                Err(err) => {
+                    report_expand_error(&err, shell);
+                    return 1;
+                }
+            };
+            if glob_match(&pattern_text, &word) {
+                return exec_command_list(&arm.body, shell);
+            }
+        }
+    }
+    // POSIX: no pattern matched — exit status 0.
+    0
+}
+
+/// What a loop should do next after running one iteration of its body
+/// (or, for `while`/`until`, its condition) — see
+/// [`take_loop_control_flow`].
+enum LoopStep {
+    /// Run the next iteration normally (no control flow was pending, or
+    /// a `continue` targeted this exact loop).
+    Continue,
+    /// Stop this loop — either nothing was pending, and the loop's own
+    /// termination condition already said so, or a `break`/`continue`
+    /// targeted this loop or an outer one (in the outer case,
+    /// `shell.pending_control_flow` is left set, one level lower, for
+    /// the caller to keep propagating).
+    Break,
+}
+
+/// Consumes `shell.pending_control_flow` (see [`crate::ControlFlow`]'s
+/// docs) and decides what the loop that just finished running its body
+/// should do: `None` pending → [`LoopStep::Continue`] (nothing special
+/// happened, run the next iteration); `Break(1)`/`Continue(1)` → this
+/// loop is the target, so `Break`/[`LoopStep::Continue`] respectively,
+/// fully consumed; `Break(n)`/`Continue(n)` for `n > 1` → not this loop's
+/// signal, decrement to `n - 1`, leave it pending, and report
+/// [`LoopStep::Break`] so *this* loop still stops (unwinding is required
+/// either way — a `continue 2` from a doubly-nested loop still needs the
+/// inner loop to stop entirely, not just skip one inner iteration, since
+/// the target is the *outer* loop's next iteration).
+fn take_loop_control_flow(shell: &mut Shell) -> LoopStep {
+    match shell.pending_control_flow.take() {
+        None => LoopStep::Continue,
+        Some(ControlFlow::Break(1)) => LoopStep::Break,
+        Some(ControlFlow::Break(n)) => {
+            shell.pending_control_flow = Some(ControlFlow::Break(n.saturating_sub(1)));
+            LoopStep::Break
+        }
+        Some(ControlFlow::Continue(1)) => LoopStep::Continue,
+        // A continue level exceeding every loop that actually encloses
+        // it needs to be *clamped*, not just discarded once it runs out
+        // of loops to decrement through the way an over-large break is
+        // (see exec_command_list's docs) — by the time propagation would
+        // otherwise stop this (the outermost) loop entirely, it's too
+        // late to still act like a *continue* of it. `shell.loop_depth
+        // == 1` here means "I am that outermost loop" (it hasn't been
+        // decremented back yet at this point in exec_for/
+        // exec_while_or_until, so it still counts this loop itself).
+        // Confirmed against real bash: `continue 3` one loop deep
+        // behaves exactly like a plain `continue`.
+        Some(ControlFlow::Continue(_)) if shell.loop_depth == 1 => LoopStep::Continue,
+        Some(ControlFlow::Continue(n)) => {
+            shell.pending_control_flow = Some(ControlFlow::Continue(n.saturating_sub(1)));
+            LoopStep::Break
+        }
+    }
 }
 
 /// Runs one [`SimpleCommand`].
@@ -516,4 +919,233 @@ mod tests {
             panic!("should have been short-circuited");
         }
     }
+
+    // ---- compound commands: if/case ----------------------------------------
+
+    #[test]
+    fn if_runs_the_first_true_branch() {
+        let mut shell = Shell::new();
+        assert_eq!(run("if true; then echo a; else echo b; fi", &mut shell), 0);
+    }
+
+    #[test]
+    fn if_falls_through_to_else() {
+        let mut shell = Shell::new();
+        run("if false; then X=a; else X=b; fi", &mut shell);
+        assert_eq!(shell.get_var("X"), Some("b"));
+    }
+
+    #[test]
+    fn if_with_no_matching_branch_and_no_else_is_status_zero() {
+        let mut shell = Shell::new();
+        assert_eq!(run("if false; then echo a; fi", &mut shell), 0);
+    }
+
+    #[test]
+    fn case_runs_the_first_matching_arm_only() {
+        let mut shell = Shell::new();
+        run(
+            "X=b; case $X in a) Y=A;; b|c) Y=BC;; *) Y=other;; esac",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("Y"), Some("BC"));
+    }
+
+    #[test]
+    fn case_with_no_matching_arm_is_status_zero() {
+        let mut shell = Shell::new();
+        assert_eq!(run("case zzz in a) echo a;; esac", &mut shell), 0);
+    }
+
+    // ---- compound commands: for/while/until ---------------------------------
+
+    #[test]
+    fn for_loop_iterates_over_wordlist() {
+        let mut shell = Shell::new();
+        run("for x in a b c; do Y=$x; done", &mut shell);
+        assert_eq!(shell.get_var("Y"), Some("c"));
+    }
+
+    #[test]
+    fn while_loop_runs_until_condition_fails() {
+        let mut shell = Shell::new();
+        run(
+            "I=0; while [ \"$I\" != 3 ]; do I=$((I+1)); done",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("I"), Some("3"));
+    }
+
+    #[test]
+    fn while_loop_exit_status_is_last_body_execution_not_zero() {
+        // Confirmed against real bash: a while loop that runs its body
+        // and stops normally keeps the body's last exit status.
+        let mut shell = Shell::new();
+        assert_eq!(
+            run(
+                "I=0; while [ \"$I\" != 2 ]; do I=$((I+1)); false; done",
+                &mut shell
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn while_loop_that_never_runs_its_body_is_status_zero() {
+        let mut shell = Shell::new();
+        assert_eq!(run("while false; do false; done", &mut shell), 0);
+    }
+
+    // ---- subshell / brace group isolation -----------------------------------
+    //
+    // Subshell *execution* (isolation of cwd/variables/exit, exit-status
+    // propagation to the parent) is deliberately not unit-tested here:
+    // exec_subshell spawns `env::current_exe()`, which resolves to this
+    // test binary during `cargo test`, not the real `conch` executable —
+    // the same reason `run_command_substitution`'s own tests
+    // (`conch-shell-core::expand`) don't cover that half of command
+    // substitution either. This is exactly what `tests/conch-difftest`'s
+    // Phase 3 corpus is for, and it covers this against the real
+    // compiled binary.
+
+    #[test]
+    fn brace_group_leaks_variable_assignments() {
+        let mut shell = Shell::new();
+        shell.shell_vars.insert("X".into(), "outer".into());
+        run("{ X=inner; }", &mut shell);
+        assert_eq!(shell.get_var("X"), Some("inner"));
+    }
+
+    // ---- break/continue propagation mechanism --------------------------------
+    //
+    // conch-core doesn't depend on conch-shell-builtins (the real `break`/
+    // `continue` implementations live there, on top of this crate) --
+    // these test doubles set `Shell::pending_control_flow` exactly the
+    // way those builtins do, so the propagation mechanism itself
+    // (`exec_command_list`/`exec_for`/`exec_while_or_until`/
+    // `take_loop_control_flow`/`exec_subshell`) can be exercised in
+    // isolation, per-level, without spawning a real conch binary the way
+    // `tests/conch-difftest`'s Phase 3 corpus does for full end-to-end
+    // coverage.
+
+    struct TestBreak(u32);
+    impl crate::Builtin for TestBreak {
+        fn run(
+            &self,
+            shell: &mut Shell,
+            _args: &[String],
+            _stdout: &mut dyn std::io::Write,
+            _stderr: &mut dyn std::io::Write,
+        ) -> i32 {
+            shell.pending_control_flow = Some(ControlFlow::Break(self.0));
+            0
+        }
+    }
+
+    struct TestContinue(u32);
+    impl crate::Builtin for TestContinue {
+        fn run(
+            &self,
+            shell: &mut Shell,
+            _args: &[String],
+            _stdout: &mut dyn std::io::Write,
+            _stderr: &mut dyn std::io::Write,
+        ) -> i32 {
+            shell.pending_control_flow = Some(ControlFlow::Continue(self.0));
+            0
+        }
+    }
+
+    fn shell_with_control_flow_builtins() -> Shell {
+        let mut shell = Shell::new();
+        shell.register_builtin("tbreak", Box::new(TestBreak(1)));
+        shell.register_builtin("tbreak2", Box::new(TestBreak(2)));
+        shell.register_builtin("tbreak5", Box::new(TestBreak(5)));
+        shell.register_builtin("tcontinue", Box::new(TestContinue(1)));
+        shell.register_builtin("tcontinue3", Box::new(TestContinue(3)));
+        shell
+    }
+
+    #[test]
+    fn break_stops_a_while_loop_immediately() {
+        let mut shell = shell_with_control_flow_builtins();
+        run("I=0; while true; do I=$((I+1)); tbreak; done", &mut shell);
+        assert_eq!(shell.get_var("I"), Some("1"));
+        assert_eq!(shell.pending_control_flow, None);
+        assert_eq!(shell.loop_depth, 0);
+    }
+
+    #[test]
+    fn continue_skips_the_rest_of_the_current_iteration() {
+        let mut shell = shell_with_control_flow_builtins();
+        run(
+            "for x in a b; do Y=$Y$x; tcontinue; Y=${Y}Z; done",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("Y"), Some("ab"));
+    }
+
+    #[test]
+    fn nested_break_2_unwinds_both_loops() {
+        let mut shell = shell_with_control_flow_builtins();
+        run(
+            "for i in 1 2; do for j in a b; do L=$L$i$j; tbreak2; done; done",
+            &mut shell,
+        );
+        // Only the very first inner iteration (i=1,j=a) ever runs.
+        assert_eq!(shell.get_var("L"), Some("1a"));
+        assert_eq!(shell.loop_depth, 0);
+    }
+
+    #[test]
+    fn nested_continue_targeting_outer_loop_via_explicit_level() {
+        let mut shell = shell_with_control_flow_builtins();
+        shell.register_builtin("tcontinue2", Box::new(TestContinue(2)));
+        run(
+            "for i in 1 2; do L=$L\"(\"$i; for j in a b; do L=$L$j; tcontinue2; L=${L}Z; done; L=$L\")\"; done",
+            &mut shell,
+        );
+        // The inner loop's first iteration (j=a) runs partially (L gets
+        // "a" appended) before `continue 2` skips straight to the outer
+        // loop's *next* iteration -- not just j=b and the "Z" after
+        // tcontinue2, but also the outer body's own trailing `L=$L")"`,
+        // since a continue targeting the outer loop skips the rest of
+        // its current iteration too, not merely the inner loop.
+        assert_eq!(shell.get_var("L"), Some("(1a(2a"));
+    }
+
+    #[test]
+    fn break_level_exceeding_nesting_depth_breaks_every_loop_and_resumes_after() {
+        let mut shell = shell_with_control_flow_builtins();
+        run(
+            "for i in 1 2; do L=$L$i; tbreak5; done; L=${L}after",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("L"), Some("1after"));
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    #[test]
+    fn continue_level_exceeding_nesting_depth_clamps_to_outermost_loop() {
+        let mut shell = shell_with_control_flow_builtins();
+        run(
+            "for i in 1 2 3; do if [ \"$i\" = 2 ]; then tcontinue3; fi; L=$L$i; done",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("L"), Some("13"));
+    }
+
+    #[test]
+    fn break_outside_any_loop_does_not_stop_later_commands() {
+        let mut shell = shell_with_control_flow_builtins();
+        run("tbreak; X=ran", &mut shell);
+        assert_eq!(shell.get_var("X"), Some("ran"));
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    // `exit`-inside-a-subshell and break/continue-inside-a-subshell
+    // isolation both require actually *running* a subshell (a spawned
+    // process, per exec_subshell's docs) to observe, so — like the
+    // isolation tests above — they live in `tests/conch-difftest`'s
+    // Phase 3 corpus instead of here.
 }

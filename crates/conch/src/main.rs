@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use conch_shell_core::{Shell, exec_command_list};
+use conch_shell_core::{Shell, exec_program};
 use conch_shell_parser::parse;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
 /// error.
 fn run_source(source: &str, shell: &mut Shell) -> i32 {
     match parse(source) {
-        Ok(list) => exec_command_list(&list, shell),
+        Ok(list) => exec_program(&list, shell),
         Err(err) => {
             eprintln!("conch: {err}");
             2
@@ -71,7 +71,7 @@ fn run_interactive(shell: &mut Shell) -> i32 {
                 let _ = editor.add_history_entry(line.as_str());
                 match parse(&line) {
                     Ok(list) => {
-                        shell.last_status = exec_command_list(&list, shell);
+                        shell.last_status = exec_program(&list, shell);
                     }
                     Err(err) => eprintln!("conch: {err}"),
                 }

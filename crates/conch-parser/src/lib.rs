@@ -83,8 +83,10 @@ pub use arithmetic::{
     parse_arithmetic_body, parse_arithmetic_expr,
 };
 pub use ast::{
-    AndOrList, Assignment, Command, CommandList, CommandListItem, LogicalOp, Pipeline, Redirect,
-    RedirectOperator, Separator, SimpleCommand,
+    AndOrList, Assignment, CaseArm, CaseClause, CaseTerminator, Command, CommandList,
+    CommandListItem, CompoundCommand, CompoundCommandKind, ForClause, IfClause, LogicalOp,
+    Pipeline, Redirect, RedirectOperator, Separator, SimpleCommand, SubshellBody, UntilClause,
+    WhileClause,
 };
 pub use conch_shell_lexer::{
     CommandSubstitution, Operator, Parameter, SpecialParameter, SubstitutionStyle, Word,

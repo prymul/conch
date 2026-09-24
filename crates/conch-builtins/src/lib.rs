@@ -1,16 +1,19 @@
-//! Phase 1 builtin commands: `cd`, `exit`, `export`, `echo`, `pwd`.
+//! Builtin commands: `cd`, `exit`, `export`, `echo`, `pwd` (Phase 1), and
+//! the `break`/`continue` POSIX special builtins (Phase 3).
 
 use std::io::Write;
 
-use conch_shell_core::{Builtin, Shell};
+use conch_shell_core::{Builtin, ControlFlow, Shell};
 
-/// Registers every Phase 1 builtin into `shell`.
+/// Registers every builtin this crate implements into `shell`.
 pub fn register_all(shell: &mut Shell) {
     shell.register_builtin("cd", Box::new(Cd));
     shell.register_builtin("exit", Box::new(Exit));
     shell.register_builtin("export", Box::new(Export));
     shell.register_builtin("echo", Box::new(Echo));
     shell.register_builtin("pwd", Box::new(Pwd));
+    shell.register_builtin("break", Box::new(Break));
+    shell.register_builtin("continue", Box::new(Continue));
 }
 
 struct Cd;
@@ -67,6 +70,18 @@ impl Builtin for Exit {
             .first()
             .and_then(|arg| arg.parse::<i32>().ok())
             .unwrap_or(shell.last_status);
+
+        // Unconditional: this always terminates the real process, no
+        // signaling/indirection needed. That's correct even for `exit`
+        // run inside a subshell — confirmed against real bash it only
+        // terminates that subshell, not the parent — because
+        // `conch-shell-core::exec`'s subshell execution runs the
+        // subshell as a genuinely separate child process (re-execing
+        // `conch -c <body>`), so *this* call, from inside that child,
+        // naturally only ends the child. See that function's doc
+        // comment for the full reasoning (and why an in-process
+        // subshell design — an earlier candidate — couldn't make this
+        // builtin correct no matter how it signaled).
         std::process::exit(code);
     }
 }
@@ -128,6 +143,80 @@ impl Builtin for Pwd {
     }
 }
 
+/// `break [n]` / `continue [n]` (POSIX special builtins) share
+/// everything except which [`ControlFlow`] variant they request — both
+/// need the same `[n]` parsing (defaults to `1`; must be a positive
+/// integer) and the same "only meaningful inside a loop" guard, matching
+/// real bash's own wording for both.
+fn run_loop_control(
+    shell: &mut Shell,
+    args: &[String],
+    stderr: &mut dyn Write,
+    name: &str,
+    make: fn(u32) -> ControlFlow,
+) -> i32 {
+    let level = match args.first() {
+        None => 1,
+        Some(arg) => match arg.parse::<u32>() {
+            // POSIX: n must be >= 1; bash additionally clamps an
+            // out-of-range n down to the current nesting depth rather
+            // than erroring (confirmed against real bash: `break 5` two
+            // loops deep still breaks both, with the same "only
+            // meaningful..." diagnostic for the remainder — see
+            // conch-shell-core::exec's module docs) rather than treating
+            // n itself as invalid, so only `0` and non-numeric/negative
+            // text are rejected here.
+            Ok(0) | Err(_) => {
+                let _ = writeln!(stderr, "{name}: {arg}: loop count out of range");
+                return 1;
+            }
+            Ok(n) => n,
+        },
+    };
+
+    // Confirmed against real bash: `break`/`continue` outside any
+    // enclosing loop is a harmless no-op (script execution continues
+    // normally afterward) that only prints a diagnostic — it must *not*
+    // set a pending signal a later, unrelated loop could mistakenly
+    // catch.
+    if shell.loop_depth == 0 {
+        let _ = writeln!(
+            stderr,
+            "{name}: only meaningful in a `for', `while', or `until' loop"
+        );
+        return 0;
+    }
+
+    shell.pending_control_flow = Some(make(level));
+    0
+}
+
+struct Break;
+impl Builtin for Break {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        run_loop_control(shell, args, stderr, "break", ControlFlow::Break)
+    }
+}
+
+struct Continue;
+impl Builtin for Continue {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        run_loop_control(shell, args, stderr, "continue", ControlFlow::Continue)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,10 +233,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_registers_every_phase_1_builtin() {
+    fn register_all_registers_every_builtin() {
         let mut shell = Shell::new();
         register_all(&mut shell);
-        for name in ["cd", "exit", "export", "echo", "pwd"] {
+        for name in ["cd", "exit", "export", "echo", "pwd", "break", "continue"] {
             assert!(shell.builtin(name).is_some(), "missing builtin: {name}");
         }
     }
@@ -204,5 +293,63 @@ mod tests {
         let (status, stdout, _) = run(&Pwd, &mut shell, &[]);
         assert_eq!(status, 0);
         assert_eq!(stdout, expected);
+    }
+
+    #[test]
+    fn break_inside_a_loop_sets_pending_control_flow() {
+        let mut shell = Shell::new();
+        shell.loop_depth = 1;
+        let (status, _, stderr) = run(&Break, &mut shell, &[]);
+        assert_eq!(status, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Break(1)));
+    }
+
+    #[test]
+    fn break_with_explicit_level() {
+        let mut shell = Shell::new();
+        shell.loop_depth = 3;
+        run(&Break, &mut shell, &["2".to_string()]);
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Break(2)));
+    }
+
+    #[test]
+    fn continue_inside_a_loop_sets_pending_control_flow() {
+        let mut shell = Shell::new();
+        shell.loop_depth = 1;
+        run(&Continue, &mut shell, &[]);
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Continue(1)));
+    }
+
+    #[test]
+    fn break_outside_any_loop_is_a_harmless_no_op() {
+        // Confirmed against real bash: `break` outside a loop just
+        // prints a diagnostic and does *not* stop the rest of the
+        // script -- it must never set a pending signal here.
+        let mut shell = Shell::new();
+        assert_eq!(shell.loop_depth, 0);
+        let (status, _, stderr) = run(&Break, &mut shell, &[]);
+        assert_eq!(status, 0);
+        assert!(!stderr.is_empty());
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    #[test]
+    fn break_zero_is_out_of_range() {
+        let mut shell = Shell::new();
+        shell.loop_depth = 1;
+        let (status, _, stderr) = run(&Break, &mut shell, &["0".to_string()]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("out of range"));
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    #[test]
+    fn break_non_numeric_argument_is_out_of_range() {
+        let mut shell = Shell::new();
+        shell.loop_depth = 1;
+        let (status, _, stderr) = run(&Break, &mut shell, &["nope".to_string()]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("out of range"));
     }
 }

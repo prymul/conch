@@ -5,8 +5,48 @@ mod exec;
 mod expand;
 
 pub use brace::brace_expand;
-pub use exec::exec_command_list;
+pub use exec::{exec_command_list, exec_program};
 pub use expand::{ExpandError, expand_word_fields, expand_word_single};
+
+/// A `break [n]`/`continue [n]` (POSIX special builtins) in progress,
+/// working its way back up through the executor to whichever enclosing
+/// loop should catch it.
+///
+/// Builtins only ever get to communicate through their `i32` exit status
+/// and whatever they write to `stdout`/`stderr` (see [`Builtin::run`]) —
+/// there's no separate "and also do this control-flow thing" channel in
+/// that trait, matching every other POSIX special builtin. So `break`/
+/// `continue` (`conch-shell-builtins`) instead set
+/// [`Shell::pending_control_flow`], and every loop/list-execution site in
+/// `conch-shell-core`'s executor checks it after each command — see that
+/// crate's `exec.rs` for the full propagation mechanism (each loop level
+/// a signal passes through decrements its `n` by one, stopping there once
+/// `n` reaches `1`).
+///
+/// Deliberately *not* a two-variant enum hardcoded to just these two
+/// cases: a subshell-scoped `exit [n]` was an earlier candidate third
+/// variant here, but doesn't belong — POSIX requires real fork semantics
+/// for a subshell (`cd`/`exit`/every variable assignment inside must
+/// never affect the parent), and `conch-shell-core::exec` gets that for
+/// free by running a subshell as a genuine child process rather than
+/// in-process (see [`crate::exec::exec_subshell`]'s docs), so `exit`
+/// inside one already only terminates that child — no in-process signal
+/// needed at all. The deferred-functions follow-up's `return [n]` *will*
+/// need exactly this shape, though: a function call is not a process
+/// boundary, so unwinding out of one has to happen through this same
+/// kind of pending, decrementing-per-level signal. This type is kept as
+/// its own enum (not e.g. folded into a bool/two separate `Option`
+/// fields) specifically so adding a `Return(i32)` variant later is a
+/// small, natural extension rather than a redesign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFlow {
+    /// `break n` — stop the loop `n` levels up entirely (`n == 1` for
+    /// the innermost enclosing loop).
+    Break(u32),
+    /// `continue n` — skip straight to the next iteration of the loop
+    /// `n` levels up.
+    Continue(u32),
+}
 
 use std::collections::HashMap;
 use std::env;
@@ -32,6 +72,21 @@ pub struct Shell {
     /// failure and moves on — see `conch-shell-core`'s `exec.rs`'s
     /// `report_expand_error` for the full rationale.
     pub is_interactive: bool,
+    /// How many `while`/`until`/`for` loops currently enclose whatever's
+    /// executing right now — incremented/decremented by the executor
+    /// around each loop's body. A subshell runs as a genuinely separate
+    /// process (see [`crate::exec::exec_subshell`]'s docs) with its own
+    /// fresh `Shell`, so — unlike an earlier in-process design this
+    /// field went through — nothing here needs to reset or isolate this
+    /// counter at a subshell boundary; there's no shared state to
+    /// isolate it *from*. The `break`/`continue` builtins
+    /// (`conch-shell-builtins`) check this before setting
+    /// [`Self::pending_control_flow`] at all, matching real bash
+    /// printing "only meaningful in a `for', `while', or `until' loop"
+    /// and otherwise doing nothing when used outside any loop.
+    pub loop_depth: u32,
+    /// See [`ControlFlow`]'s docs.
+    pub pending_control_flow: Option<ControlFlow>,
     builtins: HashMap<String, Box<dyn Builtin>>,
 }
 
@@ -45,6 +100,8 @@ impl Shell {
             shell_vars: HashMap::new(),
             last_status: 0,
             is_interactive: false,
+            loop_depth: 0,
+            pending_control_flow: None,
             builtins: HashMap::new(),
         }
     }

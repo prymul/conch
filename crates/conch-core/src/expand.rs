@@ -451,29 +451,41 @@ fn evaluate_parameter_expansion(
             }
         }
         ParameterOperator::RemovePrefix { greedy, pattern } => {
-            let pattern_text = expand_pattern_operand(pattern, shell)?;
+            let pattern_text = expand_word_as_pattern(pattern, shell)?;
             Ok(remove_prefix(&current, &pattern_text, *greedy))
         }
         ParameterOperator::RemoveSuffix { greedy, pattern } => {
-            let pattern_text = expand_pattern_operand(pattern, shell)?;
+            let pattern_text = expand_word_as_pattern(pattern, shell)?;
             Ok(remove_suffix(&current, &pattern_text, *greedy))
         }
     }
 }
 
-/// Expands a `${parameter#pattern}`-shaped pattern operand while
-/// preserving which characters came from a quoted position, so a
-/// glob metacharacter that was quoted (`${v#a\*}`, `${v#a"*"}`) matches
-/// itself rather than acting as a wildcard. Confirmed against real bash
-/// this distinction is observable: with `v='a*c'`, `${v#a"*"}` is `c`
-/// (the quoted `*` is literal) but `${v#a*}` is `*c` (the unquoted `*`
-/// wildcards, matching zero extra characters for the *shortest* match).
-/// Plain [`expand_word_single`] can't preserve this — it flattens
-/// straight to a `String` and loses the per-character quoting tag — so
-/// this goes through [`expand_to_segments`] directly instead, exactly
-/// mirroring [`glob_field`]'s own pattern-building for pathname
-/// expansion (via the shared [`build_glob_pattern`]).
-fn expand_pattern_operand(word: &Word, shell: &mut Shell) -> Result<String, ExpandError> {
+/// Expands `word` into a POSIX 2.13 pattern string while preserving
+/// which characters came from a quoted position, so a glob
+/// metacharacter that was quoted (`${v#a\*}`, `${v#a"*"}`, `case $v in
+/// a"*") ...`) matches itself rather than acting as a wildcard.
+/// Confirmed against real bash this distinction is observable in both
+/// contexts: with `v='a*c'`, `${v#a"*"}` is `c` (the quoted `*` is
+/// literal) but `${v#a*}` is `*c` (the unquoted `*` wildcards, matching
+/// zero extra characters for the *shortest* match); with `x='*'`, `case
+/// $x in "*") ... ;; *) ... ;; esac` takes the first (literal) arm, but
+/// `x='hello'` takes the second (wildcard) one. Plain [`expand_word_single`]
+/// can't preserve this — it flattens straight to a `String` and loses
+/// the per-character quoting tag — so this goes through
+/// [`expand_to_segments`] directly instead, exactly mirroring
+/// [`glob_field`]'s own pattern-building for pathname expansion (via the
+/// shared [`build_glob_pattern`]).
+///
+/// Used both for parameter-expansion pattern operands (`${var#pattern}`
+/// and siblings, this module) and for `case` pattern matching
+/// (`conch-shell-core::exec`, which also reuses [`glob_match`] for the
+/// actual matching — both need the exact same quote-aware pattern
+/// notation, POSIX 2.13, not two different implementations of it).
+pub(crate) fn expand_word_as_pattern(
+    word: &Word,
+    shell: &mut Shell,
+) -> Result<String, ExpandError> {
     let segments = expand_to_segments(word, shell)?;
     Ok(build_glob_pattern(&segments))
 }
@@ -884,7 +896,7 @@ fn glob_field(field: Vec<Segment>, cwd: &Path) -> Result<Vec<String>, ExpandErro
 /// metacharacter (and literal backslash) that came from a
 /// non-glob-eligible (i.e. quoted) segment so it matches itself rather
 /// than acting as a wildcard. Shared by pathname expansion ([`glob_field`])
-/// and parameter-expansion pattern operands ([`expand_pattern_operand`]),
+/// and parameter-expansion pattern operands ([`expand_word_as_pattern`]),
 /// which both need the same quoted-vs-unquoted distinction for pattern
 /// metacharacters.
 fn build_glob_pattern(segments: &[Segment]) -> String {
@@ -924,7 +936,14 @@ fn glob_match_dir(dir: &Path, pattern: &str) -> Vec<String> {
         .collect()
 }
 
-fn glob_match(pattern: &str, name: &str) -> bool {
+/// A full, anchored match of `pattern` (POSIX 2.13 notation, already
+/// glob-escaped as needed by [`expand_word_as_pattern`]) against `name` —
+/// `pattern` must match the *entire* string, not just a prefix/suffix of
+/// it. This is what pathname expansion needs (a directory entry either
+/// matches a glob or it doesn't), and, reused directly, what `case`
+/// pattern matching needs too (`conch-shell-core::exec`) — the same
+/// "does this pattern match this whole string" question either way.
+pub(crate) fn glob_match(pattern: &str, name: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = name.chars().collect();
     glob_match_at(&pat, 0, &text, 0)
