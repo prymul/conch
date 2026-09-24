@@ -1,0 +1,95 @@
+# Phase 3 -- `for var in word1 word2 word3; do ...; done` loops.
+#
+# All POSIX baseline (no bash-only `for ((...))` C-style loop here -- that's
+# a bash extension out of this corpus's scope), so every case runs against
+# both `bash` and `sh`. `break`/`continue` with no numeric level argument are
+# covered here; the numeric-level form (`break 2`, `continue 2`) gets its
+# own dedicated file, `nested_loops.toml`, since that's the genuinely tricky
+# part worth isolating.
+
+[[case]]
+name = "for-loop-basic-iterates-word-list-in-order"
+description = "a for loop over a literal word list assigns each word to the loop variable in order"
+tags = ["control-flow", "for"]
+oracles = ["bash", "sh"]
+script = '''
+for var in word1 word2 word3; do
+  echo "$var"
+done
+'''
+
+[[case]]
+name = "for-loop-variable-retains-last-value-after-loop-ends"
+description = "the for loop variable is an ordinary shell variable that keeps its final value after the loop finishes, not scoped to the loop body"
+tags = ["control-flow", "for"]
+oracles = ["bash", "sh"]
+script = '''
+for var in a b c; do
+  :
+done
+echo "$var"
+'''
+
+[[case]]
+name = "for-loop-empty-word-list-runs-body-zero-times"
+description = "for var in ; (an explicitly empty word list) never executes the loop body at all"
+tags = ["control-flow", "for"]
+oracles = ["bash", "sh"]
+script = '''
+for var in ; do
+  echo should-not-print
+done
+echo done
+'''
+
+[[case]]
+name = "for-loop-break-exits-the-loop-immediately"
+description = "break inside a for loop stops iterating immediately, skipping the remaining words in the list"
+tags = ["control-flow", "for", "break"]
+oracles = ["bash", "sh"]
+script = '''
+for var in a b c d; do
+  if [ "$var" = c ]; then
+    break
+  fi
+  echo "$var"
+done
+'''
+
+[[case]]
+name = "for-loop-continue-skips-to-the-next-word"
+description = "continue inside a for loop skips the rest of the current iteration's body and advances to the next word"
+tags = ["control-flow", "for", "continue"]
+oracles = ["bash", "sh"]
+script = '''
+for var in a b c d; do
+  if [ "$var" = b ]; then
+    continue
+  fi
+  echo "$var"
+done
+'''
+
+[[case]]
+name = "for-loop-exit-status-is-last-body-command-when-successful"
+description = "a for loop that completes normally exits with the status of the last command run in its body"
+tags = ["control-flow", "for", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+for var in a b c; do
+  true
+done
+echo $?
+'''
+
+[[case]]
+name = "for-loop-exit-status-is-last-body-command-when-failing"
+description = "the same last-body-command exit status rule applies when that command fails"
+tags = ["control-flow", "for", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+for var in a b c; do
+  false
+done
+echo $?
+'''

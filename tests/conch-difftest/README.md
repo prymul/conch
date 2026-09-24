@@ -43,6 +43,18 @@ but deliberately runs in **report-only mode** against conch regardless of
 `CONCH_DIFFTEST_STRICT` -- see "Phase-specific strict gates" below for
 exactly how, and why that separation matters.
 
+**Phase 3** (control flow: `if`/`elif`/`else`, `for`, `while`/`until`
+with `break`/`continue` including the numeric level argument, `case`,
+subshells, and brace groups) is being implemented concurrently in
+`crates/conch-parser`/`crates/conch-core` at the time the `phase3/`
+corpus was written -- as of this writing conch's executor still only
+handles `Command::Simple` (Phase 1) and panics on everything else, so
+every Phase 3 case is expected to fail against conch for now. That
+corpus (51 cases across 6 files) is, like Phase 2's, fully built,
+self-validated, and oracle-verified against real bash/dash today, and
+also runs in **report-only mode** via its own `CONCH_DIFFTEST_STRICT_PHASE3`
+gate -- see "Phase-specific strict gates" below.
+
 Every phase's three-test pattern is the same (`{phase}_corpus_validation.rs`,
 `{phase}_oracle_selfcheck.rs`, `{phase}_differential.rs` -- Phase 1's
 happen to be un-prefixed since they were written first):
@@ -69,21 +81,28 @@ to see all of this today, including every phase's live report.
 Each phase's `{phase}_differential.rs` checks its **own**, separately
 named env var rather than a single shared one -- `differential.rs` (Phase
 1) checks `CONCH_DIFFTEST_STRICT`; `phase2_differential.rs` checks
-`CONCH_DIFFTEST_STRICT_PHASE2`; a hypothetical Phase 3 would check
-`CONCH_DIFFTEST_STRICT_PHASE3`; and so on. This is deliberate and is the
+`CONCH_DIFFTEST_STRICT_PHASE2`; `phase3_differential.rs` checks
+`CONCH_DIFFTEST_STRICT_PHASE3`; a hypothetical Phase 4 would check
+`CONCH_DIFFTEST_STRICT_PHASE4`; and so on. This is deliberate and is the
 whole mechanism that keeps phases independent: CI's `difftest` job runs
 `cargo test -p conch-difftest`, which builds and runs *every* test binary
 in this crate regardless of which corpora are actually finished, so
 turning one phase's corpus into a hard gate must never silently pull a
 still-in-progress later phase's corpus along with it (and, symmetrically,
 a later phase going green shouldn't require touching the earlier phase's
-gate). Flip a phase to strict by setting its own var to `1` -- locally,
-or by adding it to the `difftest` job's `env:` in
-`.github/workflows/ci.yml` -- once that phase's execution has landed and
-its corpus is expected to be fully green. Don't reuse
-`CONCH_DIFFTEST_STRICT` itself for a later phase; a shared flag would
-mean the day Phase 1 legitimately earns a hard gate is the same day every
-not-yet-implemented later phase starts failing the build too.
+gate). This is exactly why the `phase3/` corpus in this repo could be
+built and merged concurrently with the Phase 3 grammar/executor work
+itself without any risk to Phase 1's `CONCH_DIFFTEST_STRICT=1` hard gate
+or Phase 2's `CONCH_DIFFTEST_STRICT_PHASE2` state -- `phase3_differential.rs`
+runs and reports every time `cargo test -p conch-difftest` does, but
+can't fail the build unless someone deliberately opts it in. Flip a
+phase to strict by setting its own var to `1` -- locally, or by adding it
+to the `difftest` job's `env:` in `.github/workflows/ci.yml` -- once that
+phase's execution has landed and its corpus is expected to be fully
+green. Don't reuse an earlier phase's flag (e.g. `CONCH_DIFFTEST_STRICT`
+or `CONCH_DIFFTEST_STRICT_PHASE2`) for a later phase; a shared flag would
+mean the day an earlier phase legitimately earns a hard gate is the same
+day every not-yet-implemented later phase starts failing the build too.
 
 ## Directory layout
 
@@ -110,21 +129,31 @@ tests/conch-difftest/
 │   │   ├── expansion.toml
 │   │   ├── builtins.toml
 │   │   └── invocation_modes.toml
-│   └── phase2/                      <- same style, one file per expansion kind
-│       ├── brace_expansion.toml
-│       ├── tilde_expansion.toml
-│       ├── parameter_expansion.toml
-│       ├── command_substitution.toml
-│       ├── arithmetic_expansion.toml
-│       ├── globbing.toml
-│       └── word_splitting.toml
+│   ├── phase2/                      <- same style, one file per expansion kind
+│   │   ├── brace_expansion.toml
+│   │   ├── tilde_expansion.toml
+│   │   ├── parameter_expansion.toml
+│   │   ├── command_substitution.toml
+│   │   ├── arithmetic_expansion.toml
+│   │   ├── globbing.toml
+│   │   └── word_splitting.toml
+│   └── phase3/                      <- same style, one file per control-flow construct
+│       ├── conditionals.toml
+│       ├── for_loops.toml
+│       ├── while_until_loops.toml
+│       ├── nested_loops.toml            (break N / continue N -- see its own header)
+│       ├── case_statements.toml
+│       └── subshells_and_groups.toml
 └── tests/
     ├── corpus_validation.rs
     ├── oracle_selfcheck.rs
     ├── differential.rs
     ├── phase2_corpus_validation.rs
     ├── phase2_oracle_selfcheck.rs
-    └── phase2_differential.rs
+    ├── phase2_differential.rs
+    ├── phase3_corpus_validation.rs
+    ├── phase3_oracle_selfcheck.rs
+    └── phase3_differential.rs
 ```
 
 Why a workspace member under `tests/`, not a bare `tests/*.rs` at the
@@ -310,13 +339,17 @@ promised yet:
   target. Worth a `known-differences.md` entry once conch's echo flag
   behavior is actually decided.
 
-Phase 2's corpus (`corpus/phase2/`, `tests/phase2_*.rs`) follows exactly
-this pattern -- see "Directory layout" and "Phase-specific strict gates"
-above. If you add a Phase 3 (or later) corpus, do the same: a sibling
-`corpus/phase3/` directory, `tests/phase3_{corpus_validation,
+Phase 2's corpus (`corpus/phase2/`, `tests/phase2_*.rs`) and Phase 3's
+corpus (`corpus/phase3/`, `tests/phase3_*.rs`) both follow exactly this
+pattern -- see "Directory layout" and "Phase-specific strict gates"
+above. If you add a Phase 4 (or later) corpus, do the same: a sibling
+`corpus/phase4/` directory, `tests/phase4_{corpus_validation,
 oracle_selfcheck,differential}.rs` following the same `corpus::load_dir`
-/ `runner::run_*` pattern, and its own `CONCH_DIFFTEST_STRICT_PHASE3` --
-nothing about the harness itself is phase-specific.
+/ `runner::run_*` pattern, and its own `CONCH_DIFFTEST_STRICT_PHASE4` --
+nothing about the harness itself is phase-specific. Phase 4 (job control)
+will also be the first phase that needs a new `normalize.rs` rule
+(`$$`/`$!` PID substitution) before its corpus can even pass its own
+oracle self-check -- see "Non-determinism and normalization" above.
 
 ### Phase 2 scoping notes
 
@@ -339,6 +372,34 @@ specified order. Two things worth knowing about how it's organized:
   bullet), so no case here depends on `${arr[@]}`-style expansion, even
   though brace expansion's "empty alternative disappears via ordinary
   unquoted-word elision" behavior is most easily demonstrated with one.
+
+### Phase 3 scoping notes
+
+`corpus/phase3/` covers the Phase 3 plan bullet's control-flow
+constructs: `if`/`elif`/`else`/`fi`, `for`, `while`/`until`,
+`break`/`continue` (with and without the numeric level argument),
+`case`/`esac`, subshells, and brace groups. All of it is POSIX baseline
+-- there is no bash-only control-flow extension in scope here (bash's
+`;;&`/`;&` `case` fallthrough terminators and `for ((...))` C-style loop
+are both bash extensions and are deliberately left out, same rationale as
+Phase 2's bash-extension carve-outs) -- so every case in this corpus runs
+against both `oracles = ["bash", "sh"]` with no split needed, unlike
+`corpus/phase2/`.
+
+`corpus/phase3/nested_loops.toml` is the file most worth reading before
+adding to: POSIX's `break n` / `continue n` numeric level argument is a
+genuinely easy thing to get backwards when hand-writing a script (an
+`until`/`while` loop where the increment happens *after* the point a
+`continue 2` fires never reaches its own increment, which is an infinite
+loop, not a test failure) -- its header spells out the exact contrasts
+each case is meant to demonstrate, and every script in that file was run
+against real bash and dash directly, under a hard wall-clock timeout
+guard, while building this corpus.
+
+Every `pwd`/`cd`-observing case in `corpus/phase3/subshells_and_groups.toml`
+needs `normalize = ["workdir"]` for the same reason Phase 1's
+`cd-then-pwd-reflects-new-directory` does -- see "Non-determinism and
+normalization" above.
 
 ## Wiring in real execution
 
@@ -400,4 +461,24 @@ cargo test -p conch-difftest --test phase2_differential -- --nocapture
 
 # Phase 2 hard gate, once warranted:
 CONCH_DIFFTEST_STRICT_PHASE2=1 cargo test -p conch-difftest --test phase2_differential -- --nocapture
+```
+
+Likewise for Phase 3 once its execution semantics land in
+`crates/conch-core`, substituting `phase3_differential` and
+`CONCH_DIFFTEST_STRICT_PHASE3`. As of this writing, conch's executor only
+handles `Command::Simple` (Phase 1) and panics (exit code 101) on every
+`Command` variant Phase 3 introduces, so `phase3_differential` reports
+0/102 against a built conch binary today -- that's the expected,
+correct-for-the-wrong-reason-not-being-a-corpus-bug state described in
+"Status as of this writing" above, confirmed by running the panic
+directly (`conch -c 'if true; then echo hi; fi'` → `internal error:
+entered unreachable code: conch-shell-parser only produces Command::Simple
+in Phase 1`), not a mismatch traceable to any corpus case's own script:
+
+```sh
+# Phase 3 full report, report-only (today's state):
+cargo test -p conch-difftest --test phase3_differential -- --nocapture
+
+# Phase 3 hard gate, once warranted:
+CONCH_DIFFTEST_STRICT_PHASE3=1 cargo test -p conch-difftest --test phase3_differential -- --nocapture
 ```
