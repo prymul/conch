@@ -23,6 +23,15 @@ pub struct Shell {
     pub shell_vars: HashMap<String, String>,
     /// The exit status of the most recently run command (`$?`).
     pub last_status: i32,
+    /// Whether this session is an interactive REPL rather than a `-c`
+    /// string or script file. Defaults to `false`
+    /// ([`Shell::new`]/[`Shell::default`]); the `conch` binary's
+    /// interactive-mode entry point sets it explicitly. Affects only
+    /// whether a POSIX-mandated *fatal* expansion error (`${var:?word}`
+    /// on an unset parameter) exits the whole process or just reports a
+    /// failure and moves on — see `conch-shell-core`'s `exec.rs`'s
+    /// `report_expand_error` for the full rationale.
+    pub is_interactive: bool,
     builtins: HashMap<String, Box<dyn Builtin>>,
 }
 
@@ -35,6 +44,7 @@ impl Shell {
             env_vars: env::vars().collect(),
             shell_vars: HashMap::new(),
             last_status: 0,
+            is_interactive: false,
             builtins: HashMap::new(),
         }
     }

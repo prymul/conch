@@ -47,6 +47,12 @@ fn run_source(source: &str, shell: &mut Shell) -> i32 {
 }
 
 fn run_interactive(shell: &mut Shell) -> i32 {
+    // A POSIX-mandated *fatal* expansion error (`${var:?word}` on an
+    // unset parameter) exits the whole process in non-interactive mode
+    // but only returns to the prompt here — see `conch-shell-core`'s
+    // `report_expand_error` for the full rationale.
+    shell.is_interactive = true;
+
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
         Err(err) => {

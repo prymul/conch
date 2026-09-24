@@ -106,8 +106,8 @@ fn exec_simple(
 ) -> (i32, Option<Vec<u8>>) {
     let assignments = match expand_assignments(cmd, shell) {
         Ok(assignments) => assignments,
-        Err(message) => {
-            eprintln!("conch: {message}");
+        Err(err) => {
+            report_expand_error(&err, shell);
             return (1, None);
         }
     };
@@ -132,7 +132,7 @@ fn exec_simple(
     let mut all_fields = match expand_words_fields(std::iter::once(name_word), shell) {
         Ok(fields) => fields.into_iter(),
         Err(err) => {
-            eprintln!("conch: {err}");
+            report_expand_error(&err, shell);
             return (1, None);
         }
     };
@@ -146,15 +146,15 @@ fn exec_simple(
     match expand_words_fields(cmd.args.iter(), shell) {
         Ok(fields) => args.extend(fields),
         Err(err) => {
-            eprintln!("conch: {err}");
+            report_expand_error(&err, shell);
             return (1, None);
         }
     }
 
     let redirects = match expand_redirects(cmd, shell) {
         Ok(redirects) => redirects,
-        Err(message) => {
-            eprintln!("conch: {message}");
+        Err(err) => {
+            report_expand_error(&err, shell);
             return (1, None);
         }
     };
@@ -188,13 +188,12 @@ fn exec_simple(
 fn expand_assignments(
     cmd: &SimpleCommand,
     shell: &mut Shell,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, ExpandError> {
     cmd.assignments
         .iter()
         .map(|assignment| {
             expand_word_single(&assignment.value, shell)
                 .map(|value| (assignment.name.clone(), value))
-                .map_err(|err| err.to_string())
         })
         .collect()
 }
@@ -208,12 +207,11 @@ struct ExpandedRedirect {
 fn expand_redirects(
     cmd: &SimpleCommand,
     shell: &mut Shell,
-) -> Result<Vec<ExpandedRedirect>, String> {
+) -> Result<Vec<ExpandedRedirect>, ExpandError> {
     cmd.redirects
         .iter()
         .map(|redirect: &Redirect| {
-            let target =
-                expand_word_single(&redirect.target, shell).map_err(|err| err.to_string())?;
+            let target = expand_word_single(&redirect.target, shell)?;
             let default_fd = match redirect.operator {
                 RedirectOperator::Input => 0,
                 RedirectOperator::Output | RedirectOperator::Append => 1,
@@ -225,6 +223,37 @@ fn expand_redirects(
             })
         })
         .collect()
+}
+
+/// Reports an expansion failure the way an ordinary command failure is
+/// reported (print to stderr, let the caller treat it as exit status 1
+/// and move on) — *unless* `err` is the one POSIX 2.6.2 mandates is fatal
+/// to the whole (non-interactive) shell: `${parameter:?word}` /
+/// `${parameter?word}` on an unset (or, colon form, null) parameter. In
+/// that case this exits the process outright instead of returning.
+///
+/// Confirmed against both real bash and dash: regardless of shell or
+/// invocation mode (`-c '...'` vs a script file), *nothing after* a
+/// triggered `${var:?...}` ever runs — only the specific exit code
+/// varies (127/1 for bash depending on invocation mode, 2 for dash),
+/// which conch doesn't attempt to replicate exactly (this always uses 1)
+/// since nothing downstream depends on matching it — see
+/// `tests/conch-difftest/known-differences.md`'s "Cross-shell quirks"
+/// section for the full grounding.
+///
+/// Only checked when `!shell.is_interactive`: an interactive shell
+/// returns to its prompt on this error rather than exiting the whole
+/// session (POSIX 2.6.2) — conch doesn't yet abort just "the rest of the
+/// current input line" for the interactive case (a smaller, distinct gap
+/// from exiting the process, and not one the differential suite's
+/// non-interactive `-c`/script-file cases exercise), so interactive mode
+/// keeps today's "print and move on to the next command" behavior for
+/// every `ExpandError` variant, same as before this function existed.
+fn report_expand_error(err: &ExpandError, shell: &Shell) {
+    eprintln!("conch: {err}");
+    if !shell.is_interactive && matches!(err, ExpandError::ParameterNullOrUnset(_)) {
+        std::process::exit(1);
+    }
 }
 
 fn exec_builtin(
