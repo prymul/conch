@@ -5,9 +5,9 @@ use conch_shell_lexer::{Operator, Span, Token, TokenKind, Word, WordSegment};
 
 use crate::ast::{
     AndOrList, Assignment, CaseArm, CaseClause, CaseTerminator, Command, CommandList,
-    CommandListItem, CompoundCommand, CompoundCommandKind, ForClause, IfClause, LogicalOp,
-    Pipeline, Redirect, RedirectOperator, Separator, SimpleCommand, SubshellBody, UntilClause,
-    WhileClause,
+    CommandListItem, CompoundCommand, CompoundCommandKind, ForClause, FunctionDefinition, IfClause,
+    LogicalOp, Pipeline, Redirect, RedirectOperator, Separator, SimpleCommand, SubshellBody,
+    UntilClause, WhileClause,
 };
 use crate::error::ParseError;
 
@@ -35,33 +35,60 @@ struct Parser<'a> {
     /// `conch-shell-lexer` already hands `conch-shell-core` the verbatim
     /// body of a `$(...)`/`` `...` `` command substitution.
     source: &'a str,
-    tokens: std::iter::Peekable<std::vec::IntoIter<Token>>,
+    /// A `Vec` + cursor index rather than the `Peekable<IntoIter<Token>>`
+    /// this used to be — needed for [`Self::peek_nth`], which the POSIX
+    /// `fname()` function-definition form requires: distinguishing
+    /// `foo()` (a function definition) from an ordinary simple command
+    /// named `foo` followed by a stray `(` needs to look two tokens
+    /// ahead (`Word`, then immediately `(`, then `)`), which a
+    /// single-token `Peekable` can't do. Every other cursor primitive
+    /// keeps the exact same signature it always had, so this doesn't
+    /// ripple out to the dozens of existing `peek`/`next` call sites —
+    /// only this struct and the primitives themselves changed.
+    tokens: Vec<Token>,
+    pos: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(source: &'a str, tokens: Vec<Token>) -> Self {
         Self {
             source,
-            tokens: tokens.into_iter().peekable(),
+            tokens,
+            pos: 0,
         }
     }
 
     // ---- cursor primitives ----------------------------------------------
 
-    fn peek(&mut self) -> Option<&Token> {
-        self.tokens.peek()
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
     }
 
-    fn peek_kind(&mut self) -> Option<&TokenKind> {
-        self.tokens.peek().map(|t| &t.kind)
+    fn peek_kind(&self) -> Option<&TokenKind> {
+        self.peek().map(|t| &t.kind)
+    }
+
+    /// Looks `n` tokens past the current position without consuming
+    /// anything (`peek_nth(0)` is equivalent to [`Self::peek`]). See
+    /// [`Self::at_posix_function_definition`] for why this exists.
+    fn peek_nth(&self, n: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + n)
+    }
+
+    fn peek_nth_kind(&self, n: usize) -> Option<&TokenKind> {
+        self.peek_nth(n).map(|t| &t.kind)
     }
 
     fn next(&mut self) -> Option<Token> {
-        self.tokens.next()
+        let tok = self.tokens.get(self.pos).cloned();
+        if tok.is_some() {
+            self.pos += 1;
+        }
+        tok
     }
 
-    fn at_eof(&mut self) -> bool {
-        self.tokens.peek().is_none()
+    fn at_eof(&self) -> bool {
+        self.pos >= self.tokens.len()
     }
 
     /// POSIX `linebreak`: zero or more `NEWLINE` tokens.
@@ -178,6 +205,26 @@ impl<'a> Parser<'a> {
     ///
     /// [`Command`]: crate::ast::Command
     fn parse_command(&mut self) -> Result<Command, ParseError> {
+        // Function definitions are checked *before* everything else in
+        // this function, including the subshell/reserved-word compound-
+        // command dispatch just below — both function-definition forms
+        // are otherwise ambiguous with it: the bash `function` keyword
+        // form starts with a reserved word the same way `if`/`for`/...
+        // do, and the POSIX `fname()` form starts with an ordinary
+        // `Word`, which `parse_simple_command` would otherwise happily
+        // swallow as an ordinary command name (with the stray `()`
+        // left over to confuse the next parse step — see
+        // `at_posix_function_definition`'s docs for why 2-token
+        // lookahead is what actually disambiguates this from a plain
+        // command).
+        if matches!(self.peek_reserved(), Some(ReservedWord::Function)) {
+            return Ok(Command::Function(
+                self.parse_function_definition_with_keyword()?,
+            ));
+        }
+        if self.at_posix_function_definition() {
+            return Ok(Command::Function(self.parse_function_definition_posix()?));
+        }
         if matches!(
             self.peek_kind(),
             Some(TokenKind::Operator(Operator::LParen))
@@ -192,6 +239,9 @@ impl<'a> Parser<'a> {
                 ReservedWord::While => Ok(Command::Compound(self.parse_while_clause()?)),
                 ReservedWord::Until => Ok(Command::Compound(self.parse_until_clause()?)),
                 ReservedWord::Case => Ok(Command::Compound(self.parse_case_clause()?)),
+                // `Function` is fully handled above, before this match is
+                // ever reached.
+                ReservedWord::Function => unreachable!("handled above"),
                 // Every other reserved word (`then`/`elif`/`else`/`fi`/
                 // `do`/`done`/`esac`/`in`/`}`) can never legally *start*
                 // a fresh command — matching real bash's "syntax error
@@ -209,6 +259,93 @@ impl<'a> Parser<'a> {
             };
         }
         Ok(Command::Simple(self.parse_simple_command()?))
+    }
+
+    // ---- function definitions ---------------------------------------------
+
+    /// Whether the parser is positioned at the POSIX `fname '(' ')'`
+    /// shape: a plain `Word`, immediately (no intervening tokens, though
+    /// blanks are fine — they're never tokens to begin with) followed by
+    /// `(` then `)`. This is the one place in the whole grammar that
+    /// needs more than one token of lookahead — everywhere else, seeing
+    /// the current token alone is enough to know which production
+    /// applies. Confirmed against real bash that blanks are tolerated
+    /// throughout (`foo ( ) { ...; }` works exactly like `foo() {...}`),
+    /// which this gets for free since whitespace was never tokenized in
+    /// the first place.
+    ///
+    /// Deliberately does *not* also require the `Word` to already be a
+    /// valid [`is_valid_name`] — [`Self::parse_function_definition_posix`]
+    /// calls [`Self::expect_name`] itself once this returns `true`, which
+    /// gives a clear "expected a name" error for something like `1x() { :; }`
+    /// rather than silently falling through to parsing `1x` as an
+    /// ordinary command name with a stray `()` left over.
+    fn at_posix_function_definition(&self) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Word(_)))
+            && matches!(
+                self.peek_nth_kind(1),
+                Some(TokenKind::Operator(Operator::LParen))
+            )
+            && matches!(
+                self.peek_nth_kind(2),
+                Some(TokenKind::Operator(Operator::RParen))
+            )
+    }
+
+    /// POSIX `function_definition : fname '(' ')' linebreak function_body`.
+    fn parse_function_definition_posix(&mut self) -> Result<FunctionDefinition, ParseError> {
+        let name = self.expect_name()?;
+        self.expect_operator(Operator::LParen, "'('")?;
+        self.expect_operator(Operator::RParen, "')'")?;
+        self.skip_newlines();
+        let body = self.parse_function_body()?;
+        Ok(FunctionDefinition { name, body })
+    }
+
+    /// bash extension: `function fname [()] compound-command` — the
+    /// parens are optional here (unlike the POSIX form, where they're
+    /// mandatory and the only thing that signals "this is a function
+    /// definition" at all).
+    fn parse_function_definition_with_keyword(&mut self) -> Result<FunctionDefinition, ParseError> {
+        self.expect_reserved(ReservedWord::Function)?;
+        let name = self.expect_name()?;
+        if matches!(
+            self.peek_kind(),
+            Some(TokenKind::Operator(Operator::LParen))
+        ) {
+            self.expect_operator(Operator::LParen, "'('")?;
+            self.expect_operator(Operator::RParen, "')'")?;
+        }
+        self.skip_newlines();
+        let body = self.parse_function_body()?;
+        Ok(FunctionDefinition { name, body })
+    }
+
+    /// POSIX `function_body : compound_command | compound_command
+    /// redirect_list` — POSIX permits *any* compound command as a
+    /// function's body, not just a brace group (confirmed against real
+    /// bash: `foo() (echo subshell-body)` is valid, running the body in
+    /// a subshell every time `foo` is called). Rule 9 (word expansion
+    /// and assignment never apply while parsing a function body) is
+    /// already true of this whole parser — it never evaluates anything,
+    /// only builds a tree — so there's nothing extra to do for that part
+    /// of the rule.
+    fn parse_function_body(&mut self) -> Result<CompoundCommand, ParseError> {
+        if matches!(
+            self.peek_kind(),
+            Some(TokenKind::Operator(Operator::LParen))
+        ) {
+            return self.parse_subshell();
+        }
+        match self.peek_reserved() {
+            Some(ReservedWord::LBrace) => self.parse_brace_group(),
+            Some(ReservedWord::If) => self.parse_if_clause(),
+            Some(ReservedWord::For) => self.parse_for_clause(),
+            Some(ReservedWord::While) => self.parse_while_clause(),
+            Some(ReservedWord::Until) => self.parse_until_clause(),
+            Some(ReservedWord::Case) => self.parse_case_clause(),
+            _ => Err(self.error_for_unexpected("a compound command (a function's body)")),
+        }
     }
 
     // ---- compound commands (POSIX 2.10.2's `compound_command`) ----------
@@ -738,11 +875,12 @@ fn is_redirect_operator(op: Operator) -> bool {
     matches!(op, Operator::Less | Operator::Great | Operator::DGreat)
 }
 
-/// The POSIX 2.4 reserved words this parser recognizes — the subset
-/// needed for Phase 3's compound commands. `!` (pipeline negation) and
-/// bash's own extensions (`[[`, `]]`, `function`, `select`) are
-/// deliberately excluded, matching how `!` was already out of scope for
-/// [`Pipeline`] before this phase.
+/// The POSIX 2.4 reserved words this parser recognizes, plus one bash
+/// extension (`function`, for `function fname [()] compound-command` —
+/// see [`Parser::parse_function_definition_with_keyword`]). `!`
+/// (pipeline negation) and bash's other extensions (`[[`, `]]`,
+/// `select`) are still deliberately excluded, matching how `!` was
+/// already out of scope for [`Pipeline`] before this phase.
 ///
 /// [`Pipeline`]: crate::ast::Pipeline
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,6 +900,7 @@ enum ReservedWord {
     In,
     LBrace,
     RBrace,
+    Function,
 }
 
 /// Matches `word` against the reserved-word set — POSIX 2.10.2 rule 1:
@@ -794,6 +933,7 @@ fn reserved_word(word: &Word) -> Option<ReservedWord> {
         "in" => Some(ReservedWord::In),
         "{" => Some(ReservedWord::LBrace),
         "}" => Some(ReservedWord::RBrace),
+        "function" => Some(ReservedWord::Function),
         _ => None,
     }
 }
@@ -815,6 +955,7 @@ fn reserved_word_text(word: ReservedWord) -> &'static str {
         ReservedWord::In => "'in'",
         ReservedWord::LBrace => "'{'",
         ReservedWord::RBrace => "'}'",
+        ReservedWord::Function => "'function'",
     }
 }
 

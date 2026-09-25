@@ -84,9 +84,9 @@ pub use arithmetic::{
 };
 pub use ast::{
     AndOrList, Assignment, CaseArm, CaseClause, CaseTerminator, Command, CommandList,
-    CommandListItem, CompoundCommand, CompoundCommandKind, ForClause, IfClause, LogicalOp,
-    Pipeline, Redirect, RedirectOperator, Separator, SimpleCommand, SubshellBody, UntilClause,
-    WhileClause,
+    CommandListItem, CompoundCommand, CompoundCommandKind, ForClause, FunctionDefinition, IfClause,
+    LogicalOp, Pipeline, Redirect, RedirectOperator, Separator, SimpleCommand, SubshellBody,
+    UntilClause, WhileClause,
 };
 pub use conch_shell_lexer::{
     CommandSubstitution, Operator, Parameter, SpecialParameter, SubstitutionStyle, Word,

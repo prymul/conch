@@ -91,9 +91,8 @@ pub struct Pipeline {
     pub commands: Vec<Command>,
 }
 
-/// POSIX `command`. `function_definition` is a deliberate follow-up (see
-/// the module docs) — `#[non_exhaustive]` so adding it later isn't a
-/// breaking change for `conch-shell-core`.
+/// POSIX `command`. `#[non_exhaustive]` so adding a future variant isn't
+/// a breaking change for `conch-shell-core`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
@@ -102,6 +101,25 @@ pub enum Command {
     /// `redirect_list`, folded into [`CompoundCommand::redirects`] —
     /// see that type's docs).
     Compound(CompoundCommand),
+    /// POSIX `function_definition` (plus the bash `function` keyword
+    /// extension — see [`FunctionDefinition`]'s docs).
+    Function(FunctionDefinition),
+}
+
+/// A function definition — either POSIX `function_definition : fname '('
+/// ')' linebreak function_body`, or the bash extension `function fname
+/// [()] compound-command` (parens optional there). Both forms produce
+/// this same shape; nothing downstream needs to know which syntax was
+/// used to define it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDefinition {
+    /// POSIX `fname : NAME` (rule 8) — validated the same way
+    /// [`ForClause::name`] already is.
+    pub name: String,
+    /// POSIX `function_body : compound_command | compound_command
+    /// redirect_list` — any compound command, not just a brace group
+    /// (confirmed against real bash: `foo() (subshell-body)` is valid).
+    pub body: CompoundCommand,
 }
 
 /// POSIX `compound_command`, together with any trailing `redirect_list`

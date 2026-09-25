@@ -31,13 +31,14 @@ pub use expand::{ExpandError, expand_word_fields, expand_word_single};
 /// free by running a subshell as a genuine child process rather than
 /// in-process (see [`crate::exec::exec_subshell`]'s docs), so `exit`
 /// inside one already only terminates that child — no in-process signal
-/// needed at all. The deferred-functions follow-up's `return [n]` *will*
-/// need exactly this shape, though: a function call is not a process
-/// boundary, so unwinding out of one has to happen through this same
-/// kind of pending, decrementing-per-level signal. This type is kept as
-/// its own enum (not e.g. folded into a bool/two separate `Option`
-/// fields) specifically so adding a `Return(i32)` variant later is a
-/// small, natural extension rather than a redesign.
+/// needed at all. [`ControlFlow::Return`] *does* need exactly this
+/// shape, though: a function call is not a process boundary, so
+/// unwinding out of one has to happen through this same kind of
+/// pending, decrementing-per-level (well — not decrementing, for
+/// `Return`; see its own docs) signal. This type is kept as its own
+/// enum (not e.g. folded into a bool/two separate `Option` fields)
+/// specifically so that variant was a small, natural extension rather
+/// than a redesign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlow {
     /// `break n` — stop the loop `n` levels up entirely (`n == 1` for
@@ -46,6 +47,24 @@ pub enum ControlFlow {
     /// `continue n` — skip straight to the next iteration of the loop
     /// `n` levels up.
     Continue(u32),
+    /// `return [n]` — stop the *function call* currently executing, with
+    /// exit status `n`. Unlike `Break`/`Continue`, this never decrements
+    /// as it propagates through nested loops/`if`/`case` bodies inside
+    /// the function — there's only ever one function-call boundary to
+    /// reach, not `n` levels of them — it just needs to keep unwinding,
+    /// unchanged, until `conch-shell-core::exec`'s function-call
+    /// execution path (the only thing that ever constructs this variant
+    /// is the `return` builtin, `conch-shell-builtins`) catches it and
+    /// converts it into that call's own return value. Confirmed against
+    /// real bash that a `break`/`continue` still pending when a function
+    /// call's own body finishes (i.e. one that named a level deeper than
+    /// any loop lexically inside that function) does *not* escape to a
+    /// loop merely *calling* the function — a function call is its own
+    /// break/continue boundary too, exactly like the top-level program
+    /// is (see [`crate::exec::exec_program`]'s docs) — so the function-
+    /// call boundary discards+warns on a leftover `Break`/`Continue` the
+    /// same way, rather than ever letting either escape past it.
+    Return(i32),
 }
 
 use std::collections::HashMap;
@@ -87,7 +106,111 @@ pub struct Shell {
     pub loop_depth: u32,
     /// See [`ControlFlow`]'s docs.
     pub pending_control_flow: Option<ControlFlow>,
+    /// `$0` — confirmed against real bash: `-c '...'`/interactive mode
+    /// uses the shell's own invocation name (`"bash"`), while script-file
+    /// mode uses the script path exactly as given on the command line,
+    /// regardless of the script's own arguments. Defaults to `"conch"`
+    /// (`Shell::new`/`Shell::default`), matching the `-c`/interactive
+    /// case; the `conch` binary's script-file entry point overwrites this
+    /// with the script path. Never changed by a function call (confirmed
+    /// against real bash: `$0` inside a function is still the *shell's*
+    /// name/script path, not the function's own name) — contrast
+    /// [`Shell::positional_params`], which a function call *does*
+    /// temporarily replace.
+    pub arg0: String,
+    /// `$1`, `$2`, ... / `$@`/`$*`/`$#` (POSIX 2.5.2) — index `0` is `$1`.
+    /// A function call temporarily replaces this with its own arguments
+    /// for the duration of the call (confirmed against real bash:
+    /// positional parameters are call-local, not shared with the
+    /// caller's), restoring the caller's own afterward — see
+    /// `conch-shell-core::exec`'s function-call execution path.
+    pub positional_params: Vec<String>,
+    /// Shell functions defined so far (`name() { ...; }`, or the bash
+    /// `function name { ...; }` extension), keyed by name — POSIX 2.9.5 /
+    /// bash manual §3.3. A later definition of the same name silently
+    /// replaces the earlier one (confirmed against real bash: no error,
+    /// no warning).
+    pub functions: HashMap<String, conch_shell_parser::FunctionDefinition>,
+    /// How many function calls are currently on the call stack — `return`
+    /// (`conch-shell-builtins`) only makes sense with this `> 0` (POSIX:
+    /// outside a function — or a sourced script, which conch doesn't
+    /// implement yet — `return` is an error; confirmed against real bash
+    /// this doesn't just silently no-op the way `break`/`continue` do
+    /// outside a loop, unlike those it returns a genuine nonzero exit
+    /// status). Incremented/decremented by
+    /// `conch-shell-core::exec::exec_function_call`, exactly mirroring
+    /// [`Self::loop_depth`]'s own convention.
+    pub function_depth: u32,
+    /// One frame per currently-active function call (pushed on entry,
+    /// popped on return — `conch-shell-core::exec::exec_function_call`),
+    /// each holding the `(name, previous binding)` pairs the `local`
+    /// builtin (`conch-shell-builtins`) has shadowed *during that call*,
+    /// in declaration order, restored in reverse once the call ends (see
+    /// [`Shell::restore_var`]'s docs for why declaration-order LIFO
+    /// restoration is correct even for two `local`s of the same name in
+    /// one call).
+    ///
+    /// Deliberately *not* a separate "local scope" lookup layer
+    /// ([`Self::get_var`]/[`Self::env_vars`]/[`Self::shell_vars`] stay
+    /// completely unchanged, with no scope-chain lookup added to any of
+    /// them) — `local` instead temporarily overwrites the *same*
+    /// `env_vars`/`shell_vars` entry a plain assignment would, and this
+    /// stack exists purely to remember what to put back once the
+    /// declaring call returns. This is deliberately what makes an
+    /// ordinary (non-`local`) assignment inside a function body correctly
+    /// mutate whatever's currently live — the global, or an outer
+    /// caller's own still-active `local`, whichever is closer — with zero
+    /// extra code at every existing assignment site: confirmed against
+    /// real bash `local` is *dynamically* scoped, not lexically (`X=g;
+    /// outer() { local X=o; inner; }; inner() { X=set_by_inner; };
+    /// outer` leaves the global `X` at `g`, unchanged, exactly as if
+    /// `inner`'s assignment had targeted `outer`'s own `local X` — which,
+    /// under this single-shared-map design, it structurally does, for
+    /// free).
+    local_stack: Vec<Vec<(String, PreviousVar)>>,
     builtins: HashMap<String, Box<dyn Builtin>>,
+    /// Which builtins in [`Self::builtins`] are POSIX 2.9.1's "special"
+    /// builtins (`break`, `continue`, `exit`, `export`, `return`, `set`,
+    /// `shift`, ...) rather than "regular" ones (`cd`, `echo`, `pwd`,
+    /// `local`, ...) — kept purely as a structural classification (see
+    /// [`Self::is_special_builtin`]/[`Self::register_special_builtin`]),
+    /// *not* currently used to stop a same-named function from shadowing
+    /// one.
+    ///
+    /// POSIX 2.9.1's command search order actually puts special builtins
+    /// *ahead* of functions specifically because 2.9.5 says a function
+    /// must never be allowed to shadow one — an earlier version of
+    /// `conch-shell-core::exec`'s command lookup enforced exactly that.
+    /// But confirmed against real bash 5.3: outside `--posix` mode, bash
+    /// actually lets a function shadow even a special builtin like
+    /// `export`/`break` (`export() { echo fake; }; export FOO=bar` runs
+    /// the fake function and never sets `FOO`; only `bash --posix`
+    /// refuses, with "`export': is a special builtin"). Since this
+    /// project already tracks bash's real default behavior over strict
+    /// POSIX-only where the two diverge elsewhere (see e.g. the
+    /// arithmetic module's own docs for the same policy), and the
+    /// differential suite's primary oracle is real, non-`--posix` bash,
+    /// a function is allowed to shadow *any* builtin — see
+    /// `conch-shell-core::exec`'s command-lookup docs for exactly where
+    /// this is decided.
+    special_builtins: std::collections::HashSet<String>,
+}
+
+/// What a variable's binding was, if anything, immediately before a
+/// `local` declaration shadowed it — captured by [`Shell::capture_var`]
+/// (used by the `local` builtin, `conch-shell-builtins`), restored by
+/// [`Shell::restore_var`] (used by `conch-shell-core::exec`'s
+/// function-call execution path once the declaring call returns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviousVar {
+    /// `name` wasn't bound in either [`Shell::env_vars`] or
+    /// [`Shell::shell_vars`] at all before the `local` that shadowed it.
+    Unset,
+    /// `name` held this value in [`Shell::shell_vars`] (i.e. was a
+    /// shell-only, non-exported variable).
+    ShellVar(String),
+    /// `name` held this value in [`Shell::env_vars`] (i.e. was exported).
+    EnvVar(String),
 }
 
 impl Shell {
@@ -102,7 +225,13 @@ impl Shell {
             is_interactive: false,
             loop_depth: 0,
             pending_control_flow: None,
+            arg0: "conch".to_string(),
+            positional_params: Vec::new(),
+            functions: HashMap::new(),
+            function_depth: 0,
+            local_stack: Vec::new(),
             builtins: HashMap::new(),
+            special_builtins: std::collections::HashSet::new(),
         }
     }
 
@@ -115,13 +244,36 @@ impl Shell {
             .map(String::as_str)
     }
 
-    /// Registers a builtin under `name`, replacing any existing builtin
-    /// with the same name.
+    /// Registers a *regular* builtin under `name` (POSIX 2.9.1's
+    /// non-special category) — replacing any existing builtin with the
+    /// same name. See [`Self::register_special_builtin`] for the other
+    /// kind, and [`Self::special_builtins`]'s docs for why this
+    /// distinction no longer affects whether a same-named function can
+    /// shadow either one.
     pub fn register_builtin(&mut self, name: impl Into<String>, builtin: Box<dyn Builtin>) {
         self.builtins.insert(name.into(), builtin);
     }
 
-    /// Returns the builtin registered under `name`, if any.
+    /// Registers a *special* builtin under `name` (POSIX 2.9.1's special
+    /// category — `break`, `continue`, `exit`, `export`, `return`, `set`,
+    /// `shift`, ...) — replacing any existing builtin with the same name.
+    /// See [`Self::special_builtins`]'s docs for what this classification
+    /// is (and isn't) used for.
+    pub fn register_special_builtin(&mut self, name: impl Into<String>, builtin: Box<dyn Builtin>) {
+        let name = name.into();
+        self.special_builtins.insert(name.clone());
+        self.builtins.insert(name, builtin);
+    }
+
+    /// Whether `name` was registered via [`Self::register_special_builtin`]
+    /// rather than [`Self::register_builtin`] — see
+    /// [`Self::special_builtins`]'s docs.
+    pub fn is_special_builtin(&self, name: &str) -> bool {
+        self.special_builtins.contains(name)
+    }
+
+    /// Returns the builtin registered under `name`, if any (special or
+    /// regular alike — see [`Self::is_special_builtin`] to distinguish).
     pub fn builtin(&self, name: &str) -> Option<&dyn Builtin> {
         self.builtins.get(name).map(AsRef::as_ref)
     }
@@ -133,6 +285,109 @@ impl Shell {
     /// back with [`Shell::register_builtin`].
     pub fn take_builtin(&mut self, name: &str) -> Option<Box<dyn Builtin>> {
         self.builtins.remove(name)
+    }
+
+    /// Captures `name`'s current binding, for a `local` declaration
+    /// (`conch-shell-builtins`) to later hand to [`Self::restore_var`]
+    /// once the declaring function call returns. See
+    /// [`Shell::local_stack`]'s docs for the full mechanism.
+    pub fn capture_var(&self, name: &str) -> PreviousVar {
+        if let Some(value) = self.env_vars.get(name) {
+            PreviousVar::EnvVar(value.clone())
+        } else if let Some(value) = self.shell_vars.get(name) {
+            PreviousVar::ShellVar(value.clone())
+        } else {
+            PreviousVar::Unset
+        }
+    }
+
+    /// Restores a binding previously captured by [`Self::capture_var`],
+    /// overwriting whatever `name` is currently bound to (if anything) in
+    /// either map.
+    pub fn restore_var(&mut self, name: &str, previous: PreviousVar) {
+        self.env_vars.remove(name);
+        self.shell_vars.remove(name);
+        match previous {
+            PreviousVar::Unset => {}
+            PreviousVar::ShellVar(value) => {
+                self.shell_vars.insert(name.to_string(), value);
+            }
+            PreviousVar::EnvVar(value) => {
+                self.env_vars.insert(name.to_string(), value);
+            }
+        }
+    }
+
+    /// Applies a `local NAME[=value]` declaration's *new* binding — the
+    /// capture/restore-list bookkeeping is the caller's job (the `local`
+    /// builtin, `conch-shell-builtins`: capture via [`Self::capture_var`]
+    /// first, push it onto the current call's [`Self::push_local_frame`]
+    /// frame, *then* call this). `value: None` is a bare `local NAME` (no
+    /// `=`) — confirmed against real bash this makes the name genuinely
+    /// *unset* within the new scope (`${NAME+is-set}` is empty), not
+    /// merely set to an empty string, so this removes `name` from both
+    /// maps rather than inserting `""`. `value: Some(v)` writes `v` into
+    /// whichever of [`Self::env_vars`]/[`Self::shell_vars`] `name`
+    /// already lived in — so an already-exported variable stays exported
+    /// once shadowed (confirmed against real bash: `export X=1; f() {
+    /// local X=2; ...; }` still shows `X=2` in a child process's
+    /// inherited environment) — defaulting to `shell_vars` (not exported)
+    /// for a name with no prior binding at all, matching bash's own
+    /// default for a brand new `local`.
+    pub fn set_local(&mut self, name: &str, value: Option<String>) {
+        let was_exported = self.env_vars.contains_key(name);
+        self.env_vars.remove(name);
+        self.shell_vars.remove(name);
+        if let Some(value) = value {
+            if was_exported {
+                self.env_vars.insert(name.to_string(), value);
+            } else {
+                self.shell_vars.insert(name.to_string(), value);
+            }
+        }
+    }
+
+    /// Pushes a fresh, empty `local` restore-list frame for a function
+    /// call that's just starting — see [`Shell::local_stack`]'s docs.
+    pub fn push_local_frame(&mut self) {
+        self.local_stack.push(Vec::new());
+    }
+
+    /// Records that `name`'s binding was `previous` immediately before
+    /// the *current* (innermost active) function call's `local`
+    /// declaration overwrote it — appends to the frame
+    /// [`Self::push_local_frame`] most recently pushed. Does nothing if
+    /// called with no function call active (the `local` builtin checks
+    /// for that itself and never calls this in that case — see
+    /// [`Self::in_function_call`]).
+    pub fn record_local(&mut self, name: String, previous: PreviousVar) {
+        if let Some(frame) = self.local_stack.last_mut() {
+            frame.push((name, previous));
+        }
+    }
+
+    /// Whether a `local` declaration is currently valid (POSIX/bash:
+    /// `local` — like `return` — is only meaningful inside a function
+    /// call).
+    pub fn in_function_call(&self) -> bool {
+        !self.local_stack.is_empty()
+    }
+
+    /// Pops the innermost function call's `local` restore-list frame and
+    /// restores every binding it shadowed, in reverse (LIFO) declaration
+    /// order — called once that call's body finishes running, regardless
+    /// of how it ended (normal completion or `return`). Reverse order is
+    /// what makes two `local`s of the *same* name within one call restore
+    /// correctly: each restore only ever needs to undo the most recent
+    /// shadow, one step at a time, which — applied repeatedly — correctly
+    /// unwinds all the way back to the true pre-call binding no matter
+    /// how many times that call re-shadowed the same name.
+    pub fn pop_local_frame(&mut self) {
+        if let Some(frame) = self.local_stack.pop() {
+            for (name, previous) in frame.into_iter().rev() {
+                self.restore_var(&name, previous);
+            }
+        }
     }
 }
 

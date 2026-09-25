@@ -62,7 +62,8 @@ use std::process::Stdio;
 
 use conch_shell_parser::{
     AndOrList, CaseClause, Command, CommandList, CompoundCommand, CompoundCommandKind, ForClause,
-    IfClause, LogicalOp, Pipeline, Redirect, RedirectOperator, SimpleCommand, Word,
+    FunctionDefinition, IfClause, LogicalOp, Pipeline, Redirect, RedirectOperator, SimpleCommand,
+    Word,
 };
 
 use crate::expand::{expand_word_as_pattern, glob_match};
@@ -145,10 +146,31 @@ pub fn exec_program(list: &CommandList, shell: &mut Shell) -> i32 {
     status
 }
 
+/// The exact message real bash prints for a `break`/`continue` with
+/// nowhere left to go — shared by [`warn_on_unhandled_control_flow`] (the
+/// top-level-program backstop) and [`exec_function_call`] (the
+/// function-call-boundary backstop — see its docs for why a function call
+/// needs this exact same discard-and-warn treatment).
+const UNHANDLED_LOOP_CONTROL_MSG: &str =
+    "conch: break/continue: only meaningful in a `for', `while', or `until' loop";
+
 /// See [`exec_program`]'s docs.
 fn warn_on_unhandled_control_flow(shell: &mut Shell) {
-    if shell.pending_control_flow.take().is_some() {
-        eprintln!("conch: break/continue: only meaningful in a `for', `while', or `until' loop");
+    // `Return` should never actually reach here — the `return` builtin
+    // (`conch-shell-builtins`) only ever sets it when
+    // `Shell::in_function_call()` is true, and `exec_function_call`
+    // always consumes it before returning — but this is still written to
+    // handle it correctly (rather than printing a misleading
+    // break/continue-shaped message) if that invariant were ever
+    // violated, instead of relying on it silently.
+    match shell.pending_control_flow.take() {
+        Some(ControlFlow::Break(_) | ControlFlow::Continue(_)) => {
+            eprintln!("{UNHANDLED_LOOP_CONTROL_MSG}");
+        }
+        Some(ControlFlow::Return(_)) => {
+            eprintln!("conch: return: can only `return' from a function or sourced script");
+        }
+        None => {}
     }
 }
 
@@ -189,12 +211,21 @@ fn exec_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> i32 {
                 let _ = carry_in.take();
                 (exec_compound(compound, shell), None)
             }
-            // Command is #[non_exhaustive] in conch-shell-parser for a
-            // future function_definition variant (a deliberate Phase 3
-            // follow-up — see conch-shell-parser::ast's module docs);
-            // conch-shell-parser itself never produces anything but
-            // Simple/Compound today.
-            _ => unreachable!("conch-shell-parser only produces Simple/Compound commands"),
+            Command::Function(func) => {
+                // POSIX: defining a function is itself a command with
+                // exit status 0 (confirmed against real bash: `foo() {
+                // :; }; echo $?` prints 0) — it doesn't *run* anything,
+                // just registers it. A later definition of the same
+                // name silently replaces the earlier one (also confirmed
+                // against real bash).
+                let _ = carry_in.take();
+                shell.functions.insert(func.name.clone(), func.clone());
+                (0, None)
+            }
+            // Command is #[non_exhaustive] in conch-shell-parser purely
+            // as a general forward-compatibility precaution; it already
+            // covers all three cases the grammar produces.
+            _ => unreachable!("conch-shell-parser only produces Simple/Compound/Function commands"),
         };
         status = this_status;
         carry_in = output;
@@ -304,6 +335,71 @@ fn exec_subshell(source: &str, shell: &Shell) -> i32 {
     }
 }
 
+/// Calls a shell function — POSIX 2.9.5 / bash manual §3.3. `args`
+/// excludes the function's own name (matches an ordinary command's own
+/// `args`, sans `name`). Runs entirely *in-process*, unlike a subshell
+/// ([`exec_subshell`]): a function call isn't a real fork boundary in any
+/// shell — it shares the caller's variables, `cwd`, and everything else
+/// by design (confirmed against real bash: `cd`/a non-`local` assignment
+/// inside a function are visible to the caller after it returns).
+///
+/// Four pieces of state get temporarily replaced for the duration of the
+/// call, each restored afterward regardless of how the call ended (normal
+/// completion, a pending `break`/`continue` with nowhere left to go, or
+/// `return`):
+///
+/// - [`Shell::positional_params`]: replaced with `args` (confirmed
+///   against real bash: `$1`/`$#`/`"$@"`/... inside a function are the
+///   function's own arguments, not the caller's).
+/// - [`Shell::loop_depth`]: reset to `0`. A function call is its own
+///   `break`/`continue` boundary, exactly like the top-level program is
+///   ([`exec_program`]) — confirmed against real bash: a `break` inside a
+///   function only ever stops a loop lexically inside that *same*
+///   function, never a loop merely *calling* it, even though
+///   `loop_depth` would otherwise still be nonzero at that point. Without
+///   this reset, a `break`/`continue` whose level exceeds the function's
+///   own internal loop nesting would incorrectly keep unwinding into the
+///   caller's own enclosing loop instead of stopping (with the same
+///   diagnostic real bash prints) right here.
+/// - A fresh [`Shell::push_local_frame`]: so `local` declarations made
+///   during this call restore correctly once it ends
+///   ([`Shell::pop_local_frame`]) — see [`Shell::local_stack`]'s docs for
+///   why this, deliberately, is *not* a new variable-lookup scope layer.
+/// - [`Shell::function_depth`]: incremented so `return` (`conch-shell-builtins`)
+///   can tell it's valid to use.
+///
+/// [`Shell::arg0`] (`$0`) is deliberately *not* touched — confirmed
+/// against real bash `$0` inside a function is still the shell's own
+/// name/script path, never the function's name.
+fn exec_function_call(func: &FunctionDefinition, args: &[String], shell: &mut Shell) -> i32 {
+    let previous_positional = std::mem::replace(&mut shell.positional_params, args.to_vec());
+    let previous_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
+    shell.push_local_frame();
+    shell.function_depth += 1;
+
+    let status = exec_compound(&func.body, shell);
+
+    // POSIX: falling off the end of a function body uses the last
+    // command's own exit status (confirmed against real bash: `f() {
+    // false; }; f; echo $?` -> 1) — exactly what `status` above already
+    // is, so the `None` arm below leaves it untouched.
+    let status = match shell.pending_control_flow.take() {
+        Some(ControlFlow::Return(code)) => code,
+        Some(ControlFlow::Break(_) | ControlFlow::Continue(_)) => {
+            eprintln!("{UNHANDLED_LOOP_CONTROL_MSG}");
+            status
+        }
+        None => status,
+    };
+
+    shell.function_depth -= 1;
+    shell.pop_local_frame();
+    shell.positional_params = previous_positional;
+    shell.loop_depth = previous_loop_depth;
+
+    status
+}
+
 /// POSIX `if_clause`/`else_part` — see
 /// [`conch_shell_parser::IfClause`]'s docs for how the AST already
 /// flattens the `elif` chain, which is what keeps this a single loop
@@ -365,34 +461,32 @@ fn exec_while_or_until(
     status
 }
 
-/// POSIX `for_clause` — see
-/// [`conch_shell_parser::ForClause`]'s docs for the `words: None` (no
-/// `in` clause) case this treats as a documented "not yet supported"
-/// error rather than silently iterating zero times (which would be
-/// indistinguishable from a real, empty `"$@"`, and so more misleading
-/// than an explicit error) — positional-parameter shell state is a
-/// deliberate Phase 3 follow-up, not implemented yet.
+/// POSIX `for_clause` — see [`conch_shell_parser::ForClause`]'s docs for
+/// the `words: None` (no `in` clause) case, which POSIX defines as
+/// implicitly `for name in "$@"`: iterating each current positional
+/// parameter as its own value, verbatim (POSIX 2.5.2's quoted-`"$@"`
+/// "one field per positional parameter" behavior — not the ordinary
+/// brace/field-splitting/globbing expansion the `in`-clause case below
+/// gets, since there's no *word* here at all for that to apply to).
 fn exec_for(clause: &ForClause, shell: &mut Shell) -> i32 {
-    let Some(words) = &clause.words else {
-        eprintln!(
-            "conch: for {} (no 'in' clause, implicitly \"$@\"): positional parameters are not yet supported",
-            clause.name
-        );
-        return 1;
-    };
-
-    // Each wordlist item undergoes the exact same brace/field-splitting/
-    // globbing expansion a command argument would (POSIX: `wordlist`'s
-    // `WORD`s are ordinary words), flattened into one sequence of
-    // iteration values — reusing expand_words_fields is what makes
-    // `for f in *.txt; do ...; done` (one AST word, many loop iterations
-    // once the glob expands) work correctly.
-    let values = match expand_words_fields(words.iter(), shell) {
-        Ok(values) => values,
-        Err(err) => {
-            report_expand_error(&err, shell);
-            return 1;
+    let values = match &clause.words {
+        Some(words) => {
+            // Each wordlist item undergoes the exact same
+            // brace/field-splitting/globbing expansion a command
+            // argument would (POSIX: `wordlist`'s `WORD`s are ordinary
+            // words), flattened into one sequence of iteration values —
+            // reusing expand_words_fields is what makes `for f in
+            // *.txt; do ...; done` (one AST word, many loop iterations
+            // once the glob expands) work correctly.
+            match expand_words_fields(words.iter(), shell) {
+                Ok(values) => values,
+                Err(err) => {
+                    report_expand_error(&err, shell);
+                    return 1;
+                }
+            }
         }
+        None => shell.positional_params.clone(),
     };
 
     shell.loop_depth += 1;
@@ -489,6 +583,17 @@ fn take_loop_control_flow(shell: &mut Shell) -> LoopStep {
             shell.pending_control_flow = Some(ControlFlow::Continue(n.saturating_sub(1)));
             LoopStep::Break
         }
+        // `return` never targets a loop at all -- it's always headed for
+        // the nearest enclosing function call's own boundary
+        // (`exec_function_call`), however many loops it has to unwind
+        // through to get there. Put back unchanged (no level to
+        // decrement -- see `ControlFlow::Return`'s docs) and report
+        // `Break` so this loop still stops, exactly like an over-large
+        // break/continue does on its way further out.
+        Some(ControlFlow::Return(code)) => {
+            shell.pending_control_flow = Some(ControlFlow::Return(code));
+            LoopStep::Break
+        }
     }
 }
 
@@ -562,9 +667,31 @@ fn exec_simple(
         }
     };
 
-    if let Some(builtin_name) = shell.builtin(&name).is_some().then(|| name.clone()) {
+    // Command search order: functions → builtins (special or regular
+    // alike) → PATH. POSIX 2.9.1/2.9.5 actually puts special builtins
+    // *ahead* of functions, specifically because a function is never
+    // allowed to shadow one — but confirmed against real bash 5.3 in its
+    // *default* (non-`--posix`) mode, a function shadows even a special
+    // builtin like `export`/`break` just fine (`export() { echo fake;
+    // }; export FOO=bar` runs the fake function, never sets `FOO`; only
+    // `bash --posix` refuses with "`export': is a special builtin").
+    // This project tracks bash's real default behavior over strict
+    // POSIX-only where the two diverge (see e.g. the arithmetic module's
+    // own docs for the same policy applied elsewhere), and the
+    // differential suite's primary oracle is real (non-`--posix`) bash,
+    // so a function is checked *first* here, unconditionally — the
+    // special/regular builtin distinction
+    // ([`Shell::is_special_builtin`]) is kept (still structurally useful
+    // for anything that needs POSIX's own categorization later) but no
+    // longer used to block a function from shadowing one.
+    if let Some(func) = shell.functions.get(&name).cloned() {
+        let status = exec_function(&func, shell, &args, &assignments, &redirects);
+        return (status, None);
+    }
+
+    if shell.builtin(&name).is_some() {
         return exec_builtin(
-            &builtin_name,
+            &name,
             shell,
             &args,
             &assignments,
@@ -582,6 +709,70 @@ fn exec_simple(
         &redirects,
         capture_output,
     )
+}
+
+/// Calls a shell function that was found via ordinary command-name
+/// lookup (`exec_simple`) — i.e. an actual *call* (`f`, `f arg1 arg2`,
+/// `FOO=bar f`), as opposed to a `Command::Function` *definition*
+/// (`f() { ...; }`, handled entirely separately in [`exec_pipeline`]).
+///
+/// Prefix assignments (`FOO=bar f`) get the same temporary,
+/// per-call-only treatment [`exec_builtin`] already gives a builtin
+/// (confirmed against real bash: `FOO=temp f` doesn't leave `FOO` set
+/// afterward) — everything else about actually running the call is
+/// [`exec_function_call`]'s job.
+///
+/// Known simplification, consistent with the module's other "a compound
+/// command doesn't get the in-memory stdout-buffer treatment a plain
+/// external/builtin command does" gap (see the module docs): a
+/// function's own combined output isn't captured into a buffer the way
+/// [`exec_builtin`]'s is, so a function call used as a non-last pipeline
+/// stage (`f | grep x`) or with its own output redirect (`f > file`)
+/// doesn't yet work correctly — confirmed against real bash both of
+/// those *do* work there, so this is a real, deliberate gap, not a
+/// theoretical one. Implementing it correctly would need genuine OS-level
+/// file-descriptor redirection around the whole call (every nested
+/// builtin/external command inside the function body writes to the real
+/// inherited stdout today, not through any single capturable sink this
+/// crate controls) — meaningfully riskier and outside this follow-up's
+/// asked-for scope, so a redirect on a function call site is reported
+/// clearly instead of silently misbehaving, matching
+/// [`exec_compound`]'s own precedent for a compound command's own
+/// trailing redirect.
+fn exec_function(
+    func: &FunctionDefinition,
+    shell: &mut Shell,
+    args: &[String],
+    assignments: &[(String, String)],
+    redirects: &[ExpandedRedirect],
+) -> i32 {
+    if !redirects.is_empty() {
+        eprintln!("conch: a function call's own output redirect (`f > file`) is not yet supported");
+        return 1;
+    }
+
+    let mut previous = Vec::with_capacity(assignments.len());
+    for (name, value) in assignments {
+        previous.push((
+            name.clone(),
+            shell.env_vars.insert(name.clone(), value.clone()),
+        ));
+    }
+
+    let status = exec_function_call(func, args, shell);
+
+    for (name, previous_value) in previous {
+        match previous_value {
+            Some(value) => {
+                shell.env_vars.insert(name, value);
+            }
+            None => {
+                shell.env_vars.remove(&name);
+            }
+        }
+    }
+
+    status
 }
 
 /// `NAME=value` prefix assignments, expanded to their final strings.
@@ -1148,4 +1339,204 @@ mod tests {
     // process, per exec_subshell's docs) to observe, so — like the
     // isolation tests above — they live in `tests/conch-difftest`'s
     // Phase 3 corpus instead of here.
+
+    // ---- functions, `local`, `return`, positional parameters ---------------
+    //
+    // Like the break/continue section above, conch-core doesn't depend on
+    // conch-shell-builtins (the real `local`/`return` builtins live
+    // there) — `TestLocal`/`TestReturn` set `Shell` state exactly the way
+    // those builtins do (see their own docs: `Shell::capture_var`/
+    // `record_local`/`set_local`, and `ControlFlow::Return`), so
+    // `exec_function_call`'s own mechanism (frame push/pop timing,
+    // `loop_depth` reset, `Return` consumption) can be exercised in
+    // isolation here.
+
+    #[test]
+    fn defining_a_function_is_status_zero_and_does_not_run_it() {
+        let mut shell = Shell::new();
+        assert_eq!(run("f() { X=ran; }", &mut shell), 0);
+        assert_eq!(shell.get_var("X"), None);
+    }
+
+    #[test]
+    fn later_function_definition_replaces_the_earlier_one() {
+        let mut shell = Shell::new();
+        run("f() { X=first; }; f() { X=second; }; f", &mut shell);
+        assert_eq!(shell.get_var("X"), Some("second"));
+    }
+
+    #[test]
+    fn a_function_can_shadow_even_a_special_builtin() {
+        // Confirmed against real bash: outside `--posix` mode, a
+        // function shadows even a special builtin like `export`/`break`
+        // (only `--posix` refuses, with "is a special builtin") -- this
+        // project tracks bash's real default over strict POSIX-only
+        // where the two diverge (see `Shell::special_builtins`'s docs).
+        struct FakeSpecial;
+        impl crate::Builtin for FakeSpecial {
+            fn run(
+                &self,
+                _shell: &mut Shell,
+                _args: &[String],
+                _stdout: &mut dyn std::io::Write,
+                _stderr: &mut dyn std::io::Write,
+            ) -> i32 {
+                panic!("the real special builtin must never run once shadowed by a function");
+            }
+        }
+        let mut shell = Shell::new();
+        shell.register_special_builtin("myspecial", Box::new(FakeSpecial));
+        run("myspecial() { X=shadowed; }; myspecial", &mut shell);
+        assert_eq!(shell.get_var("X"), Some("shadowed"));
+    }
+
+    #[test]
+    fn function_call_gets_its_own_positional_parameters_and_restores_the_callers_afterward() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["top1".to_string(), "top2".to_string()];
+        run("f() { INSIDE=\"$1:$2:$#\"; }; f a b c", &mut shell);
+        assert_eq!(shell.get_var("INSIDE"), Some("a:b:3"));
+        assert_eq!(
+            shell.positional_params,
+            vec!["top1".to_string(), "top2".to_string()]
+        );
+    }
+
+    #[test]
+    fn function_call_falling_off_the_end_uses_the_last_commands_exit_status() {
+        let mut shell = Shell::new();
+        assert_eq!(run("f() { true; false; }; f", &mut shell), 1);
+    }
+
+    #[test]
+    fn non_local_assignment_inside_a_function_mutates_the_global() {
+        // The critical subtlety this follow-up's brief called out: an
+        // assignment inside a function that was *not* `local`-declared
+        // there must still mutate the global, not silently shadow it.
+        let mut shell = Shell::new();
+        shell
+            .shell_vars
+            .insert("X".to_string(), "outer".to_string());
+        run("f() { X=changed; }; f", &mut shell);
+        assert_eq!(shell.get_var("X"), Some("changed"));
+    }
+
+    #[test]
+    fn for_without_in_clause_iterates_positional_parameters() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        run("for v; do L=$L$v; done", &mut shell);
+        assert_eq!(shell.get_var("L"), Some("xyz"));
+    }
+
+    struct TestReturn(i32);
+    impl crate::Builtin for TestReturn {
+        fn run(
+            &self,
+            shell: &mut Shell,
+            _args: &[String],
+            _stdout: &mut dyn std::io::Write,
+            _stderr: &mut dyn std::io::Write,
+        ) -> i32 {
+            shell.pending_control_flow = Some(ControlFlow::Return(self.0));
+            0
+        }
+    }
+
+    #[test]
+    fn return_stops_the_function_call_with_the_given_status() {
+        let mut shell = Shell::new();
+        shell.register_builtin("treturn5", Box::new(TestReturn(5)));
+        let status = run("f() { X=before; treturn5; X=after; }; f", &mut shell);
+        assert_eq!(status, 5);
+        assert_eq!(shell.get_var("X"), Some("before"));
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    #[test]
+    fn break_inside_a_function_does_not_escape_to_the_callers_own_loop() {
+        // Confirmed against real bash: `break` inside a function only
+        // ever stops a loop lexically inside that *same* function --
+        // never a loop merely *calling* it, even one already running
+        // when the call happens.
+        let mut shell = shell_with_control_flow_builtins();
+        run(
+            "f() { tbreak; }; for i in 1 2 3; do L=$L$i; f; L=${L}Z; done",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("L"), Some("1Z2Z3Z"));
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    #[test]
+    fn break_inside_a_functions_own_loop_stays_inside_the_function() {
+        let mut shell = shell_with_control_flow_builtins();
+        run(
+            "f() { for j in a b c; do L=$L$j; tbreak; done; }; f",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("L"), Some("a"));
+    }
+
+    struct TestLocal {
+        name: &'static str,
+        value: &'static str,
+    }
+    impl crate::Builtin for TestLocal {
+        fn run(
+            &self,
+            shell: &mut Shell,
+            _args: &[String],
+            _stdout: &mut dyn std::io::Write,
+            _stderr: &mut dyn std::io::Write,
+        ) -> i32 {
+            let previous = shell.capture_var(self.name);
+            shell.record_local(self.name.to_string(), previous);
+            shell.set_local(self.name, Some(self.value.to_string()));
+            0
+        }
+    }
+
+    #[test]
+    fn local_declaration_is_restored_once_the_function_call_returns() {
+        let mut shell = Shell::new();
+        shell
+            .shell_vars
+            .insert("X".to_string(), "outer".to_string());
+        shell.register_builtin(
+            "tlocal_inner",
+            Box::new(TestLocal {
+                name: "X",
+                value: "inner",
+            }),
+        );
+        run("f() { tlocal_inner; INSIDE=$X; }; f", &mut shell);
+        assert_eq!(shell.get_var("INSIDE"), Some("inner"));
+        assert_eq!(shell.get_var("X"), Some("outer"));
+    }
+
+    #[test]
+    fn nested_call_bare_assignment_mutates_the_nearest_active_local_not_the_true_global() {
+        // Confirmed against real bash: `local` is *dynamically* scoped —
+        // X=g; outer() { local X=o; inner; }; inner() { X=set_by_inner; };
+        // outer leaves the global X at "g", unchanged, because inner's
+        // plain assignment targets outer's still-active `local X`.
+        let mut shell = Shell::new();
+        shell
+            .shell_vars
+            .insert("X".to_string(), "global".to_string());
+        shell.register_builtin(
+            "tlocal_outer",
+            Box::new(TestLocal {
+                name: "X",
+                value: "outer_local",
+            }),
+        );
+        run(
+            "inner() { X=set_by_inner; }; outer() { tlocal_outer; inner; AFTER_INNER=$X; }; outer",
+            &mut shell,
+        );
+        assert_eq!(shell.get_var("AFTER_INNER"), Some("set_by_inner"));
+        assert_eq!(shell.get_var("X"), Some("global"));
+    }
 }

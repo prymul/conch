@@ -66,6 +66,33 @@ fn parse_one_compound_command(input: &str) -> CompoundCommand {
     cmd.clone()
 }
 
+/// Parses `input`, panicking unless it produces exactly one
+/// [`CommandListItem`] whose `and_or` has no `&&`/`||` and whose single
+/// pipeline has no `|` — i.e. exactly one [`FunctionDefinition`] —
+/// returning it.
+fn parse_one_function_definition(input: &str) -> FunctionDefinition {
+    let list = parse_ok(input);
+    assert_eq!(
+        list.items.len(),
+        1,
+        "expected exactly one item for {input:?}"
+    );
+    let item = &list.items[0];
+    assert!(
+        item.and_or.rest.is_empty(),
+        "expected no &&/|| for {input:?}"
+    );
+    assert_eq!(
+        item.and_or.first.commands.len(),
+        1,
+        "expected no pipeline for {input:?}"
+    );
+    let Command::Function(func) = &item.and_or.first.commands[0] else {
+        unreachable!("expected a Command::Function for {input:?}")
+    };
+    func.clone()
+}
+
 /// Extracts the single command name of `list`'s one-and-only
 /// [`SimpleCommand`] item, for terse assertions on a compound command's
 /// body contents.
@@ -873,4 +900,127 @@ fn for_loop_with_no_in_clause_and_nested_if() {
     };
     assert_eq!(clause.words, None);
     assert_eq!(clause.body.items.len(), 1);
+}
+
+// ---- function definitions ------------------------------------------------
+
+#[test]
+fn posix_function_definition_with_brace_group_body() {
+    let func = parse_one_function_definition("foo() { echo hi; }");
+    assert_eq!(func.name, "foo");
+    let CompoundCommandKind::BraceGroup(body) = func.body.kind else {
+        unreachable!("expected BraceGroup")
+    };
+    assert_eq!(only_command_name(&body), "echo");
+}
+
+#[test]
+fn posix_function_definition_tolerates_blanks_around_parens() {
+    // Confirmed against real bash: blanks anywhere around `fname()`'s
+    // parens are fine -- and fall out for free here since whitespace was
+    // never tokenized to begin with.
+    let func = parse_one_function_definition("foo ( ) { echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn posix_function_definition_allows_a_newline_before_the_body() {
+    let func = parse_one_function_definition("foo()\n{ echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn posix_function_definition_body_can_be_any_compound_command() {
+    // POSIX `function_body` permits any compound command, not just a
+    // brace group -- confirmed against real bash: `foo() (echo hi)` runs
+    // the body in a subshell every time `foo` is called.
+    let func = parse_one_function_definition("foo() (echo hi)");
+    let CompoundCommandKind::Subshell(subshell) = func.body.kind else {
+        unreachable!("expected Subshell")
+    };
+    assert_eq!(subshell.source, "echo hi");
+}
+
+#[test]
+fn posix_function_definition_invalid_name_is_a_syntax_error() {
+    let err = parse("1foo() { echo hi; }").unwrap_err();
+    assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+}
+
+#[test]
+fn function_keyword_without_parens() {
+    // bash extension: the `function` keyword makes the `()` optional.
+    let func = parse_one_function_definition("function foo { echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn function_keyword_with_parens() {
+    let func = parse_one_function_definition("function foo() { echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn function_keyword_body_can_be_any_compound_command() {
+    let func = parse_one_function_definition("function foo while true; do break; done");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::While(_)));
+}
+
+#[test]
+fn function_definition_can_be_followed_by_a_redirect() {
+    let func = parse_one_function_definition("foo() { echo hi; } > out.log");
+    assert_eq!(
+        func.body.redirects,
+        vec![Redirect {
+            fd: None,
+            operator: RedirectOperator::Output,
+            target: plain_word("out.log"),
+        }]
+    );
+}
+
+#[test]
+fn ordinary_command_name_glued_to_parens_without_an_immediate_close_paren_is_not_a_function() {
+    // `at_posix_function_definition` requires `Word '(' ')'` with nothing
+    // between the parens -- `foo(bar)` isn't that shape (there's a `bar`
+    // between them), so this must NOT be parsed as a function
+    // definition. It also isn't valid as an ordinary simple command
+    // (bash agrees: this is a syntax error), so the only assertion that
+    // matters here is that the parser doesn't misinterpret `(bar)` as
+    // part of a function definition it silently accepts.
+    let err = parse("foo(bar)").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedToken { .. } | ParseError::UnexpectedEof { .. }
+    ));
+}
+
+#[test]
+fn ordinary_command_is_not_misparsed_as_a_function_definition() {
+    let cmd = parse_one_simple_command("echo hi");
+    assert_eq!(cmd.name, Some(plain_word("echo")));
+}
+
+#[test]
+fn function_definition_can_be_a_pipeline_stage_target() {
+    // A function *definition* itself isn't piped into anything
+    // meaningful in real shells either, but it must still be parseable
+    // as one pipeline stage without the parser choking -- confirming
+    // `parse_command`'s function-definition dispatch composes with the
+    // rest of the grammar around it.
+    let list = parse_ok("foo() { echo hi; }; foo");
+    assert_eq!(list.items.len(), 2);
+    assert!(matches!(
+        list.items[0].and_or.first.commands[0],
+        Command::Function(_)
+    ));
+    assert!(matches!(
+        list.items[1].and_or.first.commands[0],
+        Command::Simple(_)
+    ));
 }

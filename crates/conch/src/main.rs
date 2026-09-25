@@ -8,6 +8,13 @@ use rustyline::error::ReadlineError;
 fn main() -> ExitCode {
     let mut shell = Shell::new();
     conch_shell_builtins::register_all(&mut shell);
+    // `$0` defaults to this process's own argv[0] (confirmed against real
+    // bash: `-c`/interactive mode uses the shell's own invocation name) —
+    // both branches below may still override it, per POSIX/bash's own
+    // `-c`/script-file conventions.
+    if let Some(argv0) = std::env::args().next() {
+        shell.arg0 = argv0;
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -17,15 +24,32 @@ fn main() -> ExitCode {
                 eprintln!("conch: -c requires a command string");
                 return ExitCode::from(2);
             };
+            // POSIX/bash: `-c command_string [command_name [argument...]]`
+            // — confirmed against real bash an optional argument right
+            // after `command_string` overrides `$0`, and everything past
+            // *that* becomes the initial positional parameters
+            // (`$1`, `$2`, ...).
+            if let Some(name) = args.get(2) {
+                shell.arg0 = name.clone();
+            }
+            shell.positional_params = args.get(3..).map(<[String]>::to_vec).unwrap_or_default();
             run_source(command, &mut shell)
         }
-        Some(script_path) => match std::fs::read_to_string(script_path) {
-            Ok(source) => run_source(&source, &mut shell),
-            Err(err) => {
-                eprintln!("conch: {script_path}: {err}");
-                127
+        Some(script_path) => {
+            // `$0` is the script path exactly as given on the command
+            // line, regardless of the script's own arguments (confirmed
+            // against real bash); everything after it is the initial
+            // positional parameters.
+            shell.arg0 = script_path.to_string();
+            shell.positional_params = args.get(1..).map(<[String]>::to_vec).unwrap_or_default();
+            match std::fs::read_to_string(script_path) {
+                Ok(source) => run_source(&source, &mut shell),
+                Err(err) => {
+                    eprintln!("conch: {script_path}: {err}");
+                    127
+                }
             }
-        },
+        }
         None => run_interactive(&mut shell),
     };
 

@@ -1,19 +1,34 @@
-//! Builtin commands: `cd`, `exit`, `export`, `echo`, `pwd` (Phase 1), and
-//! the `break`/`continue` POSIX special builtins (Phase 3).
+//! Builtin commands: `cd`, `exit`, `export`, `echo`, `pwd` (Phase 1); the
+//! `break`/`continue` POSIX special builtins (Phase 3); and `local`,
+//! `return`, a narrow `set --`, and `shift` (the functions/positional-
+//! parameters follow-up).
 
 use std::io::Write;
 
 use conch_shell_core::{Builtin, ControlFlow, Shell};
 
-/// Registers every builtin this crate implements into `shell`.
+/// Registers every builtin this crate implements into `shell` — as either
+/// a *regular* builtin ([`Shell::register_builtin`]) or a *special* one
+/// ([`Shell::register_special_builtin`]), per POSIX 2.9.1/2.9.5's own
+/// classification (`cd`/`echo`/`pwd`/`local` are ordinary utilities-ish
+/// builtins; `break`/`continue`/`exit`/`export`/`return`/`set`/`shift`
+/// are all on POSIX's special-builtin list). This distinction is
+/// structural only — see [`Shell::special_builtins`]'s docs for why it's
+/// *not* used to stop a same-named shell function from shadowing either
+/// kind (confirmed against real bash's own default, non-`--posix`,
+/// behavior).
 pub fn register_all(shell: &mut Shell) {
     shell.register_builtin("cd", Box::new(Cd));
-    shell.register_builtin("exit", Box::new(Exit));
-    shell.register_builtin("export", Box::new(Export));
+    shell.register_special_builtin("exit", Box::new(Exit));
+    shell.register_special_builtin("export", Box::new(Export));
     shell.register_builtin("echo", Box::new(Echo));
     shell.register_builtin("pwd", Box::new(Pwd));
-    shell.register_builtin("break", Box::new(Break));
-    shell.register_builtin("continue", Box::new(Continue));
+    shell.register_special_builtin("break", Box::new(Break));
+    shell.register_special_builtin("continue", Box::new(Continue));
+    shell.register_builtin("local", Box::new(Local));
+    shell.register_special_builtin("return", Box::new(Return));
+    shell.register_special_builtin("set", Box::new(Set));
+    shell.register_special_builtin("shift", Box::new(Shift));
 }
 
 struct Cd;
@@ -217,6 +232,186 @@ impl Builtin for Continue {
     }
 }
 
+/// `local [NAME[=VALUE]]...` (bash extension — not POSIX). Only valid
+/// inside a function call (confirmed against real bash: `local: can only
+/// be used in a function`, `$?` = 1, and — confirmed separately — no
+/// partial effect at all in that case, not even for a bare `local` with
+/// zero arguments).
+///
+/// A single `local` invocation still processes every argument even after
+/// one is rejected as an invalid name (confirmed against real bash:
+/// `local 1x=2 y=3` still declares `y`, with `$?` = 1 only because of the
+/// earlier, unrelated failure) — this doesn't `return` early on that
+/// error, just records it and keeps going.
+struct Local;
+impl Builtin for Local {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        if !shell.in_function_call() {
+            let _ = writeln!(stderr, "local: can only be used in a function");
+            return 1;
+        }
+
+        let mut status = 0;
+        for arg in args {
+            let (name, value) = match arg.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (arg.as_str(), None),
+            };
+            if !is_valid_identifier(name) {
+                let _ = writeln!(stderr, "local: `{arg}': not a valid identifier");
+                status = 1;
+                continue;
+            }
+            let previous = shell.capture_var(name);
+            shell.record_local(name.to_string(), previous);
+            shell.set_local(name, value);
+        }
+        status
+    }
+}
+
+/// The same `NAME` rule `conch-shell-parser` enforces for a function
+/// definition/`for` loop variable (`[A-Za-z_][A-Za-z0-9_]*`) — duplicated
+/// here (rather than depending on `conch-shell-parser` just for this)
+/// since it's a five-line, self-contained rule and `conch-shell-builtins`
+/// otherwise has no reason to depend on the parser crate at all.
+fn is_valid_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// `return [n]` (POSIX special builtin). Only valid inside a function
+/// call (a sourced-script `return` is POSIX-valid too, but `.`/`source`
+/// isn't implemented yet — see the module docs) — confirmed against real
+/// bash this is a genuine error (unlike `break`/`continue` outside a
+/// loop, which silently no-op): `return: can only `return' from a
+/// function or sourced script`, `$?` = 2, and nothing after it in the
+/// same list runs (matching an ordinary command failure, not a
+/// loop-control no-op).
+struct Return;
+impl Builtin for Return {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        if !shell.in_function_call() {
+            let _ = writeln!(
+                stderr,
+                "return: can only `return' from a function or sourced script"
+            );
+            return 2;
+        }
+
+        // POSIX: `n` omitted -> the exit status of the last command
+        // executed (same convention `exit`, conch-shell-builtins, already
+        // follows). Confirmed against real bash a non-numeric `n` is a
+        // real error ("numeric argument required", `$?` = 2) that still
+        // stops the function immediately, exactly like a valid `return`
+        // does -- it doesn't fall through and keep running the rest of
+        // the function body.
+        let code = match args.first() {
+            None => shell.last_status,
+            Some(arg) => match arg.parse::<i32>() {
+                Ok(code) => code,
+                Err(_) => {
+                    let _ = writeln!(stderr, "return: {arg}: numeric argument required");
+                    shell.pending_control_flow = Some(ControlFlow::Return(2));
+                    return 2;
+                }
+            },
+        };
+        // Confirmed against real bash `return`'s argument wraps into an
+        // unsigned byte immediately (observable via `$?` inside the very
+        // same shell, not just the final process exit code) -- `return
+        // 300` leaves `$?` at 44, `return -1` leaves it at 255 -- the
+        // same `rem_euclid(256)` conch's binary crate's `main` already
+        // uses for the whole *process's* own final exit code, applied
+        // here instead so it's correct for an in-shell `$?` observation
+        // too, not just a `-c`/script-file invocation's process exit.
+        shell.pending_control_flow = Some(ControlFlow::Return(code.rem_euclid(256)));
+        0
+    }
+}
+
+/// `set -- [arg...]` — a deliberately narrow slice of real `set`: only
+/// the `--`-prefixed positional-parameter-replacement form is
+/// implemented. Every other `set` form (options like `-e`/`-x`, `set` on
+/// its own to list variables, `set -o ...`, ...) is a later phase (see
+/// the module docs) and reported clearly rather than silently
+/// misbehaving.
+struct Set;
+impl Builtin for Set {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        if args.first().map(String::as_str) == Some("--") {
+            shell.positional_params = args[1..].to_vec();
+            return 0;
+        }
+        let _ = writeln!(
+            stderr,
+            "conch: only `set -- [arg...]` is supported so far (a narrow initial implementation -- full `set` is a later phase)"
+        );
+        1
+    }
+}
+
+/// `shift [n]` (POSIX special builtin) — removes the first `n` (default
+/// `1`) positional parameters. Confirmed against real bash: `n` greater
+/// than `$#` is an all-or-nothing error (`$?` = 1, positional parameters
+/// left completely unchanged), as is a negative `n` (with an explicit
+/// "shift count out of range" diagnostic in that case specifically,
+/// unlike the silent `n > $#` case — this always prints one, which is
+/// harmless either way since `tests/conch-difftest` only compares stderr
+/// wording when a case opts into it); `shift 0` is a valid no-op.
+struct Shift;
+impl Builtin for Shift {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        let n = match args.first() {
+            None => 1,
+            Some(arg) => match arg.parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    let _ = writeln!(stderr, "shift: {arg}: numeric argument required");
+                    return 1;
+                }
+            },
+        };
+        let out_of_range =
+            n < 0 || usize::try_from(n).is_ok_and(|n| n > shell.positional_params.len());
+        if out_of_range {
+            let _ = writeln!(stderr, "shift: shift count out of range");
+            return 1;
+        }
+        // `n` is already confirmed in `0..=positional_params.len()`.
+        shell.positional_params.drain(0..n as usize);
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,8 +431,31 @@ mod tests {
     fn register_all_registers_every_builtin() {
         let mut shell = Shell::new();
         register_all(&mut shell);
-        for name in ["cd", "exit", "export", "echo", "pwd", "break", "continue"] {
+        for name in [
+            "cd", "exit", "export", "echo", "pwd", "break", "continue", "local", "return", "set",
+            "shift",
+        ] {
             assert!(shell.builtin(name).is_some(), "missing builtin: {name}");
+        }
+    }
+
+    #[test]
+    fn register_all_classifies_special_vs_regular_builtins_per_posix_2_9_1() {
+        let mut shell = Shell::new();
+        register_all(&mut shell);
+        for name in [
+            "break", "continue", "exit", "export", "return", "set", "shift",
+        ] {
+            assert!(
+                shell.is_special_builtin(name),
+                "expected {name} to be special"
+            );
+        }
+        for name in ["cd", "echo", "pwd", "local"] {
+            assert!(
+                !shell.is_special_builtin(name),
+                "expected {name} to be regular"
+            );
         }
     }
 
@@ -349,6 +567,211 @@ mod tests {
         let mut shell = Shell::new();
         shell.loop_depth = 1;
         let (status, _, stderr) = run(&Break, &mut shell, &["nope".to_string()]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("out of range"));
+    }
+
+    // ---- local ---------------------------------------------------------------
+
+    #[test]
+    fn local_outside_a_function_errors_and_has_no_effect() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Local, &mut shell, &["X=1".to_string()]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("can only be used in a function"));
+        assert_eq!(shell.get_var("X"), None);
+    }
+
+    #[test]
+    fn local_with_value_shadows_and_is_recorded_for_restoration() {
+        let mut shell = Shell::new();
+        shell
+            .shell_vars
+            .insert("X".to_string(), "outer".to_string());
+        shell.push_local_frame();
+        let (status, _, _) = run(&Local, &mut shell, &["X=inner".to_string()]);
+        assert_eq!(status, 0);
+        assert_eq!(shell.get_var("X"), Some("inner"));
+        shell.pop_local_frame();
+        assert_eq!(shell.get_var("X"), Some("outer"));
+    }
+
+    #[test]
+    fn bare_local_with_no_value_makes_the_name_genuinely_unset() {
+        // Confirmed against real bash: `local X` (no `=`) makes
+        // `${X+is-set}` empty -- genuinely unset, not merely `""`.
+        let mut shell = Shell::new();
+        shell
+            .shell_vars
+            .insert("X".to_string(), "outer".to_string());
+        shell.push_local_frame();
+        run(&Local, &mut shell, &["X".to_string()]);
+        assert_eq!(shell.get_var("X"), None);
+        shell.pop_local_frame();
+        assert_eq!(shell.get_var("X"), Some("outer"));
+    }
+
+    #[test]
+    fn local_of_an_already_exported_variable_stays_exported() {
+        // Confirmed against real bash: `export X=1; f() { local X=2; };
+        // f` still shows `X=2` in a child process's inherited
+        // environment -- `local` inherits the export attribute of an
+        // existing same-named global, it doesn't strip it.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("X".to_string(), "outer".to_string());
+        shell.push_local_frame();
+        run(&Local, &mut shell, &["X=inner".to_string()]);
+        assert!(shell.env_vars.contains_key("X"));
+        assert_eq!(shell.get_var("X"), Some("inner"));
+    }
+
+    #[test]
+    fn local_invalid_identifier_errors_but_still_processes_later_arguments() {
+        // Confirmed against real bash: `local 1x=2 y=3` still declares
+        // `y`, with `$?` = 1 only because of the earlier, unrelated
+        // failure.
+        let mut shell = Shell::new();
+        shell.push_local_frame();
+        let (status, _, stderr) = run(&Local, &mut shell, &["1x=2".to_string(), "y=3".to_string()]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("not a valid identifier"));
+        assert_eq!(shell.get_var("y"), Some("3"));
+    }
+
+    // ---- return ----------------------------------------------------------------
+
+    #[test]
+    fn return_outside_a_function_errors_without_setting_pending_control_flow() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Return, &mut shell, &[]);
+        assert_eq!(status, 2);
+        assert!(stderr.contains("can only `return'"));
+        assert_eq!(shell.pending_control_flow, None);
+    }
+
+    #[test]
+    fn return_with_explicit_code_sets_pending_control_flow() {
+        let mut shell = Shell::new();
+        shell.push_local_frame();
+        run(&Return, &mut shell, &["5".to_string()]);
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Return(5)));
+    }
+
+    #[test]
+    fn return_with_no_argument_uses_the_last_status() {
+        let mut shell = Shell::new();
+        shell.last_status = 7;
+        shell.push_local_frame();
+        run(&Return, &mut shell, &[]);
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Return(7)));
+    }
+
+    #[test]
+    fn return_wraps_an_out_of_range_code_into_a_byte_like_bash_does() {
+        // Confirmed against real bash: `return 300` leaves `$?` at 44,
+        // `return -1` leaves it at 255 -- wrapped immediately, observable
+        // in the very same shell, not deferred to process exit.
+        let mut shell = Shell::new();
+        shell.push_local_frame();
+        run(&Return, &mut shell, &["300".to_string()]);
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Return(44)));
+
+        let mut shell = Shell::new();
+        shell.push_local_frame();
+        run(&Return, &mut shell, &["-1".to_string()]);
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Return(255)));
+    }
+
+    #[test]
+    fn return_non_numeric_argument_still_stops_the_call() {
+        let mut shell = Shell::new();
+        shell.push_local_frame();
+        let (status, _, stderr) = run(&Return, &mut shell, &["abc".to_string()]);
+        assert_eq!(status, 2);
+        assert!(stderr.contains("numeric argument required"));
+        assert_eq!(shell.pending_control_flow, Some(ControlFlow::Return(2)));
+    }
+
+    // ---- set -- / shift ----------------------------------------------------------
+
+    #[test]
+    fn set_dash_dash_replaces_positional_parameters() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["old".to_string()];
+        let (status, _, _) = run(
+            &Set,
+            &mut shell,
+            &["--".to_string(), "a".to_string(), "b".to_string()],
+        );
+        assert_eq!(status, 0);
+        assert_eq!(
+            shell.positional_params,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_dash_dash_alone_clears_positional_parameters() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["old".to_string()];
+        run(&Set, &mut shell, &["--".to_string()]);
+        assert!(shell.positional_params.is_empty());
+    }
+
+    #[test]
+    fn set_without_dash_dash_is_reported_as_unsupported() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Set, &mut shell, &["-e".to_string()]);
+        assert_eq!(status, 1);
+        assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn shift_default_removes_one_positional_parameter() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (status, _, _) = run(&Shift, &mut shell, &[]);
+        assert_eq!(status, 0);
+        assert_eq!(
+            shell.positional_params,
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn shift_n_removes_n_positional_parameters() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        run(&Shift, &mut shell, &["2".to_string()]);
+        assert_eq!(shell.positional_params, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn shift_zero_is_a_no_op() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["a".to_string()];
+        let (status, _, _) = run(&Shift, &mut shell, &["0".to_string()]);
+        assert_eq!(status, 0);
+        assert_eq!(shell.positional_params, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn shift_beyond_available_params_errors_without_changing_them() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["a".to_string(), "b".to_string()];
+        let (status, _, _) = run(&Shift, &mut shell, &["5".to_string()]);
+        assert_eq!(status, 1);
+        assert_eq!(
+            shell.positional_params,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn shift_negative_count_errors() {
+        let mut shell = Shell::new();
+        shell.positional_params = vec!["a".to_string()];
+        let (status, _, stderr) = run(&Shift, &mut shell, &["-1".to_string()]);
         assert_eq!(status, 1);
         assert!(stderr.contains("out of range"));
     }

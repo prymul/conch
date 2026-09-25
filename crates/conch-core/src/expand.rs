@@ -137,6 +137,17 @@ struct Segment {
     /// result of parameter/command/arithmetic expansion (POSIX 2.6.5),
     /// never for literal source text.
     split_eligible: bool,
+    /// Forces a field boundary immediately after this segment,
+    /// regardless of its own content, `split_eligible`, or any
+    /// neighboring segment — used *only* for `"$@"` (always) and, when
+    /// `IFS` is set to the empty string, `$@`/`$*` (see
+    /// [`push_positional_params_as_independent_fields`]'s docs for the
+    /// full "why" and worked examples this reproduces, all confirmed
+    /// against real bash). Every other segment this module ever
+    /// constructs leaves this `false` — a plain expansion or piece of
+    /// literal text never forces a boundary the way one positional
+    /// parameter ending and the next beginning does.
+    force_field_break_after: bool,
 }
 
 /// Expands `word` to a single field: tilde and parameter/command/
@@ -198,11 +209,13 @@ fn expand_to_segments(word: &Word, shell: &mut Shell) -> Result<Vec<Segment>, Ex
                 text: home.to_string(),
                 glob_eligible: true,
                 split_eligible: false,
+                force_field_break_after: false,
             });
             segments.push(Segment {
                 text: rest.to_string(),
                 glob_eligible: true,
                 split_eligible: false,
+                force_field_break_after: false,
             });
             continue;
         }
@@ -239,6 +252,7 @@ fn expand_segment(
                 text: text.clone(),
                 glob_eligible: true,
                 split_eligible: false,
+                force_field_break_after: false,
             });
             Ok(())
         }
@@ -247,6 +261,7 @@ fn expand_segment(
                 text: text.clone(),
                 glob_eligible: false,
                 split_eligible: false,
+                force_field_break_after: false,
             });
             Ok(())
         }
@@ -268,11 +283,61 @@ fn expand_segment(
             }
             Ok(())
         }
+        // `$@`/`${@}` and `$*`/`${*}` (the lexer decodes a *bare*
+        // `${@}`/`${*}` — no operator at all before the closing `}` — to
+        // this exact same `WordSegment::Parameter` variant, not
+        // `ComplexParameterExpansion`; see `conch-shell-lexer`'s
+        // `scan_braced_parameter`) each need special, N-field-aware
+        // handling no other parameter gets — see
+        // [`push_positional_params_as_independent_fields`]'s and
+        // [`join_positional_params_with_ifs`]'s docs for the full
+        // POSIX 2.5.2 grounding and worked examples (all confirmed
+        // against real bash) this reproduces. Every other parameter
+        // keeps the single-segment handling this arm always had.
+        WordSegment::Parameter(Parameter::Special(SpecialParameter::At)) => {
+            // `"$@"` (quoted) and unquoted `$@` are *both* "one field per
+            // positional parameter", differing only in whether each
+            // field independently undergoes further glob/IFS-splitting
+            // afterward (`in_double_quotes` alone already controls
+            // exactly that, the same way it does for every other
+            // parameter) — except unquoted `$@` additionally needs
+            // ordinary IFS-driven splitting *within* each field when
+            // `IFS` is non-empty, per POSIX 2.5.2 ("initially producing
+            // one field ... non-empty fields split further") — handled
+            // by [`push_unquoted_at_or_star_fields`], not here.
+            if in_double_quotes {
+                push_positional_params_as_independent_fields(shell, false, out);
+            } else {
+                push_unquoted_at_or_star_fields(shell, out);
+            }
+            Ok(())
+        }
+        WordSegment::Parameter(Parameter::Special(SpecialParameter::Star)) => {
+            if in_double_quotes {
+                // `"$*"` (POSIX 2.5.2): all positional parameters joined
+                // into a *single* field — unlike `"$@"`, this never
+                // needs `force_field_break_after` at all.
+                out.push(Segment {
+                    text: join_positional_params_with_ifs(shell),
+                    glob_eligible: false,
+                    split_eligible: false,
+                    force_field_break_after: false,
+                });
+            } else {
+                // Confirmed against real bash: unquoted `$*` and
+                // unquoted `$@` are indistinguishable, even under a
+                // custom `IFS` and even with positional parameters whose
+                // own text contains `IFS` characters.
+                push_unquoted_at_or_star_fields(shell, out);
+            }
+            Ok(())
+        }
         WordSegment::Parameter(param) => {
             out.push(Segment {
                 text: expand_parameter(param, shell),
                 glob_eligible: true,
                 split_eligible: true,
+                force_field_break_after: false,
             });
             Ok(())
         }
@@ -281,6 +346,7 @@ fn expand_segment(
                 text: run_command_substitution(&sub.body, shell)?,
                 glob_eligible: true,
                 split_eligible: true,
+                force_field_break_after: false,
             });
             Ok(())
         }
@@ -289,6 +355,7 @@ fn expand_segment(
                 text: expand_complex_parameter_expansion(body, in_double_quotes, shell)?,
                 glob_eligible: true,
                 split_eligible: true,
+                force_field_break_after: false,
             });
             Ok(())
         }
@@ -297,21 +364,154 @@ fn expand_segment(
                 text: expand_arithmetic_expansion(body, shell)?,
                 glob_eligible: true,
                 split_eligible: true,
+                force_field_break_after: false,
             });
             Ok(())
         }
     }
 }
 
+/// Pushes one [`Segment`] per current positional parameter
+/// ([`Shell::positional_params`]), each with [`Segment::split_eligible`]
+/// and [`Segment::glob_eligible`] set to `!in_double_quoted_wrapper` and
+/// [`Segment::force_field_break_after`] set on every one but the last —
+/// what both `"$@"` (`in_double_quoted_wrapper = true`, always) and
+/// unquoted `$@`/`$*` when `IFS` is set to the empty string
+/// (`in_double_quoted_wrapper = false` — see
+/// [`push_unquoted_at_or_star_fields`]) need.
+///
+/// The `force_field_break_after` mechanism this relies on ([`split_fields`])
+/// only needs to close the *current* field immediately after a segment
+/// like this, unconditionally — never per-character, unlike ordinary IFS
+/// splitting — which is exactly what makes an empty positional parameter
+/// correctly become its own empty field here (confirmed against real
+/// bash: `set -- a "" b; for x in "$@"; do ...; done` visits three
+/// fields, the second empty) while an *unquoted* empty one instead
+/// vanishes entirely when `IFS` is non-empty (a completely different
+/// mechanism — [`push_unquoted_at_or_star_fields`]'s docs).
+fn push_positional_params_as_independent_fields(
+    shell: &Shell,
+    glob_eligible: bool,
+    out: &mut Vec<Segment>,
+) {
+    let count = shell.positional_params.len();
+    for (i, param) in shell.positional_params.iter().enumerate() {
+        out.push(Segment {
+            text: param.clone(),
+            glob_eligible,
+            split_eligible: false,
+            force_field_break_after: i + 1 < count,
+        });
+    }
+}
+
+/// Unquoted `$@`/`$*` (POSIX 2.5.2 — confirmed against real bash these
+/// two are indistinguishable when unquoted, including under a custom
+/// `IFS`; see [`expand_segment`]'s `Star` arm). Two genuinely different
+/// mechanisms, chosen by whether `IFS` is set to the empty string:
+///
+/// - `IFS` unset, default, or any non-empty value: every positional
+///   parameter is joined with a single literal separator character (the
+///   first character of `IFS`, or a space if `IFS` is unset — POSIX
+///   2.5.2's own wording for `*`, which this reuses since confirmed
+///   behavior makes `@` identical here) into *one* new segment, fed
+///   through the ordinary, unmodified [`split_fields`] IFS-splitting
+///   algorithm exactly like any other unquoted expansion result. This
+///   alone reproduces real bash's actual, sometimes-surprising boundary
+///   behavior exactly — confirmed against real bash with `IFS=","; set
+///   -- "a," "b"` (a positional parameter whose *own* text happens to
+///   end in an `IFS` delimiter character): unquoted `$@` there is 3
+///   fields, `a`, ``, `b` — an empty field appears at the parameter
+///   boundary that *neither* parameter's own text would produce if
+///   split in isolation (`"a,"` alone unquoted is just 1 field, `a` — no
+///   trailing empty one; see POSIX 2.6.5's "no *trailing* empty field"
+///   rule, which is exactly what would otherwise suppress it) —
+///   inserting a real separator character reproduces this for free,
+///   without any special-casing: splitting the combined `"a,,b"` the
+///   *existing*, unmodified algorithm's own already-tested
+///   embedded-empty-field behavior naturally produces exactly that
+///   extra field. It also reproduces the opposite-looking case
+///   correctly: `set -- a "" b` (empty positional parameter, *default*
+///   `IFS`) is only 2 fields, `a`, `b` — no field at all for the empty
+///   one — because the inserted separator there is a plain space
+///   (`IFS`'s whitespace class), and whitespace-class IFS characters
+///   already collapse/never produce an empty field on their own
+///   ([`split_fields`]'s existing, unmodified `is_ifs_ws` handling).
+/// - `IFS` set to the empty string: splitting is disabled entirely (POSIX
+///   2.6.5), so no separator is inserted and no further per-character
+///   splitting happens — but `$@`/`$*` must still preserve one field per
+///   positional parameter rather than collapsing to a single field the
+///   way ordinary `IFS=''` input does (confirmed against real bash:
+///   `IFS=""; set -- "a," "b"; for x in $@; do ...; done` is still 2
+///   fields, `a,` and `b`, unmodified and un-joined) — reuses
+///   [`push_positional_params_as_independent_fields`], glob-eligible
+///   since this is the unquoted case.
+fn push_unquoted_at_or_star_fields(shell: &Shell, out: &mut Vec<Segment>) {
+    match shell.get_var("IFS") {
+        Some("") => {
+            push_positional_params_as_independent_fields(shell, true, out);
+        }
+        ifs => {
+            let sep = ifs.and_then(|s| s.chars().next()).unwrap_or(' ');
+            out.push(Segment {
+                text: shell.positional_params.join(&sep.to_string()),
+                glob_eligible: true,
+                split_eligible: true,
+                force_field_break_after: false,
+            });
+        }
+    }
+}
+
+/// `"$*"` (POSIX 2.5.2): every positional parameter joined into one
+/// string by the first character of `IFS` — a space if `IFS` is unset, or
+/// no separator at all (not even a null one) if `IFS` is set but empty.
+/// Confirmed against real bash for all three cases: `IFS` unset →
+/// space-joined; `IFS=","` → comma-joined; `IFS=""` → concatenated with
+/// no separator whatsoever.
+fn join_positional_params_with_ifs(shell: &Shell) -> String {
+    let ifs = shell.get_var("IFS");
+    let sep = match ifs {
+        None => " ".to_string(),
+        Some(s) => s.chars().next().map(String::from).unwrap_or_default(),
+    };
+    shell.positional_params.join(&sep)
+}
+
+/// The single-string "current value" of `param` — used directly for
+/// every ordinary parameter, and as the fallback/`ParameterOperator::Length`
+/// operand for `@`/`*` too (their *field-splicing* behavior, which this
+/// can't express in one `String`, is handled entirely separately — see
+/// [`expand_segment`]'s dedicated `At`/`Star` arms, used for a plain
+/// `$@`/`"$@"`/`$*`/`"$*"`/`${@}`/`${*}` word segment; this function is
+/// only ever reached for `@`/`*` from a *different* parameter-expansion
+/// operator applied to one of them, e.g. `${@:-word}` or `${#@}`'s own
+/// `current` — a narrower, less-tested corner this follow-up doesn't
+/// chase exhaustively). Joining with [`join_positional_params_with_ifs`]
+/// here (the same as `"$*"`'s own value) is a reasonable stand-in for
+/// that corner, not a claim that every operator's interaction with
+/// `@`/`*` is fully bash-accurate this way.
 fn expand_parameter(param: &Parameter, shell: &Shell) -> String {
     match param {
         Parameter::Name(name) => shell.get_var(name).unwrap_or("").to_string(),
-        Parameter::Positional(_) => String::new(),
-        Parameter::Special(special) => match special {
-            SpecialParameter::Question => shell.last_status.to_string(),
-            _ => String::new(),
-        },
+        Parameter::Positional(n) => positional_param(shell, *n).unwrap_or("").to_string(),
+        Parameter::Special(SpecialParameter::Question) => shell.last_status.to_string(),
+        Parameter::Special(SpecialParameter::Zero) => shell.arg0.clone(),
+        Parameter::Special(SpecialParameter::Hash) => shell.positional_params.len().to_string(),
+        Parameter::Special(SpecialParameter::At | SpecialParameter::Star) => {
+            join_positional_params_with_ifs(shell)
+        }
+        Parameter::Special(SpecialParameter::Dash | SpecialParameter::Dollar) => String::new(),
+        Parameter::Special(SpecialParameter::Bang) => String::new(),
     }
+}
+
+/// `$1`, `$2`, ... (`n` is 1-based, matching POSIX/the lexer's own
+/// [`Parameter::Positional`] numbering) — `None` if `n` is out of range
+/// (unset), same as an ordinary unset named variable.
+fn positional_param(shell: &Shell, n: u32) -> Option<&str> {
+    let index = usize::try_from(n).ok()?.checked_sub(1)?;
+    shell.positional_params.get(index).map(String::as_str)
 }
 
 /// Whether `parameter` currently has a value at all — distinct from
@@ -321,18 +521,21 @@ fn expand_parameter(param: &Parameter, shell: &Shell) -> String {
 fn is_parameter_set(parameter: &Parameter, shell: &Shell) -> bool {
     match parameter {
         Parameter::Name(name) => shell.get_var(name).is_some(),
-        // No positional-parameter shell state exists yet — `expand_parameter`
-        // above already always expands `Parameter::Positional` to `""` —
-        // so treating every positional parameter as unset is the closest
-        // honest match: a real argument-less invocation would have every
-        // positional parameter genuinely unset too.
-        Parameter::Positional(_) => false,
-        // Every special parameter conch recognizes is a shell built-in
-        // that always has *some* value in a real shell, even if empty —
-        // none of them are ever genuinely "unset". `$?` is the only one
-        // conch actually varies (`shell.last_status`); the rest being
-        // hardcoded to `""` by `expand_parameter` is a distinct,
-        // already-documented simplification from being "unset".
+        Parameter::Positional(n) => positional_param(shell, *n).is_some(),
+        // `@`/`*` specifically count as *unset* when there are zero
+        // positional parameters, for both the colon and non-colon
+        // operator forms alike — confirmed against real bash: `set --;
+        // echo "${@-fallback}"` (non-colon) *and* `echo "${@:-fallback}"`
+        // (colon) both print "fallback", and `set --; : "${@?msg}"`
+        // errors with "@: msg" — none of which would happen if `@`/`*`
+        // were simply always "set" the way every other special parameter
+        // is.
+        Parameter::Special(SpecialParameter::At | SpecialParameter::Star) => {
+            !shell.positional_params.is_empty()
+        }
+        // Every *other* special parameter conch recognizes is a shell
+        // built-in that always has *some* value in a real shell, even if
+        // empty — none of the rest are ever genuinely "unset".
         Parameter::Special(_) => true,
     }
 }
@@ -403,6 +606,19 @@ fn evaluate_parameter_expansion(
         NullMode::UnsetOrNull => !is_set || current.is_empty(),
     };
     match &expansion.operator {
+        // `${#@}`/`${#*}` are a POSIX-mandated special case: confirmed
+        // against real bash `set -- a bb ccc; echo "${#@}" "${#*}" "$#"`
+        // prints `3 3 3` — the *count* of positional parameters, not the
+        // length of their joined-together text (`current` here) the way
+        // `${#name}` ordinarily means.
+        ParameterOperator::Length
+            if matches!(
+                expansion.parameter,
+                Parameter::Special(SpecialParameter::At | SpecialParameter::Star)
+            ) =>
+        {
+            Ok(shell.positional_params.len().to_string())
+        }
         ParameterOperator::Length => Ok(current.chars().count().to_string()),
         ParameterOperator::UseDefault { null_mode, word } => {
             if effectively_empty(*null_mode) {
@@ -784,15 +1000,20 @@ fn run_command_substitution(body: &str, shell: &Shell) -> Result<String, ExpandE
 /// whitespace class and everything else in `ifs` as the delimiter class,
 /// matching POSIX's own default-vs-custom-IFS distinction.
 fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
-    if ifs.is_empty() {
-        // IFS='' disables splitting entirely (POSIX 2.6.5).
-        return if segments.is_empty() {
-            Vec::new()
-        } else {
-            vec![segments]
-        };
-    }
-
+    // No early `ifs.is_empty()` shortcut here (an earlier version of this
+    // function had one, unconditionally returning every segment combined
+    // into at most one field) — `is_ifs_ws`/`is_ifs_delim` below are
+    // already always `false` for an empty `ifs` (`"".contains(c)` is
+    // always `false`), so the loop below already disables ordinary
+    // per-character splitting on its own, with no special-casing needed.
+    // The shortcut had to go specifically so `force_field_break_after`
+    // (`"$@"`, and unquoted `$@`/`$*` when `IFS` is exactly `""` — see
+    // [`push_positional_params_as_independent_fields`]'s docs) still
+    // takes effect even when `IFS` is empty: confirmed against real bash
+    // `IFS=""; set -- "a," "b"; for x in $@; do ...; done` is still 2
+    // *separate* fields, not 1 combined one, so an ordinary
+    // ifs-is-empty-therefore-everything-is-one-field rule can't be
+    // correct once `$@` is in the picture.
     let is_ifs_ws = |c: char| c.is_whitespace() && ifs.contains(c);
     let is_ifs_delim = |c: char| ifs.contains(c) && !c.is_whitespace();
 
@@ -802,8 +1023,13 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
 
     for segment in segments {
         if !segment.split_eligible {
+            let force_break = segment.force_field_break_after;
             current.push(segment);
             current_has_content = true;
+            if force_break {
+                fields.push(std::mem::take(&mut current));
+                current_has_content = false;
+            }
             continue;
         }
 
@@ -816,6 +1042,7 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
                         text: std::mem::take(&mut piece),
                         glob_eligible,
                         split_eligible: true,
+                        force_field_break_after: false,
                     });
                     current_has_content = true;
                 }
@@ -829,6 +1056,7 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
                         text: std::mem::take(&mut piece),
                         glob_eligible,
                         split_eligible: true,
+                        force_field_break_after: false,
                     });
                 }
                 fields.push(std::mem::take(&mut current));
@@ -842,8 +1070,21 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
                 text: piece,
                 glob_eligible,
                 split_eligible: true,
+                force_field_break_after: false,
             });
             current_has_content = true;
+        }
+        // `force_field_break_after` never fires here for a *split-
+        // eligible* segment in practice — the only segments this module
+        // ever constructs with it set are the non-split-eligible ones
+        // above (`push_positional_params_as_independent_fields`'s N
+        // independent fields) — but handled uniformly regardless, for
+        // the same reason the non-split branch above does: nothing about
+        // `force_field_break_after`'s *meaning* is specific to either
+        // branch.
+        if segment.force_field_break_after && current_has_content {
+            fields.push(std::mem::take(&mut current));
+            current_has_content = false;
         }
     }
     if current_has_content {
@@ -1458,5 +1699,178 @@ mod tests {
         let mut shell = Shell::new();
         shell.env_vars.insert("HOME".into(), "/home/conch".into());
         assert_eq!(single("$((~0))", &mut shell), "-1");
+    }
+
+    // ---- positional parameters / `$@` / `$*` (POSIX 2.5.2) -----------------
+
+    fn set_positional(shell: &mut Shell, params: &[&str]) {
+        shell.positional_params = params.iter().map(|s| s.to_string()).collect();
+    }
+
+    #[test]
+    fn positional_parameter_expands_to_its_value_or_empty_if_unset() {
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["first", "second"]);
+        assert_eq!(single("$1", &mut shell), "first");
+        assert_eq!(single("$2", &mut shell), "second");
+        // Out of range -- same as an ordinary unset variable.
+        assert_eq!(single("$3", &mut shell), "");
+    }
+
+    #[test]
+    fn hash_expands_to_positional_param_count() {
+        let mut shell = Shell::new();
+        assert_eq!(single("$#", &mut shell), "0");
+        set_positional(&mut shell, &["a", "b", "c"]);
+        assert_eq!(single("$#", &mut shell), "3");
+    }
+
+    #[test]
+    fn dollar_zero_expands_to_arg0() {
+        let mut shell = Shell::new();
+        shell.arg0 = "myscript".to_string();
+        assert_eq!(single("$0", &mut shell), "myscript");
+    }
+
+    #[test]
+    fn quoted_at_produces_one_independent_field_per_positional_parameter() {
+        // Confirmed against real bash: set -- one two three; for x in
+        // pre"$@"post; do ...; done visits "preone", "two", "threepost"
+        // -- literal text glues only to the *first*/*last* field, never
+        // in between.
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["one", "two", "three"]);
+        assert_eq!(
+            fields(r#"pre"$@"post"#, &mut shell),
+            vec!["preone", "two", "threepost"]
+        );
+    }
+
+    #[test]
+    fn quoted_at_with_zero_positional_params_produces_zero_fields() {
+        let mut shell = Shell::new();
+        assert_eq!(fields(r#""$@""#, &mut shell), Vec::<String>::new());
+    }
+
+    #[test]
+    fn quoted_at_with_zero_positional_params_glued_to_literal_text_keeps_the_literal_text() {
+        // Confirmed against real bash: set --; for x in pre"$@"post; do
+        // ...; done still visits exactly one field, "prepost" -- the
+        // vanishing behavior only applies to `"$@"` standing alone.
+        let mut shell = Shell::new();
+        assert_eq!(fields(r#"pre"$@"post"#, &mut shell), vec!["prepost"]);
+    }
+
+    #[test]
+    fn quoted_at_preserves_an_empty_positional_parameter_as_its_own_field() {
+        // Confirmed against real bash: set -- a "" b; for x in "$@"; do
+        // ...; done visits three fields, the second one empty.
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["a", "", "b"]);
+        assert_eq!(fields(r#""$@""#, &mut shell), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn quoted_star_joins_positional_params_by_first_ifs_char() {
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["a", "b", "c"]);
+        // Unset IFS -> space-joined.
+        assert_eq!(fields(r#""$*""#, &mut shell), vec!["a b c"]);
+        // Custom IFS -> joined by its first character.
+        shell.env_vars.insert("IFS".into(), ",".into());
+        assert_eq!(fields(r#""$*""#, &mut shell), vec!["a,b,c"]);
+        // IFS set but empty -> no separator at all.
+        shell.env_vars.insert("IFS".into(), String::new());
+        assert_eq!(fields(r#""$*""#, &mut shell), vec!["abc"]);
+    }
+
+    #[test]
+    fn unquoted_at_and_star_are_indistinguishable_under_custom_ifs() {
+        // Confirmed against real bash: IFS=","; set -- "a b" "c d"; for x
+        // in $@; do ...; done and the identical loop over $* both visit
+        // exactly "a b" then "c d" -- the internal spaces aren't in IFS
+        // so they don't cause further splitting, and the comma-joined
+        // boundary between the two parameters doesn't merge them either.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), ",".into());
+        set_positional(&mut shell, &["a b", "c d"]);
+        assert_eq!(fields("$@", &mut shell), vec!["a b", "c d"]);
+        assert_eq!(fields("$*", &mut shell), vec!["a b", "c d"]);
+    }
+
+    #[test]
+    fn unquoted_at_under_default_ifs_splits_each_parameter_and_discards_empty_ones() {
+        // Confirmed against real bash: set -- a "" b; for x in $@; do
+        // ...; done visits only "a" then "b" -- the empty positional
+        // parameter contributes no field at all when unquoted (contrast
+        // quoted_at_preserves_an_empty_positional_parameter_as_its_own_field).
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["a", "", "b"]);
+        assert_eq!(fields("$@", &mut shell), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn unquoted_at_under_default_ifs_further_splits_each_parameters_own_text() {
+        // Confirmed against real bash: unset IFS; set -- "a b" "c d";
+        // for x in $@; do ...; done visits four fields, "a" "b" "c" "d".
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["a b", "c d"]);
+        assert_eq!(fields("$@", &mut shell), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn unquoted_at_custom_delimiter_ifs_can_produce_an_extra_boundary_field() {
+        // Confirmed against real bash: IFS=","; set -- "a," "b"; for x
+        // in $@; do ...; done visits THREE fields ("a", "", "b") even
+        // though "a," split in isolation is just one field ("a", no
+        // trailing empty -- POSIX 2.6.5's "no trailing empty field"
+        // rule) -- the extra empty field only appears because it's now
+        // *internal* to the whole $@ expansion, not the true end. A
+        // second real-bash-confirmed case makes this even clearer:
+        // IFS=","; set -- "a," ",b" visits FOUR fields ("a","","","b").
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), ",".into());
+        set_positional(&mut shell, &["a,", "b"]);
+        assert_eq!(fields("$@", &mut shell), vec!["a", "", "b"]);
+        set_positional(&mut shell, &["a,", ",b"]);
+        assert_eq!(fields("$@", &mut shell), vec!["a", "", "", "b"]);
+    }
+
+    #[test]
+    fn unquoted_at_with_ifs_empty_preserves_fields_without_further_splitting() {
+        // Confirmed against real bash: IFS=""; set -- "a," "b"; for x in
+        // $@; do ...; done visits exactly two fields, "a," and "b",
+        // unmodified -- splitting is off, but the two parameters still
+        // don't merge into one field the way ordinary IFS='' input
+        // would.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), String::new());
+        set_positional(&mut shell, &["a,", "b"]);
+        assert_eq!(fields("$@", &mut shell), vec!["a,", "b"]);
+    }
+
+    #[test]
+    fn hash_of_at_and_star_is_positional_param_count_not_joined_text_length() {
+        // Confirmed against real bash: set -- a bb ccc; echo "${#@}"
+        // "${#*}" "$#" prints "3 3 3", not the length of "a bb ccc".
+        let mut shell = Shell::new();
+        set_positional(&mut shell, &["a", "bb", "ccc"]);
+        assert_eq!(single("${#@}", &mut shell), "3");
+        assert_eq!(single("${#*}", &mut shell), "3");
+    }
+
+    #[test]
+    fn at_and_star_count_as_unset_when_there_are_zero_positional_params() {
+        // Confirmed against real bash: set --; echo "${@-fallback}"
+        // "${@:-fallback}" both print "fallback" -- for *both* the
+        // non-colon and colon operator forms, unlike every other special
+        // parameter (which never counts as unset at all).
+        let mut shell = Shell::new();
+        assert_eq!(single("${@-fallback}", &mut shell), "fallback");
+        assert_eq!(single("${@:-fallback}", &mut shell), "fallback");
+        assert_eq!(single("${*-fallback}", &mut shell), "fallback");
+
+        set_positional(&mut shell, &["a", "b"]);
+        assert_eq!(single("${@-fallback}", &mut shell), "a b");
     }
 }
