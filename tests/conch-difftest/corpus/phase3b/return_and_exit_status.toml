@@ -1,0 +1,90 @@
+# Phase 3b -- the `return` builtin and a function's exit status.
+#
+# Two POSIX rules covered here:
+#
+# - `return [n]` inside a function sets the function's exit status to `n`
+#   (or, with no argument, to the status of the last command run before
+#   `return` itself) and stops running the rest of the function body
+#   immediately.
+# - a function that runs to completion *without* ever calling `return`
+#   exits with the status of the last command it ran -- exactly the same
+#   rule a whole script/subshell follows (see
+#   `corpus/phase3/subshells_and_groups.toml`'s
+#   `subshell-exit-status-is-its-last-command-status`).
+#
+# `return` used outside of any function is where bash and dash genuinely
+# diverge, confirmed directly against real bash and real `/bin/dash` (not
+# just this harness's own `sh`, which is bash-in-POSIX-mode on the dev box
+# this corpus was built on, not dash):
+#
+# - bash treats it as a builtin *usage error*: it prints
+#   "return: can only `return' from a function or sourced script" to
+#   stderr, sets $? to 2 for that one command, and then keeps running the
+#   rest of the script.
+# - dash instead treats the top-level script (whether given via `-c` or a
+#   file) as if it were itself a sourced script, so `return n` there
+#   behaves like `exit n`: it terminates immediately with exit code `n`,
+#   and nothing after it -- including anything on the same line -- ever
+#   runs.
+#
+# Because that's a difference in stdout content (bash keeps going and
+# prints the rest of the script's output; dash does not) and not just exit
+# code or stderr wording, `return-outside-any-function-is-an-error-in-bash`
+# below is `oracles = ["bash"]` only; see `known-differences.md`'s
+# "Cross-shell quirks worth knowing" section for the consolidated writeup
+# of this divergence.
+
+[[case]]
+name = "return-with-explicit-code-sets-the-function-exit-status"
+description = "return n inside a function immediately stops the function and sets its exit status ($?, as observed by the caller) to n, skipping any remaining commands in the function body"
+tags = ["functions", "return", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  echo before
+  return 7
+  echo should-not-print
+}
+f
+echo "rc=$?"
+'''
+
+[[case]]
+name = "function-falling-off-the-end-uses-the-last-commands-status-success"
+description = "a function that never calls return exits with the status of the last command it ran, same as a bare script -- here the last command succeeds"
+tags = ["functions", "return", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  false
+  true
+}
+f
+echo "rc=$?"
+'''
+
+[[case]]
+name = "function-falling-off-the-end-uses-the-last-commands-status-failure"
+description = "the same last-command-status rule applies when that last command fails, contrasting directly with the success case above"
+tags = ["functions", "return", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  true
+  false
+}
+f
+echo "rc=$?"
+'''
+
+[[case]]
+name = "return-outside-any-function-is-an-error-in-bash"
+description = "bash treats a top-level (not inside any function) return as a builtin usage error: it reports the mistake on stderr, sets $? to 2 for that command, and then continues running the rest of the script -- dash instead treats the whole invocation as an implicit sourced script and terminates immediately, so this case is bash-only; see this file's header and known-differences.md"
+tags = ["functions", "return", "bash-extension"]
+oracles = ["bash"]
+script = '''
+echo before
+return 3
+echo "rc=$?"
+echo after
+'''

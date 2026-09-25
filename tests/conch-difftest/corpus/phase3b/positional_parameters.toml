@@ -1,0 +1,67 @@
+# Phase 3b -- top-level positional parameters: `set --`, `$1`/`$2`/.../
+# `$#`/`$@`/`$*`, and `shift [n]`.
+#
+# The quoted-vs-unquoted field-splitting behavior of `$@`/`$*` gets its own
+# dedicated file (`at_star_field_splitting.toml`) since that's the
+# genuinely tricky part; this file covers the more mechanical pieces:
+# setting positional parameters, reading them back, and shifting them.
+# `set`/`shift` are both POSIX special builtins (not bash extensions), so
+# every case runs against both `bash` and `sh`, confirmed directly against
+# real bash and real `/bin/dash`.
+
+[[case]]
+name = "set-dash-dash-establishes-positional-parameters"
+description = "set -- word1 word2 ... replaces the current positional parameters wholesale; $1/$2/$3/$#/$@/$* all reflect the new list immediately"
+tags = ["positional-parameters", "set"]
+oracles = ["bash", "sh"]
+script = '''
+set -- a b c
+echo "1=$1 2=$2 3=$3 count=$# at=$@ star=$*"
+'''
+
+[[case]]
+name = "shift-with-no-argument-shifts-by-one"
+description = "a bare shift drops $1 and renumbers every remaining positional parameter down by one, decrementing $#"
+tags = ["positional-parameters", "shift"]
+oracles = ["bash", "sh"]
+script = '''
+set -- a b c d
+shift
+echo "1=$1 count=$#"
+'''
+
+[[case]]
+name = "shift-with-numeric-argument-shifts-by-n"
+description = "shift n drops the first n positional parameters at once, same end state as calling shift n times in a row"
+tags = ["positional-parameters", "shift"]
+oracles = ["bash", "sh"]
+script = '''
+set -- a b c d
+shift 2
+echo "1=$1 count=$#"
+'''
+
+[[case]]
+name = "set-with-no-args-clears-positional-parameters"
+description = "set -- with nothing after it clears every positional parameter: $# becomes 0 and $1 becomes empty"
+tags = ["positional-parameters", "set"]
+oracles = ["bash", "sh"]
+script = '''
+set -- a b c
+set --
+echo "count=$# one=[$1]"
+'''
+
+[[case]]
+name = "function-call-gets-its-own-positional-parameters-separate-from-top-level"
+description = "calling a function with its own arguments temporarily replaces $1/$#/etc. for the duration of that call; the top level's own positional parameters (set beforehand) are unaffected and reappear once the function returns"
+tags = ["positional-parameters", "functions"]
+oracles = ["bash", "sh"]
+script = '''
+set -- top1 top2
+f() {
+  echo "in f: 1=$1 count=$#"
+}
+f fa fb fc
+echo "after f: 1=$1 count=$#"
+'''

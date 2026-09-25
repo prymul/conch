@@ -55,6 +55,28 @@ self-validated, and oracle-verified against real bash/dash today, and
 also runs in **report-only mode** via its own `CONCH_DIFFTEST_STRICT_PHASE3`
 gate -- see "Phase-specific strict gates" below.
 
+**Phase 3b** (shell functions -- both `fname() { ...; }` and
+`fname() ( ...; )` bodies, plus bash's `function fname { ...; }`
+extension -- the `local`/`return`/`set`/`shift` builtins, and real
+positional-parameter state: `$1`.../`$#`/`$@`/`$*`/`$0`) is being
+implemented concurrently in `crates/conch-parser`/`crates/conch-core` at
+the time the `phase3b/` corpus was written. As of this writing
+`crates/conch-parser` has no `function_definition` grammar at all, so
+every function-defining case fails to *parse* against conch (confirmed:
+`conch -c 'f() { echo hi; }; f'` -> `conch: unexpected operator '('
+at byte 1, expected a separator (';', '&', or newline) or end of input`,
+exit 2); `local`/`return`/`set`/`shift` aren't registered builtins yet, so
+calling any of them tries to exec a same-named external command instead
+(confirmed: `conch -c 'return 3'` -> `conch: return: No such file or
+directory (os error 2)`, exit 127); and every positional-parameter read
+silently expands to empty/zero rather than erroring, since no
+positional-parameter shell state exists yet. That corpus (27 cases
+across 6 files) is, like Phase 2's and Phase 3's, fully built,
+self-validated, and oracle-verified against real bash/dash today, and
+also runs in **report-only mode** via its own
+`CONCH_DIFFTEST_STRICT_PHASE3B` gate -- see "Phase-specific strict gates"
+below.
+
 Every phase's three-test pattern is the same (`{phase}_corpus_validation.rs`,
 `{phase}_oracle_selfcheck.rs`, `{phase}_differential.rs` -- Phase 1's
 happen to be un-prefixed since they were written first):
@@ -82,7 +104,8 @@ Each phase's `{phase}_differential.rs` checks its **own**, separately
 named env var rather than a single shared one -- `differential.rs` (Phase
 1) checks `CONCH_DIFFTEST_STRICT`; `phase2_differential.rs` checks
 `CONCH_DIFFTEST_STRICT_PHASE2`; `phase3_differential.rs` checks
-`CONCH_DIFFTEST_STRICT_PHASE3`; a hypothetical Phase 4 would check
+`CONCH_DIFFTEST_STRICT_PHASE3`; `phase3b_differential.rs` checks
+`CONCH_DIFFTEST_STRICT_PHASE3B`; a hypothetical Phase 4 would check
 `CONCH_DIFFTEST_STRICT_PHASE4`; and so on. This is deliberate and is the
 whole mechanism that keeps phases independent: CI's `difftest` job runs
 `cargo test -p conch-difftest`, which builds and runs *every* test binary
@@ -137,13 +160,20 @@ tests/conch-difftest/
 │   │   ├── arithmetic_expansion.toml
 │   │   ├── globbing.toml
 │   │   └── word_splitting.toml
-│   └── phase3/                      <- same style, one file per control-flow construct
-│       ├── conditionals.toml
-│       ├── for_loops.toml
-│       ├── while_until_loops.toml
-│       ├── nested_loops.toml            (break N / continue N -- see its own header)
-│       ├── case_statements.toml
-│       └── subshells_and_groups.toml
+│   ├── phase3/                      <- same style, one file per control-flow construct
+│   │   ├── conditionals.toml
+│   │   ├── for_loops.toml
+│   │   ├── while_until_loops.toml
+│   │   ├── nested_loops.toml            (break N / continue N -- see its own header)
+│   │   ├── case_statements.toml
+│   │   └── subshells_and_groups.toml
+│   └── phase3b/                     <- same style, functions/local/return/positional params
+│       ├── functions.toml
+│       ├── return_and_exit_status.toml
+│       ├── local_scoping.toml
+│       ├── recursion.toml
+│       ├── positional_parameters.toml
+│       └── at_star_field_splitting.toml (the quoted-vs-unquoted $@/$* contrast)
 └── tests/
     ├── corpus_validation.rs
     ├── oracle_selfcheck.rs
@@ -153,7 +183,10 @@ tests/conch-difftest/
     ├── phase2_differential.rs
     ├── phase3_corpus_validation.rs
     ├── phase3_oracle_selfcheck.rs
-    └── phase3_differential.rs
+    ├── phase3_differential.rs
+    ├── phase3b_corpus_validation.rs
+    ├── phase3b_oracle_selfcheck.rs
+    └── phase3b_differential.rs
 ```
 
 Why a workspace member under `tests/`, not a bare `tests/*.rs` at the
@@ -401,6 +434,47 @@ needs `normalize = ["workdir"]` for the same reason Phase 1's
 `cd-then-pwd-reflects-new-directory` does -- see "Non-determinism and
 normalization" above.
 
+### Phase 3b scoping notes
+
+`corpus/phase3b/` covers shell function definition and calling (both
+`fname() { ...; }` and `fname() ( ...; )` bodies, plus bash's
+`function fname { ...; }` extension), the `return` and `local` builtins,
+and real positional-parameter state (`set --`, `shift [n]`, `$1`.../`$#`/
+`$@`/`$*`). Almost all of it is POSIX baseline -- `local`, while not
+actually specified by POSIX at all, is a de facto standard every shell
+relevant to this project (including dash) implements the same way, so it
+runs against both oracles like the rest of this corpus -- with two
+bash-only exceptions, each `oracles = ["bash"]` only and documented in
+`known-differences.md`'s bash-extensions table:
+`bash-function-keyword-also-defines-a-function` in `functions.toml`
+(dash doesn't accept the `function` keyword at all), and
+`return-outside-any-function-is-an-error-in-bash` in
+`return_and_exit_status.toml` (dash treats a top-level `return` as an
+implicit `exit` instead of a builtin usage error -- a stdout-content
+divergence, not just wording, so `oracles = ["bash", "sh"]` genuinely
+can't be used here; see that file's own header and
+`known-differences.md`'s "Cross-shell quirks worth knowing" section).
+
+`corpus/phase3b/at_star_field_splitting.toml` is the file most worth
+reading before adding to: it's the file this whole corpus's hardest
+semantic (quoted vs. unquoted `$@`/`$*`, plus the N=0 zero-fields edge
+case) gets dedicated coverage in, and its
+`printf-with-zero-positional-at-is-not-a-valid-zero-fields-demonstration`
+case is a documented **negative** result kept deliberately -- `printf`
+turned out not to be a valid way to demonstrate "$@" contributing zero
+fields (it applies its format string at least once regardless, treating
+a missing operand as an empty string, so it produces the same one-line
+output whether given zero args from `"$@"` or truly no operands at all).
+That was discovered by actually running it against real bash and dash
+while building this corpus, not assumed -- see the file's header for the
+full writeup and which two cases (a `for` loop and a function-argument
+count) are the correct way to prove the zero-fields property instead.
+
+`corpus/phase3b/recursion.toml`'s
+`local-variables-nest-correctly-across-recursive-calls` case exists
+specifically so `local` scoping is proven to nest across more than one
+call-stack frame, not just work once -- see that file's header.
+
 ## Wiring in real execution
 
 This is the part whoever picks this crate up once Phase 1 execution
@@ -481,4 +555,34 @@ cargo test -p conch-difftest --test phase3_differential -- --nocapture
 
 # Phase 3 hard gate, once warranted:
 CONCH_DIFFTEST_STRICT_PHASE3=1 cargo test -p conch-difftest --test phase3_differential -- --nocapture
+```
+
+Likewise for Phase 3b once function/`local`/`return`/positional-parameter
+execution lands in `crates/conch-parser`/`crates/conch-core`,
+substituting `phase3b_differential` and `CONCH_DIFFTEST_STRICT_PHASE3B`.
+As of this writing, conch's parser has no `function_definition` grammar
+at all and its executor has no positional-parameter shell state, so
+`phase3b_differential` reports 2/52 against a built conch binary today.
+Both passes are `printf-with-zero-positional-at-is-not-a-valid-zero-
+fields-demonstration` (see that case's own doc note in
+`at_star_field_splitting.toml`) -- a coincidence, not evidence `$@` is
+implemented: conch's placeholder "every positional parameter is
+permanently unset" behavior happens to produce the exact same one blank
+line real bash/dash produce for a script that legitimately has zero
+positional parameters, purely because that specific case can't
+distinguish "always unset" from "genuinely empty" in its output. Every
+other case fails for one of two confirmed reasons (not a corpus bug):
+defining a function fails to *parse* (`conch -c 'f() { echo hi; }; f'` →
+`conch: unexpected operator '(' at byte 1, expected a separator (';',
+'&', or newline) or end of input`, exit 2), or calling `local`/`return`/
+`set`/`shift` tries to exec a same-named external command (`conch -c
+'return 3'` → `conch: return: No such file or directory (os error 2)`,
+exit 127):
+
+```sh
+# Phase 3b full report, report-only (today's state):
+cargo test -p conch-difftest --test phase3b_differential -- --nocapture
+
+# Phase 3b hard gate, once warranted:
+CONCH_DIFFTEST_STRICT_PHASE3B=1 cargo test -p conch-difftest --test phase3b_differential -- --nocapture
 ```

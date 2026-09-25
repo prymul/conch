@@ -1,0 +1,118 @@
+# Phase 3b -- shell function definition and calling.
+#
+# POSIX only defines one function-definition syntax, `fname() compound_command`
+# (almost always written with a brace-group body, `fname() { ...; }`, but a
+# subshell body, `fname() ( ...; )`, is equally legal grammar and has a
+# genuinely different runtime effect -- see the direct contrast below). bash
+# additionally accepts a `function fname { ...; }` keyword form as an
+# extension; dash does not, so that one case is `oracles = ["bash"]` only
+# (see `known-differences.md`'s bash-extensions table).
+#
+# The brace-body vs. subshell-body contrast mirrors
+# `corpus/phase3/subshells_and_groups.toml`'s subshell/brace-group pairing
+# exactly, just applied to a function body instead of a bare `( )`/`{ }`:
+# a subshell-body function forks, so a variable assignment inside it never
+# leaks back to the caller; a brace-body function runs in the caller's own
+# shell environment, so it does.
+#
+# All scripts here were run against real bash and real `/bin/dash` directly
+# while building this corpus (the dev box's own `sh` resolves to bash in
+# POSIX mode, not dash -- see README.md's "Non-determinism and
+# normalization" cross-shell-quirks note), and bash/dash agreed on every
+# POSIX-baseline case.
+
+[[case]]
+name = "brace-body-function-receives-positional-arguments"
+description = "a function with a brace-group body sees its call arguments as its own $1/$2/.../$#/$@, distinct from whatever the caller's own positional parameters were"
+tags = ["functions", "positional-parameters"]
+oracles = ["bash", "sh"]
+script = '''
+greet() {
+  echo "args: $1 $2 count=$# all=$@"
+}
+greet foo bar
+'''
+
+[[case]]
+name = "function-called-with-zero-arguments-has-zero-count"
+description = "calling a function with no arguments at all gives it $# = 0 and an empty $1, the same as a script invoked with no positional parameters"
+tags = ["functions", "positional-parameters"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  echo "count=$# first=[$1]"
+}
+f
+'''
+
+[[case]]
+name = "subshell-body-function-isolates-variable-assignments"
+description = "a function defined with a subshell body -- fname() ( ... ) -- forks to run its body, so a variable assignment inside it never leaks back to the caller once the function returns; direct contrast with the brace-body case below"
+tags = ["functions", "subshell", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+insub() (
+  x=inside
+  echo "in subshell func: $x"
+)
+x=outside
+insub
+echo "after: $x"
+'''
+
+[[case]]
+name = "brace-body-function-variable-assignment-persists-in-caller"
+description = "a function defined with an ordinary brace-group body runs in the caller's own shell environment, so a variable assignment inside it is still visible after the function returns -- the direct contrast with the subshell-body case above"
+tags = ["functions", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+inbrace() {
+  x=inside
+  echo "in brace func: $x"
+}
+x=outside
+inbrace
+echo "after: $x"
+'''
+
+[[case]]
+name = "function-calls-a-builtin-and-another-function"
+description = "a function's body is ordinary shell code: it can call another previously-defined function and a shell builtin (cd, here, via a subshell so its directory change doesn't affect the rest of the corpus run) in the same body"
+tags = ["functions", "builtins"]
+oracles = ["bash", "sh"]
+script = '''
+inner() {
+  echo "inner got: $1"
+}
+outer() {
+  echo "outer calling inner and a builtin"
+  inner "$1"
+  echo "cd builtin result: $(cd .. && echo moved)"
+}
+outer hello
+'''
+
+[[case]]
+name = "function-name-shadows-a-plain-command-of-the-same-name"
+description = "defining a function whose name matches an existing command (true, here -- a shell builtin in both bash and dash, also present as a real PATH binary) makes plain, unqualified calls to that name run the function instead for the rest of the script"
+tags = ["functions", "shadowing"]
+oracles = ["bash", "sh"]
+script = '''
+true() {
+  echo "shadowed true"
+}
+true
+echo "rc=$?"
+'''
+
+[[case]]
+name = "bash-function-keyword-also-defines-a-function"
+description = "bash accepts an alternate function-definition syntax, function fname { ...; } (the parens are optional and omitted here), as an extension beyond POSIX's fname() compound_command; dash rejects the function keyword entirely, so this case is bash-only"
+tags = ["functions", "bash-extension"]
+oracles = ["bash"]
+script = '''
+function greet {
+  echo "hi $1"
+}
+greet world
+'''

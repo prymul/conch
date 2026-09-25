@@ -55,6 +55,7 @@ against two oracles.
 | Arithmetic comma operator `(a,b,c)` | `expecting ')'` parse error | `corpus/phase2/arithmetic_expansion.toml` |
 | Arithmetic: a non-numeric variable value is recursively treated as another variable's *name* (e.g. `x=abc; $((x+1))` looks up `abc`, finds it unset, uses 0) | `Illegal number: abc` -- an immediate error, no recursive lookup | `corpus/phase2/arithmetic_expansion.toml` |
 | Glob bracket-expression `^` as a negation synonym for `!` (a glibc `fnmatch()` extension bash's linked libc happens to support) | `^` is an ordinary literal character inside the bracket set -- POSIX only defines `!` for negation | `corpus/phase2/globbing.toml` |
+| `function fname { ...; }` (and `function fname() { ...; }`) as an alternate function-definition keyword syntax alongside POSIX's `fname() compound_command` | Treats `function`, the function name, and the literal `{` as ordinary words -- an attempt to run a command named `function` (`function: not found`) -- then runs the body's own commands as plain top-level statements with no group around them at all, and finally hits a syntax error on the orphaned closing `}` (confirmed: dash exits 2, having never reached the intended function call) | `corpus/phase3b/functions.toml` |
 
 ## Cross-shell quirks worth knowing (neither shell is simply "wrong")
 
@@ -89,6 +90,24 @@ just the target(s) that do agree.
   `corpus/phase2/arithmetic_expansion.toml`'s
   `arithmetic-division-by-zero-halts-dash-but-not-bash-on-the-next-line`
   is `oracles = ["bash"]` only rather than narrowing `compare`.
+
+- **`return` outside any function: bash reports a usage error and keeps
+  going; dash treats it as an implicit `exit` for the whole invocation.**
+  Both shells reject a bare `return` at the top level in some sense (it
+  isn't a function call, so "return to the caller" is meaningless), but
+  they disagree on what that rejection actually does. bash prints
+  `` return: can only `return' from a function or sourced script `` to
+  stderr, sets `$?` to 2 for that one command, and then continues
+  executing the rest of the script exactly as if that line had been a
+  no-op. dash instead treats the top-level script (`-c '...'` or a file,
+  either way) as though it were itself a sourced script, so `return n`
+  behaves like `exit n`: it terminates immediately with exit code `n`,
+  and nothing after it -- even later on the same source line -- ever
+  runs. This is a difference in actual stdout content (bash's remaining
+  output still appears; dash's doesn't), so
+  `corpus/phase3b/return_and_exit_status.toml`'s
+  `return-outside-any-function-is-an-error-in-bash` is `oracles =
+  ["bash"]` only rather than narrowing `compare`.
 
 ## Entry format
 
