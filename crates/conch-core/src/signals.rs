@@ -343,24 +343,21 @@ impl Shell {
     /// module docs for why draining the pipe itself is unconditional
     /// rather than conditioned on "did it actually have a byte."
     ///
-    /// The `SIGCHLD`-gating matters beyond just avoiding pointless work
-    /// on every call: [`Shell::reap_children`]'s `waitpid(-1, ...)` reaps
-    /// indiscriminately across *every* child of this process, including
-    /// ones a concurrently-in-flight, ordinary (non-job-control)
-    /// `std::process::Child::wait()` elsewhere in this crate is also
-    /// specifically waiting on — harmless in this crate's real,
-    /// single-threaded execution model (nothing else runs while a
-    /// blocking syscall is in flight), but a real, observed race in this
-    /// crate's own multi-threaded `cargo test` binary, where unrelated
-    /// tests spawning real child processes run concurrently on different
-    /// threads of *one* process and do share that process's child-PID
-    /// namespace. Only ever actually reaping when `SIGCHLD` was
-    /// genuinely pending (which requires a handler this crate installed
-    /// via [`Self::init_signal_handling`] to have actually fired) makes
-    /// that sweep run only when there's real reason to believe it has
-    /// something to do, incidentally eliminating the test race too
-    /// (no test here ever installs a handler, so this never fires for
-    /// them at all).
+    /// The `SIGCHLD`-gating here is a plain, uncontroversial efficiency
+    /// win (skip a pointless sweep when nothing changed) rather than a
+    /// safety-load-bearing one: an earlier version of this doc comment
+    /// leaned on it to *also* avoid a cross-child reaping race in this
+    /// crate's own multi-threaded `cargo test` binary (unrelated tests
+    /// spawning real children on different threads of one process, which
+    /// share that process's child-PID namespace) — a real, observed
+    /// flake at the time, caught by this test suite itself going red.
+    /// That race is now closed *structurally*, one layer down, in
+    /// [`Shell::reap_children`] itself (scoped to specific tracked job
+    /// leaders rather than a process-wide `waitpid(-1, ...)` sweep, per
+    /// a later security review — see that function's own docs for the
+    /// full reasoning), which means this function no longer depends on
+    /// the `SIGCHLD`-gate for correctness at all, only for avoiding
+    /// needless work.
     ///
     /// Returns the ids of jobs whose state changed (see
     /// [`Shell::reap_children`]), for a caller to print notifications

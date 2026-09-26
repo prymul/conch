@@ -54,15 +54,39 @@ process (see `conch-shell-core::exec::exec_subshell`'s own doc comment),
 not by an in-process fork of interpreter state. Propagating a `trap`'s
 *command text* to that freshly-started process would require passing it
 through the environment for the child to automatically parse and execute
-at startup -- which is structurally the exact same shape CVE-2014-6271
-(Shellshock) exploited (a command/function definition smuggled through an
-environment variable and auto-run by a newly-started shell that trusted
-it). This codebase already explicitly declined that same pattern for
-propagating ordinary shell variables (`Shell::shell_vars`) into a
-subshell, for the identical reason -- see that same `exec_subshell` doc
-comment. This is a deliberate security tradeoff, not an oversight, and
-not expected to change without a fundamentally different (in-process, not
-re-exec-based) subshell implementation.
+at startup -- the same general shape Shellshock's (CVE-2014-6271)
+post-mortem warns about (data an attacker doesn't control gets sent
+somewhere, only to have a startup path auto-execute a piece of it as a
+command), even though the specific exploitability chain doesn't carry
+over one-for-one: unlike Shellshock's bug (a parser that scanned function
+definitions out of *every* environment variable indiscriminately, with no
+intended boundary at all), a trap-text channel here would be one
+specific, internally-named variable read at one known point
+(`Shell::new`), the same narrow shape the (safe, already-shipped)
+`__CONCH_IGNORED_SIGNALS` ignored-signal-list case already uses -- it
+wouldn't inherit Shellshock's specific indiscriminate-environment-scanning
+defect just by existing; getting the delimiting right for arbitrary
+command text (as opposed to a simple comma-joined signal-name list) is a
+solvable, ordinary engineering problem on its own, not evidence the whole
+approach is unsound. And, notably, no real capability is actually
+withheld from
+anyone by this decision: a script can already get the identical effect
+without any propagation machinery at all, simply by writing `trap 'cmd'
+SIG` as the first line inside its own subshell body. So this is
+ultimately a POSIX-fidelity gap, not a load-bearing security boundary --
+but the general shape (arbitrary command text, sent through an
+environment variable, auto-run by a freshly-started interpreter that
+trusts it) is close enough to what Shellshock's category of bug looked
+like that this codebase already explicitly declined the analogous
+pattern once before, for propagating ordinary shell variables
+(`Shell::shell_vars`) into a subshell -- see that same `exec_subshell` doc
+comment -- and extending that same caution to trap command-text, rather
+than reopening the question from scratch, is the more conservative
+default until there's a concrete reason a script actually needs the
+propagated form instead of writing the trap inside the subshell directly.
+Revisiting this is realistic (unlike a hypothetical fundamentally
+different in-process subshell implementation, which would sidestep the
+whole question) if that reason ever surfaces.
 
 **Case:** `corpus/phase4/trap.toml` ->
 `trap-set-in-parent-is-visible-inside-a-subshell-bash-only` (currently
@@ -126,6 +150,57 @@ Phase 4 development, for the cases this gap does *not* affect (single
 foreground command, any backgrounded pipeline) -- both confirmed correct
 that way; the gap itself (foreground multi-stage pipeline) was reasoned
 through from the implementation, not separately reproduced live.
+
+### KD-0003: a background job reported once at an interactive prompt can become un-`wait`-able too soon
+
+**What diverges:** in an *interactive* session, if a backgrounded job
+finishes and gets announced by the next prompt's own notification pass
+(bash's `[1]+ Done sleep 0.1`-style line) before the script/user gets
+around to running `wait "$pid"` on it -- i.e. at least one full
+prompt/command boundary passes in between -- a subsequent `wait "$pid"`
+fails with `wait: pid N is not a child of this shell` instead of
+succeeding.
+
+**bash/sh behavior:** a completed background job stays `wait`-able for a
+meaningfully longer window than "until it's been printed once" -- typing
+an unrelated command at the prompt in between backgrounding a job and
+later `wait`-ing on it does not cause bash to forget the job.
+
+**conch behavior:** [`Shell::purge_finished_notified_jobs`]
+(`conch-shell-core::job`) removes a job from the job table as soon as its
+current state has been reported *once*, whether that report came from
+the `jobs` builtin or the interactive prompt loop's own per-prompt
+notification pass (`conch`'s `report_finished_jobs`). Once purged,
+[`Shell::wait_for_pid`] has nothing left to look up, so `wait` on that
+pid reports it as never having been this shell's child at all, even
+though it genuinely was.
+
+**Why:** this is a narrow, interactive-only gap in the *policy* of when a
+finished job's table entry gets cleaned up, not a fundamental limitation
+of the job-table/`wait` mechanism itself -- unlike KD-0001/KD-0002, this
+one is closer to an under-tuned default than a considered design
+tradeoff: the "purge after first report" rule was written to match "show
+a completed job's status exactly once, then forget it" for `jobs`'
+*display* purposes, without separately considering that the same purge
+also needs to not race a still-pending explicit `wait` on that same job.
+A more bash-like policy (e.g. only purging once a job has actually been
+`wait`-ed on, or after some longer grace window, rather than immediately
+after its first *display*) would close this, but wasn't implemented as
+part of landing the rest of Phase 4 -- flagged and explicitly deferred
+rather than fixed in the moment it was found, the same "land this phase
+in a good, complete state rather than keep extending it" call already
+made for KD-0002. A legitimate candidate for a fast-follow alongside (or
+instead of) KD-0002's.
+
+**Case:** not currently represented in the differential corpus and can't
+be with the current corpus design -- reaching this gap requires crossing
+an *interactive* prompt boundary between backgrounding a job and later
+`wait`-ing on it (the corpus's own `-c`/script-mode invocations never go
+through the interactive per-prompt notification pass at all, since
+that's only wired up in `conch`'s own `run_interactive`, not
+`run_source`), so no `-c`-based script can exercise it regardless of how
+it's written. Found and confirmed via live `pty`-backed manual testing,
+not the differential suite.
 
 ## Bash extensions not in the POSIX baseline
 

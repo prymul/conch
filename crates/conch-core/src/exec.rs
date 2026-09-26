@@ -482,6 +482,30 @@ fn run_foreground_job(
 /// terminal ownership, blocking wait, stoppable via Ctrl-Z again exactly
 /// like any other foreground job (see [`run_foreground_job`]).
 ///
+/// Hands the terminal over via `tcsetpgrp` *before* sending `SIGCONT`,
+/// matching the GNU libc manual's own `put_job_in_foreground` reference
+/// sequence (`tcsetpgrp` → restore saved terminal modes → `SIGCONT` →
+/// wait) — caught by a security review, not by any local testing: doing
+/// it in the other order (as an earlier version of this function did)
+/// is a real, timing-dependent flake, not merely non-idiomatic — if the
+/// resumed job's first terminal access happens before this shell's own
+/// `tcsetpgrp` call actually lands, the kernel immediately re-stops it
+/// with `SIGTTIN`/`SIGTTOU`, since it would still be trying to use the
+/// terminal from a *background* process group's perspective at that
+/// exact instant. `run_foreground_job` below still does its own
+/// `tcsetpgrp` to the same `pgid` immediately afterward (correctly
+/// redundant, not a second bug: it's shared with the "freshly spawned,
+/// not resumed" call path, where there's no prior stop/`SIGCONT` for
+/// this ordering concern to apply to at all).
+///
+/// Known gap, not addressed here: no `tcgetattr`/`tcsetattr` save/restore
+/// of the terminal's *mode* (as opposed to its foreground process group)
+/// around a stop/resume — a job that changes terminal modes while
+/// running (`vim`'s raw mode, say) doesn't have that mode saved when it
+/// stops or restored when it resumes. Flagged by the same security
+/// review as a separate, lower-severity, likely-out-of-scope-for-this-pass
+/// gap, not a required fix alongside the ordering bug above.
+///
 /// # Errors
 ///
 /// `id` isn't a known job, or the underlying `killpg`
@@ -494,6 +518,8 @@ pub fn resume_job_in_foreground(shell: &mut Shell, id: u32) -> Result<i32, Strin
     let command = job.command.clone();
     if shell.job_control_active {
         eprintln!("{command}");
+        let stdin = std::io::stdin();
+        let _ = tcsetpgrp(&stdin, pgid);
     }
     if let Err(err) = shell.signal_job(id, Signal::SIGCONT) {
         return Err(format!("fg: {err}"));

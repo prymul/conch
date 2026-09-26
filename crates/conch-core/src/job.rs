@@ -27,20 +27,26 @@
 //! race a concurrent reap the way signaling a specific, potentially
 //! already-recycled PID could.
 //!
-//! # Why reaping only ever happens in one place
+//! # Why [`JobState`] is only ever updated in one place
 //!
-//! [`Shell::reap_children`] is the *only* code in this crate that ever
-//! calls `waitpid` — every job's [`JobState`] is exactly whatever that
-//! function most recently observed, never guessed at, inferred from a
-//! timeout, or updated any other way. It's designed to be called
-//! liberally (before every prompt, right after any foreground job
-//! returns control to the shell, and from the deferred-`SIGCHLD` signal
-//! checkpoint — see `conch-shell-core::signals`) specifically *because*
-//! it's cheap and idempotent when there's nothing new to reap: a
-//! `WNOHANG` loop that keeps calling `waitpid(None, ...)` until it
-//! returns [`nix::sys::wait::WaitStatus::StillAlive`] or an `ECHILD`
-//! (only possible children left are internal ones — actually not: see
-//! its own docs), never blocking.
+//! Every [`Job`]'s state is exactly whatever
+//! [`Shell::apply_wait_status`] most recently observed for it, never
+//! guessed at, inferred from a timeout, or updated any other way — both
+//! `waitpid`-calling entry points in this module
+//! ([`Shell::reap_children`]'s non-blocking per-leader sweep and
+//! [`Shell::block_for_any_child_change`]'s blocking single step, used by
+//! `wait`) route every observation through that one shared function so
+//! they can never disagree about what a given `WaitStatus` means.
+//! [`Shell::reap_children`] is designed to be called liberally (before
+//! every prompt, right after any foreground job returns control to the
+//! shell, and from the deferred-`SIGCHLD` signal checkpoint — see
+//! `conch-shell-core::signals`) specifically *because* it's cheap and
+//! idempotent when there's nothing new to reap for any tracked job, and
+//! — since a security review had it scoped from an earlier, broader
+//! `waitpid(-1, ...)` sweep to one `WNOHANG` call per tracked job leader
+//! specifically (see that function's own docs for the full reasoning) —
+//! it's also now structurally incapable of observing, let alone
+//! reaping, any child this shell didn't itself register as a job.
 
 use std::collections::BTreeMap;
 
@@ -290,47 +296,89 @@ impl JobTable {
 }
 
 impl Shell {
-    /// Reaps every currently-reapable child (`waitpid(-1, WNOHANG |
-    /// WUNTRACED | WCONTINUED)`, repeated until nothing's left to
-    /// report) and updates the job table accordingly. Never blocks —
-    /// safe to call speculatively and often (see the module docs).
+    /// Reaps every currently-reapable **tracked job leader** (one
+    /// `waitpid(leader, WNOHANG | WUNTRACED | WCONTINUED)` call per
+    /// [`Job`] in [`Shell::job_table`], never the whole-process
+    /// `waitpid(-1, ...)` sweep an earlier version of this function
+    /// used) and updates the job table accordingly. Never blocks — safe
+    /// to call speculatively and often (see the module docs).
     ///
-    /// A child this shell didn't itself register as a job (most notably:
-    /// a foreground external command spawned directly by
-    /// `conch-shell-core::exec` without going through the job table at
-    /// all, whose own `wait` loop reaps it directly) is silently skipped
-    /// here rather than logged/erroring — `waitpid(-1, ...)` reports
-    /// *every* reapable child indiscriminately, and a foreground-wait
-    /// loop racing this same call for the same child is expected, not a
-    /// bug (only one of the two ever actually observes a given state
-    /// change, since `waitpid` consumes it).
+    /// Deliberately scoped to specific, already-known pids rather than
+    /// "whatever this process happens to have reapable right now" —
+    /// caught by a security review: a process-wide `waitpid(-1, ...)`
+    /// reaps *indiscriminately*, meaning it could consume the exit
+    /// status of a child some *other*, unrelated code in this same
+    /// process is separately, directly `waitpid`-ing for (an ordinary
+    /// foreground external-command spawn that never went through the
+    /// job table at all, say), stealing it before that other code ever
+    /// gets to observe it. Under this crate's real, single-threaded
+    /// production execution model that specific race can't actually
+    /// happen (nothing else runs concurrently while this process is
+    /// blocked in *its own* `waitpid` call — see
+    /// `conch-shell-core::exec::run_foreground_job`'s docs), but relying
+    /// on that as the *only* thing preventing it was an unenforced
+    /// invariant, not a structural guarantee — the exact hazard that
+    /// once caused a real, reproducible flake in this crate's own
+    /// multi-threaded `cargo test` binary (see
+    /// [`Shell::process_pending_signals`]'s docs for that incident),
+    /// and would reopen the instant any *future* test also called
+    /// [`Shell::init_signal_handling`]. Targeting only this shell's own
+    /// tracked job leaders removes the hazard structurally instead of
+    /// merely avoiding triggering it today: this function can no longer
+    /// observe, let alone reap, a child it doesn't already know about.
     ///
     /// Returns the ids of every job whose [`JobState`] just changed
     /// (freshly `Stopped`/`Done`/`Signaled`, or `Running` again via
     /// `SIGCONT`), for a caller (the interactive prompt loop) to print
     /// bash's `[1]+ Done sleep 5`-style notification for.
     pub fn reap_children(&mut self) -> Vec<u32> {
+        // Collected up front (rather than iterating `self.job_table`
+        // directly) so the loop below is free to take `&mut self` per
+        // leader via `apply_wait_status` without fighting the borrow
+        // checker over a concurrent immutable iterator — `Pid` is
+        // `Copy`, so this is a cheap, small copy, not a real allocation
+        // concern even with many tracked jobs.
+        let leaders: Vec<Pid> = self.job_table.iter().map(|job| job.leader).collect();
+        let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
         let mut changed = Vec::new();
-        loop {
-            let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
-            match waitpid(None, Some(flags)) {
-                Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
-                Err(Errno::EINTR) => continue,
-                Err(_) => break,
-                Ok(status) => changed.extend(self.apply_wait_status(status)),
+        for leader in leaders {
+            loop {
+                match waitpid(leader, Some(flags)) {
+                    // `ECHILD` here just means *this* leader has nothing
+                    // new to report (already reaped by an earlier call,
+                    // or never had anything pending) -- not an error
+                    // condition worth treating differently from
+                    // `StillAlive`.
+                    Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+                    Err(Errno::EINTR) => continue,
+                    Err(_) => break,
+                    Ok(status) => {
+                        changed.extend(self.apply_wait_status(status));
+                        // A specific-pid `waitpid` call only ever reports
+                        // one state transition per call (unlike `-1`,
+                        // which could have more waiting across *other*
+                        // children) -- nothing further to drain for this
+                        // one leader on this pass.
+                        break;
+                    }
+                }
             }
         }
         changed
     }
 
     /// Applies one [`WaitStatus`] observation to whichever tracked job it
-    /// belongs to (if any — see [`Self::reap_children`]'s docs for why an
-    /// untracked child is silently skipped), returning that job's id if
-    /// it was tracked and its state actually changed. The one piece of
-    /// "turn a raw `waitpid` result into a `JobState` update" logic,
-    /// shared by [`Self::reap_children`]'s `WNOHANG` sweep and
-    /// [`Self::block_for_any_child_change`]'s single blocking step, so
-    /// the two can never disagree about what a given `WaitStatus` means.
+    /// belongs to (`None` if it doesn't belong to any tracked job at all
+    /// — no longer reachable from [`Self::reap_children`] itself, since
+    /// that function only ever asks `waitpid` about pids it already
+    /// knows are tracked leaders, but still reachable from
+    /// [`Self::block_for_any_child_change`], which — unlike
+    /// `reap_children` — has no way to narrow its own `waitpid(-1, ...)`
+    /// call to specific pids at all, see that function's own docs),
+    /// returning that job's id if it was tracked and its state actually
+    /// changed. The one piece of "turn a raw `waitpid` result into a
+    /// `JobState` update" logic, shared by both callers, so they can
+    /// never disagree about what a given `WaitStatus` means.
     fn apply_wait_status(&mut self, status: WaitStatus) -> Option<u32> {
         // `.pid()` is `WaitStatus`'s own accessor (handles the
         // Linux-only `PtraceEvent`/`PtraceSyscall` variants' cfg-gating
@@ -360,6 +408,25 @@ impl Shell {
     /// docs): nothing else in this process runs concurrently while this
     /// call is blocked, so it can never "lose" a state change to a
     /// competing `waitpid` call the way two real OS threads could.
+    ///
+    /// Still uses `waitpid(-1, ...)` (unlike [`Self::reap_children`],
+    /// which a security review had scoped to specific tracked leaders
+    /// instead — see that function's own docs) rather than one call per
+    /// tracked leader, because a *blocking* "wait for whichever of these
+    /// N specific pids changes first" has no single-syscall equivalent
+    /// to fall back on the way a non-blocking, one-leader-at-a-time sweep
+    /// does — `waitpid` only ever blocks for one specific pid, or for
+    /// *any* child. This carries the same theoretical "could reap an
+    /// unrelated concurrent `waitpid` caller's child out from under it"
+    /// category of hazard `reap_children` had, under the same purely
+    /// hypothetical condition (a future test spawning real children
+    /// concurrently with a `wait`/`fg`/`bg` call on a *different*
+    /// thread of one `cargo test` binary — not a concern in this crate's
+    /// actual single-threaded production execution, per the paragraph
+    /// above) — flagged here rather than silently left unremarked, not
+    /// fixed in this pass (no *drop-in* narrower replacement exists for
+    /// the blocking-on-multiple-specific-targets case the way there did
+    /// for `reap_children`'s simpler "sweep everything" one).
     ///
     /// Returns `false` if there was nothing left to wait for at all
     /// (`ECHILD` — every child of this process has already been
