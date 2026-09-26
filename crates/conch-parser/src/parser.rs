@@ -115,10 +115,9 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let mut items = Vec::new();
         while !self.at_eof() {
-            let and_or = self.parse_and_or()?;
-            let separator = self.parse_optional_separator();
-            let is_none = matches!(separator, Separator::None);
-            items.push(CommandListItem { and_or, separator });
+            let item = self.parse_command_list_item()?;
+            let is_none = matches!(item.separator, Separator::None);
+            items.push(item);
             if is_none {
                 break;
             }
@@ -131,21 +130,60 @@ impl<'a> Parser<'a> {
         Ok(CommandList { items })
     }
 
+    /// Parses one [`CommandListItem`] — an `and_or` plus whatever
+    /// [`Separator`] follows it — shared by [`Self::parse_command_list`]
+    /// (the whole top-level program) and [`Self::parse_compound_list`]
+    /// (every compound command's own body), which differ only in what
+    /// tells them to stop looping for more items.
+    ///
+    /// Captures the item's own starting byte offset *before* parsing the
+    /// `and_or` (via [`Self::peek`], which — since every caller has
+    /// already skipped leading newlines/blank separators by this point —
+    /// is exactly the first byte of the `and_or` itself, no leading
+    /// whitespace) and hands it to [`Self::parse_optional_separator`],
+    /// which needs it only in the `&` case (see [`Separator::Async`]'s
+    /// docs for why).
+    fn parse_command_list_item(&mut self) -> Result<CommandListItem, ParseError> {
+        let item_start = self.peek().map_or(self.source.len(), |tok| tok.span.start);
+        let and_or = self.parse_and_or()?;
+        let separator = self.parse_optional_separator(item_start);
+        Ok(CommandListItem { and_or, separator })
+    }
+
     /// POSIX `separator`: `separator_op linebreak | newline_list`. Also
     /// consumes any further blank lines, matching `linebreak`'s
     /// "zero or more" and `newline_list`'s "one or more" both folding
     /// into "skip everything after the first separator token".
-    fn parse_optional_separator(&mut self) -> Separator {
-        let separator = match self.peek_kind() {
-            Some(TokenKind::Operator(Operator::Semi)) => {
+    ///
+    /// `item_start` is the byte offset [`Self::parse_command_list_item`]
+    /// captured just before parsing the `and_or` this separator follows
+    /// — needed only for the `&` case, to slice out [`Separator::Async`]'s
+    /// own raw source text (`self.source[item_start..amp_start]`, the
+    /// same `open.end..close_start` slicing [`Self::parse_subshell`]
+    /// already does, just with the `&` token's own start standing in for
+    /// a subshell's closing `)`).
+    fn parse_optional_separator(&mut self, item_start: usize) -> Separator {
+        let separator = match self.peek() {
+            Some(tok) if matches!(tok.kind, TokenKind::Operator(Operator::Semi)) => {
                 self.next();
                 Separator::Sequential
             }
-            Some(TokenKind::Operator(Operator::Amp)) => {
+            Some(tok) if matches!(tok.kind, TokenKind::Operator(Operator::Amp)) => {
+                let amp_start = tok.span.start;
                 self.next();
-                Separator::Async
+                // `trim_end` only: `item_start` is already exactly the
+                // and_or's first byte (see parse_command_list_item's
+                // docs), but `amp_start` is the `&` token's own start,
+                // which includes whatever whitespace separates it from
+                // the last real token (`sleep 1 &` would otherwise
+                // capture a trailing space) -- harmless either way once
+                // re-lexed by the child `conch -c` this text is handed
+                // to, but trimmed here so the captured source (and any
+                // diagnostic/`jobs` display built from it later) reads
+                // cleanly.
+                Separator::Async(self.source[item_start..amp_start].trim_end().to_string())
             }
-            Some(TokenKind::Newline) => {
+            Some(tok) if matches!(tok.kind, TokenKind::Newline) => {
                 self.next();
                 Separator::Sequential
             }
@@ -565,10 +603,9 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let mut items = Vec::new();
         while !self.at_compound_list_end() {
-            let and_or = self.parse_and_or()?;
-            let separator = self.parse_optional_separator();
-            let is_none = matches!(separator, Separator::None);
-            items.push(CommandListItem { and_or, separator });
+            let item = self.parse_command_list_item()?;
+            let is_none = matches!(item.separator, Separator::None);
+            items.push(item);
             if is_none {
                 break;
             }

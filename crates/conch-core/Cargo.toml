@@ -9,6 +9,17 @@ repository.workspace = true
 [dependencies]
 conch-shell-parser = { workspace = true }
 thiserror = "2"
+# Process-group/terminal-control/signal-handling primitives Phase 4 job
+# control needs (`setpgid`/`tcsetpgrp`/`sigaction`/`waitpid`), following
+# the GNU libc manual's job-control chapter's protocol -- see this crate's
+# `job` module docs. `process`/`signal`/`term` are exactly the three
+# feature-gated modules that protocol needs (`unistd`'s `setpgid`/`Pid`,
+# `sys::wait`; `sys::signal`; `unistd`'s `tcsetpgrp`/`tcgetpgrp`
+# respectively) -- no broader `nix` surface than that is pulled in.
+# Already resolved at 0.31.3 transitively via `rustyline`'s own
+# termios/tty handling, so this adds no new version to the dependency
+# graph, only new feature flags on an already-locked crate.
+nix = { version = "0.31", features = ["process", "signal", "term"] }
 
 [dev-dependencies]
 tempfile = "3"

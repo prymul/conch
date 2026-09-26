@@ -65,7 +65,7 @@
 //! assert_eq!(first.separator, Separator::Sequential);
 //!
 //! let second = &list.items[1];
-//! assert_eq!(second.separator, Separator::Async); // trailing `&`
+//! assert!(matches!(second.separator, Separator::Async(_))); // trailing `&`
 //! let Command::Simple(cmd) = &second.and_or.first.commands[0] else {
 //!     unreachable!()
 //! };

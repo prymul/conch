@@ -366,7 +366,59 @@ fn trailing_semicolon_does_not_add_an_empty_item() {
 fn trailing_ampersand_marks_async() {
     let list = parse_ok("sleep 1 &");
     assert_eq!(list.items.len(), 1);
-    assert_eq!(list.items[0].separator, Separator::Async);
+    assert!(matches!(list.items[0].separator, Separator::Async(_)));
+}
+
+#[test]
+fn async_separator_captures_the_and_or_lists_own_verbatim_source() {
+    // conch-shell-core's executor re-execs this exact text (generalizing
+    // SubshellBody's own byte-slicing mechanism) to run a backgrounded
+    // list as a genuinely separate process -- see Separator::Async's docs.
+    let Separator::Async(source) = &parse_ok("sleep 1 &").items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "sleep 1");
+}
+
+#[test]
+fn async_separator_captures_the_whole_and_or_chain_not_just_the_first_pipeline() {
+    // POSIX 2.9.3.1: `&` backgrounds the *entire* and_or list -- confirmed
+    // against real bash `false && echo no &` backgrounds the whole chain.
+    let list = parse_ok("false && echo no &");
+    assert_eq!(list.items.len(), 1);
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "false && echo no");
+}
+
+#[test]
+fn async_separator_source_excludes_a_following_sequential_item() {
+    let list = parse_ok("sleep 1 & echo started");
+    assert_eq!(list.items.len(), 2);
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "sleep 1");
+    assert_eq!(list.items[1].separator, Separator::None);
+}
+
+#[test]
+fn async_separator_inside_a_compound_commands_body_also_captures_source() {
+    // `parse_compound_list` (every loop/if/brace-group/case-arm body)
+    // shares the exact same item-parsing path as the top-level program --
+    // `&` inside a brace group's body must capture correctly too.
+    let list = parse_ok("{ sleep 1 & echo started; }");
+    let Command::Compound(compound) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Compound")
+    };
+    let CompoundCommandKind::BraceGroup(body) = &compound.kind else {
+        unreachable!("expected a BraceGroup")
+    };
+    let Separator::Async(source) = &body.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "sleep 1");
 }
 
 #[test]
@@ -493,7 +545,7 @@ fn realistic_combined_input() {
     );
 
     let second = &list.items[1];
-    assert_eq!(second.separator, Separator::Async);
+    assert!(matches!(second.separator, Separator::Async(_)));
     let Command::Simple(cmd5) = &second.and_or.first.commands[0] else {
         unreachable!("expected a Command::Simple")
     };

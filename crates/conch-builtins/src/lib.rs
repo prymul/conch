@@ -1,11 +1,21 @@
 //! Builtin commands: `cd`, `exit`, `export`, `echo`, `pwd` (Phase 1); the
-//! `break`/`continue` POSIX special builtins (Phase 3); and `local`,
+//! `break`/`continue` POSIX special builtins (Phase 3); `local`,
 //! `return`, a narrow `set --`, and `shift` (the functions/positional-
-//! parameters follow-up).
+//! parameters follow-up); and `jobs`/`fg`/`bg`/`wait`/`trap` (Phase 4 job
+//! control).
+//!
+//! Every job-control builtin here is a thin wrapper over
+//! `conch-shell-core`'s own job-table/signal-handling API
+//! (`conch_shell_core::job`/`conch_shell_core::signals`) — this crate
+//! deliberately has no direct `nix` dependency of its own (see e.g.
+//! [`Shell::trap_set_by_name`]'s own docs for why), so every one of these
+//! builtins works entirely in terms of job ids/PIDs-as-strings and
+//! [`conch_shell_core::TrapAction`] (which has no OS-signal type in it at
+//! all), never a raw `nix::sys::signal::Signal`.
 
 use std::io::Write;
 
-use conch_shell_core::{Builtin, ControlFlow, Shell};
+use conch_shell_core::{Builtin, ControlFlow, Shell, TrapAction};
 
 /// Registers every builtin this crate implements into `shell` — as either
 /// a *regular* builtin ([`Shell::register_builtin`]) or a *special* one
@@ -29,6 +39,11 @@ pub fn register_all(shell: &mut Shell) {
     shell.register_special_builtin("return", Box::new(Return));
     shell.register_special_builtin("set", Box::new(Set));
     shell.register_special_builtin("shift", Box::new(Shift));
+    shell.register_builtin("jobs", Box::new(Jobs));
+    shell.register_builtin("fg", Box::new(Fg));
+    shell.register_builtin("bg", Box::new(Bg));
+    shell.register_special_builtin("wait", Box::new(Wait));
+    shell.register_special_builtin("trap", Box::new(Trap));
 }
 
 struct Cd;
@@ -85,6 +100,16 @@ impl Builtin for Exit {
             .first()
             .and_then(|arg| arg.parse::<i32>().ok())
             .unwrap_or(shell.last_status);
+
+        // POSIX: "the trap on EXIT shall be executed before the shell
+        // terminates" -- every path that ends this process (this
+        // builtin, falling off the end of a `-c`/script, or the
+        // interactive loop ending) needs this same call; see
+        // `Shell::run_exit_trap`'s own docs for why it's safe to call
+        // even when nothing was ever trapped (a no-op) or when the trap
+        // action itself calls `exit` again (already-taken, so it can't
+        // recurse into itself).
+        shell.run_exit_trap();
 
         // Unconditional: this always terminates the real process, no
         // signaling/indirection needed. That's correct even for `exit`
@@ -409,6 +434,268 @@ impl Builtin for Shift {
         // `n` is already confirmed in `0..=positional_params.len()`.
         shell.positional_params.drain(0..n as usize);
         0
+    }
+}
+
+// ---- job control: jobs / fg / bg / wait / trap ----------------------------
+
+/// `jobs [-p] [job_spec...]` — lists background/stopped jobs.
+/// `job_spec` arguments (beyond `-p`) are accepted but not (yet) used to
+/// filter the listing — every currently tracked job is always shown,
+/// matching bare `jobs`' own behavior and a harmless superset of a
+/// filtered listing's.
+///
+/// After listing, purges every job that was *already* finished *and*
+/// already reported once before (see
+/// [`Shell::purge_finished_notified_jobs`]) — the same "show a completed
+/// job's status exactly once, then forget it" policy real bash follows,
+/// applied here since `jobs` is one of the two places (the other: the
+/// interactive prompt loop's own per-prompt notification pass, `conch`)
+/// that "reports" a job's state at all.
+struct Jobs;
+impl Builtin for Jobs {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> i32 {
+        let pids_only = args.iter().any(|arg| arg == "-p");
+        let mut lines = Vec::new();
+        for job in shell.job_table.iter() {
+            if pids_only {
+                lines.push(job.leader.to_string());
+            } else {
+                lines.push(format!(
+                    "[{}]  {:<11} {}",
+                    job.id,
+                    job.state.label(),
+                    job.command
+                ));
+            }
+            // `jobs` itself is what marks a *currently* `Running`/
+            // `Stopped` job's state as "already reported" — a completed
+            // job it prints here is exactly the one report real bash
+            // guarantees before forgetting it.
+        }
+        for line in &lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        // Every job just listed above has now had its current state
+        // reported once — mark it `notified` so a `Done`/`Signaled` one
+        // gets purged below (and a `Running`/`Stopped` one simply
+        // doesn't get re-announced by the interactive prompt loop's own
+        // notification pass for the *same* state again).
+        let ids: Vec<u32> = shell.job_table.iter().map(|job| job.id).collect();
+        for id in ids {
+            if let Some(job) = shell.job_table.get_mut(id) {
+                job.notified = true;
+            }
+        }
+        shell.purge_finished_notified_jobs();
+        0
+    }
+}
+
+/// Resolves a `fg`/`bg`-style optional job-spec argument, reporting
+/// real bash's own "no job control" error first when appropriate (both
+/// builtins need this exact same guard-then-resolve sequence).
+fn resolve_fg_bg_job(
+    shell: &Shell,
+    args: &[String],
+    name: &str,
+    stderr: &mut dyn Write,
+) -> Result<u32, i32> {
+    if !shell.job_control_active {
+        let _ = writeln!(stderr, "{name}: no job control in this shell");
+        return Err(1);
+    }
+    shell
+        .job_table
+        .resolve_spec(args.first().map(String::as_str))
+        .map_err(|err| {
+            let _ = writeln!(stderr, "{name}: {err}");
+            1
+        })
+}
+
+/// `fg [job_spec]` — resumes a stopped-or-backgrounded job in the
+/// foreground (terminal ownership, blocking wait, stoppable via Ctrl-Z
+/// again) — see [`conch_shell_core::resume_job_in_foreground`].
+struct Fg;
+impl Builtin for Fg {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        let id = match resolve_fg_bg_job(shell, args, "fg", stderr) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        match conch_shell_core::resume_job_in_foreground(shell, id) {
+            Ok(status) => status,
+            Err(err) => {
+                let _ = writeln!(stderr, "{err}");
+                1
+            }
+        }
+    }
+}
+
+/// `bg [job_spec]` — resumes a stopped job in the background (`SIGCONT`,
+/// no terminal handoff, doesn't block) — see
+/// [`Shell::resume_job_in_background`].
+struct Bg;
+impl Builtin for Bg {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        let id = match resolve_fg_bg_job(shell, args, "bg", stderr) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        let command = shell
+            .job_table
+            .get(id)
+            .map(|job| job.command.clone())
+            .unwrap_or_default();
+        match shell.resume_job_in_background(id) {
+            Ok(()) => {
+                let _ = writeln!(stdout, "[{id}]  {command} &");
+                0
+            }
+            Err(err) => {
+                let _ = writeln!(stderr, "{err}");
+                1
+            }
+        }
+    }
+}
+
+/// `wait [pid...]` (POSIX special builtin) — with operands, blocks until
+/// each named job finishes (in argument order) and reports the *last*
+/// one's exit status as `$?`; with none, blocks until every currently
+/// running background job finishes and always reports `0` — see
+/// [`Shell::wait_for_pid`]/[`Shell::wait_for_all_background_jobs`] for
+/// the actual blocking mechanics.
+struct Wait;
+impl Builtin for Wait {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        if args.is_empty() {
+            shell.wait_for_all_background_jobs();
+            shell.purge_finished_notified_jobs();
+            return 0;
+        }
+
+        let mut status = 0;
+        for arg in args {
+            let Ok(pid) = arg.parse::<i32>() else {
+                let _ = writeln!(stderr, "wait: {arg}: arguments must be process or job IDs");
+                status = 127;
+                continue;
+            };
+            match shell.wait_for_pid(pid) {
+                Some(code) => status = code,
+                None => {
+                    let _ = writeln!(stderr, "wait: pid {pid} is not a child of this shell");
+                    status = 127;
+                }
+            }
+        }
+        shell.purge_finished_notified_jobs();
+        status
+    }
+}
+
+/// `trap [-p] [action] [signal...]` (POSIX special builtin) — see
+/// [`Shell::trap_set_by_name`]/[`Shell::trap_describe_by_name`]/
+/// [`Shell::trap_list`] for the actual signal-name parsing/disposition
+/// bookkeeping this wraps.
+///
+/// `action`: `-` resets each named signal to its original disposition
+/// ([`TrapAction::Default`]); any other first non-flag argument is the
+/// command text to run ([`TrapAction::Command`]) — including an empty
+/// string, which is *not* a no-op text to run but [`TrapAction::Ignore`]
+/// (POSIX: `trap '' SIG` ignores the signal, distinct from never
+/// trapping it at all — see that variant's own docs for why the
+/// distinction matters).
+struct Trap;
+impl Builtin for Trap {
+    fn run(
+        &self,
+        shell: &mut Shell,
+        args: &[String],
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        if args.first().map(String::as_str) == Some("-p") {
+            let specs = &args[1..];
+            if specs.is_empty() {
+                for line in shell.trap_list() {
+                    let _ = writeln!(stdout, "{line}");
+                }
+                return 0;
+            }
+            let mut status = 0;
+            for spec in specs {
+                match shell.trap_describe_by_name(spec) {
+                    Ok(Some(line)) => {
+                        let _ = writeln!(stdout, "{line}");
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = writeln!(stderr, "{err}");
+                        status = 1;
+                    }
+                }
+            }
+            return status;
+        }
+
+        let Some(action_arg) = args.first() else {
+            // Bare `trap`: list every currently registered trap.
+            for line in shell.trap_list() {
+                let _ = writeln!(stdout, "{line}");
+            }
+            return 0;
+        };
+
+        let action = if action_arg == "-" {
+            TrapAction::Default
+        } else if action_arg.is_empty() {
+            TrapAction::Ignore
+        } else {
+            TrapAction::Command(action_arg.clone())
+        };
+
+        let specs = &args[1..];
+        if specs.is_empty() {
+            let _ = writeln!(stderr, "trap: usage: trap [-p] [action] [signal...]");
+            return 2;
+        }
+
+        let mut status = 0;
+        for spec in specs {
+            if let Err(err) = shell.trap_set_by_name(spec, action.clone()) {
+                let _ = writeln!(stderr, "{err}");
+                status = 1;
+            }
+        }
+        status
     }
 }
 
@@ -774,5 +1061,125 @@ mod tests {
         let (status, _, stderr) = run(&Shift, &mut shell, &["-1".to_string()]);
         assert_eq!(status, 1);
         assert!(stderr.contains("out of range"));
+    }
+
+    // ---- job control: jobs / fg / bg / wait / trap ---------------------
+    //
+    // The actual job-table-populated, real-process-backed behavior of
+    // these builtins (a real backgrounded job showing up in `jobs`,
+    // `fg`/`bg` actually resuming one, `wait` actually blocking) needs a
+    // genuinely spawned process to exercise meaningfully — like
+    // `exec_subshell`'s own execution (see `conch-shell-core::exec`'s
+    // test module docs), that's `tests/conch-difftest`'s job, not a
+    // unit test here. What's covered here is everything reachable
+    // without spawning anything: error paths, and `trap`'s pure
+    // string-table bookkeeping (already itself exercised more directly
+    // in `conch-shell-core::signals`' own tests; these confirm the
+    // builtin wires arguments to it correctly).
+
+    #[test]
+    fn fg_without_job_control_is_a_clear_error() {
+        let mut shell = Shell::new();
+        assert!(!shell.job_control_active);
+        let (status, _, stderr) = run(&Fg, &mut shell, &[]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("no job control"));
+    }
+
+    #[test]
+    fn bg_without_job_control_is_a_clear_error() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Bg, &mut shell, &[]);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("no job control"));
+    }
+
+    #[test]
+    fn wait_on_an_unknown_pid_is_a_clear_error_without_blocking() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Wait, &mut shell, &["999999".to_string()]);
+        assert_eq!(status, 127);
+        assert!(stderr.contains("not a child"));
+    }
+
+    #[test]
+    fn wait_with_a_non_numeric_argument_is_a_clear_error() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Wait, &mut shell, &["not-a-pid".to_string()]);
+        assert_eq!(status, 127);
+        assert!(stderr.contains("must be process or job IDs"));
+    }
+
+    #[test]
+    fn wait_with_no_operands_and_no_background_jobs_is_an_immediate_no_op() {
+        let mut shell = Shell::new();
+        let (status, _, _) = run(&Wait, &mut shell, &[]);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn jobs_with_an_empty_table_prints_nothing() {
+        let mut shell = Shell::new();
+        let (status, stdout, _) = run(&Jobs, &mut shell, &[]);
+        assert_eq!(status, 0);
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn trap_registers_a_command_and_lists_it() {
+        let mut shell = Shell::new();
+        let (status, _, _) = run(
+            &Trap,
+            &mut shell,
+            &["echo caught".to_string(), "USR1".to_string()],
+        );
+        assert_eq!(status, 0);
+        let (status, stdout, _) = run(&Trap, &mut shell, &[]);
+        assert_eq!(status, 0);
+        assert!(stdout.contains("echo caught"));
+    }
+
+    #[test]
+    fn trap_dash_p_reports_nothing_for_an_untrapped_signal() {
+        let mut shell = Shell::new();
+        let (status, stdout, _) = run(&Trap, &mut shell, &["-p".to_string(), "USR2".to_string()]);
+        assert_eq!(status, 0);
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn trap_dash_p_reports_a_registered_trap() {
+        let mut shell = Shell::new();
+        run(
+            &Trap,
+            &mut shell,
+            &["echo hi".to_string(), "USR2".to_string()],
+        );
+        let (status, stdout, _) = run(&Trap, &mut shell, &["-p".to_string(), "USR2".to_string()]);
+        assert_eq!(status, 0);
+        assert!(stdout.contains("echo hi"));
+    }
+
+    #[test]
+    fn trap_with_an_unrecognized_signal_errors() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(
+            &Trap,
+            &mut shell,
+            &["echo hi".to_string(), "NOTASIGNAL".to_string()],
+        );
+        assert_eq!(status, 1);
+        assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn trap_exit_registers_the_exit_trap() {
+        let mut shell = Shell::new();
+        run(
+            &Trap,
+            &mut shell,
+            &["echo bye".to_string(), "EXIT".to_string()],
+        );
+        assert_eq!(shell.exit_trap(), Some("echo bye"));
     }
 }

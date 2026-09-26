@@ -3,10 +3,14 @@
 mod brace;
 mod exec;
 mod expand;
+mod job;
+mod signals;
 
 pub use brace::brace_expand;
-pub use exec::{exec_command_list, exec_program};
+pub use exec::{exec_command_list, exec_program, resume_job_in_foreground};
 pub use expand::{ExpandError, expand_word_fields, expand_word_single};
+pub use job::{Job, JobState, JobTable};
+pub use signals::TrapAction;
 
 /// A `break [n]`/`continue [n]` (POSIX special builtins) in progress,
 /// working its way back up through the executor to whichever enclosing
@@ -118,6 +122,21 @@ pub struct Shell {
     /// [`Shell::positional_params`], which a function call *does*
     /// temporarily replace.
     pub arg0: String,
+    /// `$$` — POSIX: "the decimal value of the process number of the
+    /// invoking shell," and — critically — confirmed against real bash
+    /// this is the *top-level* shell's own PID, unchanged inside a
+    /// subshell environment even though a subshell is a genuinely
+    /// separate OS process here (see `exec::exec_subshell`'s docs);
+    /// bash's own non-POSIX `$BASHPID` extension exists specifically to
+    /// expose the *actual current* process's PID when that's what's
+    /// wanted instead. Defaults to this process's own real PID
+    /// ([`Shell::new`]); every one of this crate's re-exec sites
+    /// (subshells, command substitution, a backgrounded job's wrapper —
+    /// see `conch-shell-core::exec`'s module docs) propagates the *original* value
+    /// through via the `__CONCH_PID` environment variable rather than
+    /// letting each child default to its own new, different real PID —
+    /// see [`Shell::new`]'s own docs for the receiving half of that.
+    pub pid: nix::unistd::Pid,
     /// `$1`, `$2`, ... / `$@`/`$*`/`$#` (POSIX 2.5.2) — index `0` is `$1`.
     /// A function call temporarily replaces this with its own arguments
     /// for the duration of the call (confirmed against real bash:
@@ -194,6 +213,91 @@ pub struct Shell {
     /// `conch-shell-core::exec`'s command-lookup docs for exactly where
     /// this is decided.
     special_builtins: std::collections::HashSet<String>,
+
+    // ---- Phase 4: job control -------------------------------------------
+    /// Background/stopped jobs — see [`job`]'s module docs.
+    pub job_table: JobTable,
+    /// The process-group leader PID of whatever `&`-backgrounded job most
+    /// recently started — `$!` (`conch-shell-core::expand`).
+    pub last_background_pid: Option<nix::unistd::Pid>,
+    /// Whether [`Self::init_job_control`] (`conch-shell-core::signals`)
+    /// succeeded — `true` only for the one interactive session with a
+    /// real controlling terminal; `false` for `-c`/script-file
+    /// invocations, subshell/command-substitution re-exec'd children, and
+    /// an interactive session run without a controlling terminal at all
+    /// (e.g. under a test harness). Gates every terminal-ownership
+    /// (`tcsetpgrp`) and process-group-creation call in
+    /// `conch-shell-core::exec` — see that crate's module docs for why
+    /// scoping job control to "interactive only" this way is a
+    /// deliberate, bash-matching choice, not a shortcut.
+    pub job_control_active: bool,
+    /// The shell's own process group, once [`Self::init_job_control`]
+    /// establishes it — what every foreground-job terminal handoff hands
+    /// the terminal *back* to.
+    pub shell_pgid: Option<nix::unistd::Pid>,
+    /// Set when the foreground job most recently run didn't simply
+    /// finish — either suspended (`SIGTSTP`) or killed by `SIGINT` — so
+    /// every "runs a sequence of things" function in
+    /// `conch-shell-core::exec` can unwind back to the prompt the same
+    /// way a pending [`ControlFlow`] already does, without folding this
+    /// into that enum itself (see [`ForegroundInterrupt`]'s own docs for
+    /// why keeping it a separate, additive field was a deliberate call,
+    /// not an oversight).
+    pub foreground_interrupt: Option<ForegroundInterrupt>,
+    /// Registered `trap` actions, keyed by signal — see
+    /// [`crate::signals::TrapAction`] and [`Self::set_trap`].
+    pub(crate) traps: HashMap<nix::sys::signal::Signal, TrapAction>,
+    /// `trap 'cmd' EXIT`'s command text, if any — see
+    /// [`Self::run_exit_trap`].
+    pub(crate) exit_trap: Option<String>,
+    /// Every signal this shell has installed its own real handler for
+    /// (`SIGCHLD` always; anything else only once `trap`'d) — tracked so
+    /// [`Self::prepare_child_for_job_control`] knows exactly which
+    /// dispositions a spawned child must reset before it execs, rather
+    /// than resetting every signal unconditionally (which would be
+    /// needlessly broad and, worse, silently paper over a missing entry
+    /// here instead of the reset list ever being wrong in an
+    /// *observable* way).
+    pub(crate) handled_signals: std::collections::HashSet<nix::sys::signal::Signal>,
+    /// The self-pipe's read end — see `conch-shell-core::signals`'
+    /// module docs.
+    pub(crate) signal_pipe_read: Option<std::os::fd::OwnedFd>,
+    /// The self-pipe's write end — kept alive here for the process's
+    /// whole life; never read from again after
+    /// [`Self::init_signal_handling`] publishes its raw fd for
+    /// `handle_signal` to write to.
+    pub(crate) signal_pipe_write: Option<std::os::fd::OwnedFd>,
+}
+
+/// See [`Shell::foreground_interrupt`]'s docs for why this is a separate
+/// field/type rather than a new [`ControlFlow`] variant: `ControlFlow`'s
+/// existing consumers (loop boundaries decrementing `break n`/`continue
+/// n` by one level, a function call's own boundary consuming `return`)
+/// have specific, level-aware interception semantics that a "the
+/// foreground job stopped/was interrupted — abandon *everything* and
+/// return to the prompt, unconditionally, skipping every one of those
+/// boundaries" signal must never be subject to. Keeping it a wholly
+/// separate, always-fully-propagating field means every existing
+/// `ControlFlow` test/behavior in `conch-shell-core::exec` needed zero
+/// changes — confirmed exactly right for this design, not merely
+/// convenient, by the same reasoning that already keeps a subshell's
+/// `exit`/`break`/`continue` isolation free of any special-casing in
+/// that module (see `exec::exec_subshell`'s docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundInterrupt {
+    /// The foreground job was suspended (`SIGTSTP`/`SIGTTIN`/`SIGTTOU`)
+    /// and is now `Stopped` in [`Shell::job_table`] under this job id,
+    /// resumable via `fg`/`bg`.
+    Stopped(u32),
+    /// The foreground job was killed by `SIGINT` specifically —
+    /// confirmed against real bash this aborts the rest of the current
+    /// command list/script the same way a stopped job does, rather than
+    /// continuing to the next `;`-separated command or loop iteration
+    /// the way an ordinary nonzero exit status would; no other
+    /// terminating signal gets this treatment (an external command
+    /// killed by, say, `SIGTERM` just reports its ordinary `128+n` exit
+    /// status and execution continues normally).
+    Interrupted,
 }
 
 /// What a variable's binding was, if anything, immediately before a
@@ -217,22 +321,66 @@ impl Shell {
     /// Creates a new shell session, inheriting the current process's
     /// working directory and environment.
     pub fn new() -> Self {
-        Self {
+        let mut env_vars: HashMap<String, String> = env::vars().collect();
+        // `$$` (`Self::pid`) — see that field's own docs. `__CONCH_PID`
+        // is this crate's own internal re-exec-propagation channel, not
+        // a real user-facing variable, so it's removed from `env_vars`
+        // here rather than left to leak into e.g. `export -p`'s
+        // eventual output or a child process this shell itself spawns
+        // (which should never see it — it's meaningful only as a
+        // one-hop signal from a re-exec'ing parent to the exact child it
+        // just spawned, consumed exactly once, right here). Carries only
+        // a plain decimal PID, never interpreted as anything else,
+        // deliberately unlike the `shell_vars`-via-env-var idea this
+        // crate's own subshell docs already explain the (Shellshock-
+        // shaped) reasons *not* to do for actual shell state/command
+        // text.
+        let pid = env_vars
+            .remove("__CONCH_PID")
+            .and_then(|value| value.parse::<i32>().ok())
+            .map(nix::unistd::Pid::from_raw)
+            .unwrap_or_else(nix::unistd::getpid);
+        // See `Self::ignored_trap_names`'s docs — captured and stripped
+        // here for the same "internal one-hop re-exec channel, not a
+        // real user-facing variable" reason `__CONCH_PID` is; applied
+        // below, once `shell` itself exists (needs `&mut self` — see
+        // `Self::set_trap`).
+        let inherited_ignored_signals = env_vars
+            .remove("__CONCH_IGNORED_SIGNALS")
+            .map(|value| Self::parse_ignored_trap_names(&value))
+            .unwrap_or_default();
+
+        let mut shell = Self {
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            env_vars: env::vars().collect(),
+            env_vars,
             shell_vars: HashMap::new(),
             last_status: 0,
             is_interactive: false,
             loop_depth: 0,
             pending_control_flow: None,
             arg0: "conch".to_string(),
+            pid,
             positional_params: Vec::new(),
             functions: HashMap::new(),
             function_depth: 0,
             local_stack: Vec::new(),
             builtins: HashMap::new(),
             special_builtins: std::collections::HashSet::new(),
+            job_table: JobTable::new(),
+            last_background_pid: None,
+            job_control_active: false,
+            shell_pgid: None,
+            foreground_interrupt: None,
+            traps: HashMap::new(),
+            exit_trap: None,
+            handled_signals: std::collections::HashSet::new(),
+            signal_pipe_read: None,
+            signal_pipe_write: None,
+        };
+        for signal in inherited_ignored_signals {
+            shell.set_trap(Some(signal), signals::TrapAction::Ignore);
         }
+        shell
     }
 
     /// Looks up a variable, preferring exported environment variables and

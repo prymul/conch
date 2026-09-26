@@ -61,14 +61,19 @@ use std::io::Write as _;
 use std::process::Stdio;
 
 use conch_shell_parser::{
-    AndOrList, CaseClause, Command, CommandList, CompoundCommand, CompoundCommandKind, ForClause,
-    FunctionDefinition, IfClause, LogicalOp, Pipeline, Redirect, RedirectOperator, SimpleCommand,
-    Word,
+    AndOrList, CaseClause, Command, CommandList, CommandListItem, CompoundCommand,
+    CompoundCommandKind, ForClause, FunctionDefinition, IfClause, LogicalOp, Pipeline, Redirect,
+    RedirectOperator, Separator, SimpleCommand, Word,
 };
+use nix::errno::Errno;
+use nix::sys::signal::Signal;
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{Pid, tcsetpgrp};
 
 use crate::expand::{expand_word_as_pattern, glob_match};
 use crate::{
-    ControlFlow, ExpandError, Shell, brace_expand, expand_word_fields, expand_word_single,
+    ControlFlow, ExpandError, ForegroundInterrupt, Shell, brace_expand, expand_word_fields,
+    expand_word_single,
 };
 
 /// Brace-expands then field-expands each word in `words`, in order,
@@ -100,8 +105,23 @@ fn expand_words_fields<'a>(
 pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
     let mut status = shell.last_status;
     for item in &list.items {
-        status = exec_and_or(&item.and_or, shell);
+        status = exec_command_list_item(item, shell);
         shell.last_status = status;
+        // A safe checkpoint (per `conch-shell-core::signals`' module
+        // docs) between every command — reaps any background job that
+        // changed state and runs any `trap`'d signal's command text.
+        // Never from inside a signal handler itself.
+        shell.process_pending_signals();
+        if shell.foreground_interrupt.is_some() {
+            // The job just run (this iteration or a nested one still
+            // unwinding through) was stopped or killed by SIGINT — see
+            // `ForegroundInterrupt`'s docs for why this propagates all
+            // the way back to the prompt unconditionally, the same way
+            // an over-large `break`/`continue` still stops *this* list
+            // even though it isn't this list's own signal to fully
+            // consume.
+            break;
+        }
         match shell.pending_control_flow {
             // A break/continue level exceeding every loop that actually
             // encloses it (`shell.loop_depth == 0` here means: none do,
@@ -119,6 +139,17 @@ pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
         }
     }
     status
+}
+
+/// Dispatches one [`CommandListItem`] on its [`Separator`]: an `&`-marked
+/// item backgrounds the *entire* `and_or` chain (see [`exec_async`] and
+/// [`Separator::Async`]'s own docs for why the whole chain, not just its
+/// first pipeline); every other item just runs synchronously as before.
+fn exec_command_list_item(item: &CommandListItem, shell: &mut Shell) -> i32 {
+    match &item.separator {
+        Separator::Async(source) => exec_async(&item.and_or, source, shell),
+        Separator::Sequential | Separator::None => exec_and_or(&item.and_or, shell),
+    }
 }
 
 /// Runs a full parsed *program* (the top-level input — a whole `-c`
@@ -143,6 +174,14 @@ pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
 pub fn exec_program(list: &CommandList, shell: &mut Shell) -> i32 {
     let status = exec_command_list(list, shell);
     warn_on_unhandled_control_flow(shell);
+    // A `ForegroundInterrupt` (see its own docs) has, by construction,
+    // already fully unwound every intervening loop/`if`/function-call
+    // frame by the time it reaches here — nothing further to warn about,
+    // just clear it so it doesn't incorrectly also abort the *next*
+    // top-level program run against this same `Shell` (the interactive
+    // REPL loop calls this once per line, reusing one `Shell` across
+    // every line).
+    shell.foreground_interrupt = None;
     status
 }
 
@@ -174,9 +213,20 @@ fn warn_on_unhandled_control_flow(shell: &mut Shell) {
     }
 }
 
+/// Whether the executor should stop running whatever list/loop/`if`-chain
+/// it's in the middle of, right now, without running anything else —
+/// true for a pending `break`/`continue`/`return` ([`ControlFlow`]) *or*
+/// a [`ForegroundInterrupt`] (a foreground job just stopped or was
+/// killed by `SIGINT`) — see [`ForegroundInterrupt`]'s own docs for why
+/// these are two separate fields checked together here rather than one
+/// merged enum.
+fn unwinding(shell: &Shell) -> bool {
+    shell.pending_control_flow.is_some() || shell.foreground_interrupt.is_some()
+}
+
 fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
     let mut status = exec_pipeline(&and_or.first, shell);
-    if shell.pending_control_flow.is_some() {
+    if unwinding(shell) {
         return status;
     }
     for (op, pipeline) in &and_or.rest {
@@ -186,7 +236,7 @@ fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
         };
         if should_run {
             status = exec_pipeline(pipeline, shell);
-            if shell.pending_control_flow.is_some() {
+            if unwinding(shell) {
                 return status;
             }
         }
@@ -194,14 +244,283 @@ fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
     status
 }
 
+/// Backgrounds an entire `and_or` list (`&`) — POSIX 2.9.3.1: run in "a
+/// subshell environment," exactly the isolation [`exec_subshell`] already
+/// provides for `(...)`, generalized here rather than building parallel
+/// infrastructure (per this phase's design review): re-exec `conch -c
+/// <source>` as a genuine child process, given its own process group so
+/// it's a real job (see `conch-shell-core::signals`), and — the one
+/// thing that makes this genuinely *async* rather than just another
+/// subshell — never waited for here at all; [`Shell::reap_children`]
+/// (driven off `SIGCHLD`, see that module's docs) is what eventually
+/// notices it finished.
+///
+/// `source` is `item.separator`'s own captured raw text — *except* when
+/// `and_or` is already, itself, exactly one bare subshell
+/// (`(cmd) &`, no `&&`/`||`, no pipe): reusing
+/// [`conch_shell_parser::SubshellBody::source`] directly there avoids
+/// double-wrapping (re-exec'ing `conch -c "(cmd)"` would itself spawn a
+/// second, redundant subshell re-exec internally once that child parses
+/// it back out) — see this phase's design review for the same
+/// reasoning.
+///
+/// POSIX: the exit status of an asynchronous list is always `0`
+/// (confirmed against real bash) — this shell has never even *started*
+/// waiting for the job by the time this returns, so `0` is the only
+/// value that could ever be correct here regardless.
+fn exec_async(and_or: &AndOrList, source: &str, shell: &mut Shell) -> i32 {
+    let source = match &and_or.first.commands.as_slice() {
+        [
+            Command::Compound(CompoundCommand {
+                kind: CompoundCommandKind::Subshell(body),
+                redirects,
+            }),
+        ] if and_or.rest.is_empty() && redirects.is_empty() => body.source.as_str(),
+        _ => source,
+    };
+
+    spawn_background_job(source, shell);
+    0
+}
+
+/// The actual `conch -c <source>` re-exec + process-group + job-table
+/// registration behind [`exec_async`] — see that function's docs.
+///
+/// Blocks `SIGCHLD` for the fork-and-register window (spawn, then
+/// [`crate::job::JobTable::register`]): the GNU libc manual's
+/// job-control chapter specifically calls out that a child which exits
+/// before its parent finishes its own bookkeeping for it must not get
+/// reaped first — without this, an extremely short-lived backgrounded
+/// job (`true &`) could have its `SIGCHLD` delivered and (via
+/// [`Shell::process_pending_signals`], if some *other* checkpoint
+/// happened to run first) reaped before [`crate::job::JobTable::register`]
+/// below ever runs, leaving a job-table entry that's permanently stuck
+/// `Running` for a process that's already gone.
+fn spawn_background_job(source: &str, shell: &mut Shell) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            eprintln!("conch: {err}");
+            return;
+        }
+    };
+
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("-c")
+        .arg(source)
+        .current_dir(&shell.cwd)
+        .env_clear()
+        .envs(&shell.env_vars)
+        // An asynchronous list is a POSIX 2.12 "subshell environment"
+        // exactly like `(...)` is -- `$$` inside the backgrounded list
+        // itself must still read as the *top-level* shell's PID, not
+        // this wrapper's own new one (see `Shell::pid`'s docs). This
+        // does *not* leak into some further, genuinely separate shell
+        // invocation the backgrounded command itself might spawn (e.g.
+        // `"$0" -c '...' &`'s own inner `"$0" -c` call) -- that's an
+        // ordinary external-command spawn (`exec_external`), which
+        // builds its child's environment from `shell.env_vars` alone
+        // (already stripped of this key by `Shell::new`), never from
+        // this process's raw OS environment.
+        .env("__CONCH_PID", shell.pid.to_string())
+        // POSIX 2.9.3.1: an *ignored* trap (`trap '' SIG`, no command
+        // text) is inherited into an async subshell environment too,
+        // unlike a *caught* one — see `Shell::ignored_trap_names`'s own
+        // docs for why propagating exactly this (and only this) subset
+        // of trap state through an environment variable is safe.
+        .env("__CONCH_IGNORED_SIGNALS", shell.ignored_trap_names());
+    // New process group (this child becomes its own leader) regardless
+    // of whether *this* session has an interactive terminal to hand
+    // around — a background job still needs its own pgid so a later
+    // `bg`/`fg`-style `SIGCONT` (or any other job-targeted signal, see
+    // `crate::job`'s module docs on signaling by pgid) reaches exactly
+    // this job and nothing else.
+    shell.prepare_child_for_job_control(&mut command, true);
+
+    let mut sigchld = nix::sys::signal::SigSet::empty();
+    sigchld.add(Signal::SIGCHLD);
+    let _ = sigchld.thread_block();
+
+    match command.spawn() {
+        Ok(child) => {
+            let pid = Pid::from_raw(child.id() as i32);
+            let id = shell.job_table.register(pid, pid, source.to_string());
+            shell.last_background_pid = Some(pid);
+            if shell.job_control_active {
+                eprintln!("[{id}] {pid}");
+            }
+            // Deliberately not `child.wait()`/dropped-and-forgotten in
+            // any special way — reaping happens exclusively through
+            // `Shell::reap_children`'s own `waitpid`, never through this
+            // `std::process::Child` handle (letting it drop here doesn't
+            // reap it either way — see `std::process::Child`'s own docs
+            // — so there's nothing extra to do with it).
+        }
+        Err(err) => {
+            eprintln!("conch: {source}: {err}");
+        }
+    }
+
+    let _ = sigchld.thread_unblock();
+}
+
+/// Runs `pgid_leader` (a foreground job's process-group leader — and, in
+/// every case this function is used for today, its *only* process) to
+/// completion or until it stops, handing it the controlling terminal
+/// first (when [`Shell::job_control_active`]) and reclaiming it
+/// afterward regardless of outcome. Sets [`Shell::foreground_interrupt`]
+/// when the job stopped or was killed by `SIGINT` — see that field's
+/// docs for why every "runs a sequence of things" function in this
+/// module needs to notice that and unwind.
+///
+/// Deliberately does *not* pre-register `pgid_leader` in
+/// [`Shell::job_table`] the way [`spawn_background_job`] does — matching
+/// real bash, only a job that ends up `Stopped` (or was ever
+/// backgrounded to begin with) shows up in `jobs` at all. This is
+/// race-free under this crate's single-threaded execution model without
+/// the `SIGCHLD`-blocking [`spawn_background_job`] needs: nothing else
+/// can concurrently call `waitpid` on this exact, not-yet-disclosed pid
+/// out from under the blocking call below (control genuinely doesn't
+/// return to any other Rust code — including the checkpoint that drives
+/// [`Shell::process_pending_signals`]/[`Shell::reap_children`] — until
+/// this function's own `waitpid` call itself returns).
+/// `existing`: `None` for a freshly spawned job (the common case, from
+/// [`exec_external`]'s own job-control branch) — a job that turns out to
+/// stop gets a brand-new [`Shell::job_table`] entry
+/// ([`crate::job::JobTable::register_stopped`]). `Some(id)` for
+/// [`resume_job_in_foreground`]'s use (`fg`, `conch-shell-builtins`):
+/// `pgid_leader` here already *is* that existing job's own pgid, so a
+/// fresh stop needs to update that *same* entry in place, and a
+/// completion (`Exited`/`Signaled`) needs to remove it — there's nothing
+/// left to `wait`/`fg`/`bg` once a job that was just brought to the
+/// foreground actually finishes there, unlike a plain background
+/// completion (which stays queryable — see
+/// [`Shell::purge_finished_notified_jobs`]'s docs — until something
+/// actually reports it).
+fn run_foreground_job(
+    shell: &mut Shell,
+    pgid_leader: Pid,
+    command_text: &str,
+    existing: Option<u32>,
+) -> i32 {
+    let stdin = std::io::stdin();
+    if shell.job_control_active {
+        let _ = tcsetpgrp(&stdin, pgid_leader);
+    }
+
+    let status = loop {
+        match waitpid(pgid_leader, Some(WaitPidFlag::WUNTRACED)) {
+            Ok(status) => break status,
+            Err(Errno::EINTR) => continue,
+            Err(_) => break WaitStatus::Exited(pgid_leader, 1),
+        }
+    };
+
+    let exit_status = match status {
+        WaitStatus::Exited(_, code) => {
+            if let Some(id) = existing {
+                shell.job_table.remove(id);
+            }
+            code
+        }
+        WaitStatus::Signaled(_, sig, _) => {
+            if let Some(id) = existing {
+                shell.job_table.remove(id);
+            }
+            if sig == Signal::SIGINT {
+                shell.foreground_interrupt = Some(ForegroundInterrupt::Interrupted);
+            }
+            128 + sig as i32
+        }
+        WaitStatus::Stopped(..) => {
+            let id = match existing {
+                Some(id) => {
+                    if let Some(job) = shell.job_table.get_mut(id) {
+                        job.state = crate::JobState::Stopped;
+                        job.notified = false;
+                    }
+                    id
+                }
+                None => shell.job_table.register_stopped(
+                    pgid_leader,
+                    pgid_leader,
+                    command_text.to_string(),
+                ),
+            };
+            if shell.job_control_active {
+                eprintln!("[{id}]+  Stopped                 {command_text}");
+                // This *is* the report for this stop -- without marking
+                // it here, the interactive prompt loop's own per-prompt
+                // notification pass (`report_finished_jobs`, `conch`)
+                // would see the same still-`notified: false` job and
+                // print the exact same line a second time right before
+                // the next prompt (confirmed via a real pty-driven
+                // Ctrl-Z smoke test, not assumed).
+                if let Some(job) = shell.job_table.get_mut(id) {
+                    job.notified = true;
+                }
+            }
+            shell.foreground_interrupt = Some(ForegroundInterrupt::Stopped(id));
+            128 + Signal::SIGTSTP as i32
+        }
+        _ => 1,
+    };
+
+    if shell.job_control_active
+        && let Some(shell_pgid) = shell.shell_pgid
+    {
+        let _ = tcsetpgrp(&stdin, shell_pgid);
+    }
+
+    exit_status
+}
+
+/// `fg [job_spec]` (`conch-shell-builtins`)'s core mechanic: resumes an
+/// already-[`Stopped`](crate::JobState::Stopped)-or-backgrounded job
+/// (`SIGCONT` to its process group) and brings it into the foreground —
+/// terminal ownership, blocking wait, stoppable via Ctrl-Z again exactly
+/// like any other foreground job (see [`run_foreground_job`]).
+///
+/// # Errors
+///
+/// `id` isn't a known job, or the underlying `killpg`
+/// ([`Shell::signal_job`]) call failed.
+pub fn resume_job_in_foreground(shell: &mut Shell, id: u32) -> Result<i32, String> {
+    let Some(job) = shell.job_table.get(id) else {
+        return Err(format!("fg: {id}: no such job"));
+    };
+    let pgid = job.pgid;
+    let command = job.command.clone();
+    if shell.job_control_active {
+        eprintln!("{command}");
+    }
+    if let Err(err) = shell.signal_job(id, Signal::SIGCONT) {
+        return Err(format!("fg: {err}"));
+    }
+    Ok(run_foreground_job(shell, pgid, &command, Some(id)))
+}
+
 fn exec_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> i32 {
     let mut carry_in: Option<Vec<u8>> = None;
     let mut status = 0;
+    // A single-stage pipeline is eligible to become its own foreground
+    // job (its own process group, real terminal ownership, stoppable via
+    // Ctrl-Z) if it turns out to resolve to an external command — see
+    // `exec_external`'s own docs for why that decision has to be made
+    // there, after expansion, rather than here from the AST shape alone.
+    // A multi-stage pipeline (`cmd1 | cmd2`) is a documented, carried-
+    // forward gap for *this* treatment specifically — see the module
+    // docs' pipeline-buffering note — even though each external stage
+    // still spawns a real, if un-pgid'd, child process exactly as before.
+    let is_standalone = pipeline.commands.len() == 1;
 
     for (i, command) in pipeline.commands.iter().enumerate() {
         let is_last = i == pipeline.commands.len() - 1;
         let (this_status, output) = match command {
-            Command::Simple(simple) => exec_simple(simple, shell, carry_in.take(), !is_last),
+            Command::Simple(simple) => {
+                exec_simple(simple, shell, carry_in.take(), !is_last, is_standalone)
+            }
             Command::Compound(compound) => {
                 // Known simplification — see the module docs. Any
                 // stdin_data carried in from a previous stage is
@@ -325,13 +644,46 @@ fn exec_subshell(source: &str, shell: &Shell) -> i32 {
         .current_dir(&shell.cwd)
         .env_clear()
         .envs(&shell.env_vars)
+        // `$$` must read as the *top-level* shell's PID even inside a
+        // subshell -- see `Shell::pid`'s own docs.
+        .env("__CONCH_PID", shell.pid.to_string())
+        // An *ignored* trap propagates into a subshell environment too
+        // (unlike a *caught* one, which is deliberately never
+        // propagated this way -- see this function's own doc comment
+        // above, and `Shell::ignored_trap_names`'s docs, for why the
+        // two get different treatment).
+        .env("__CONCH_IGNORED_SIGNALS", shell.ignored_trap_names())
         .status();
     match status {
-        Ok(status) => status.code().unwrap_or(1),
+        Ok(status) => exit_code_of(status),
         Err(err) => {
             eprintln!("conch: subshell: {err}");
             1
         }
+    }
+}
+
+/// Converts a real child process's [`std::process::ExitStatus`] into a
+/// POSIX-shaped shell exit status: the process's own exit code if it
+/// exited normally, or `128 + signal` if it was killed by an uncaught
+/// signal (POSIX 2.8.2 / confirmed against real bash's own convention —
+/// e.g. `SIGTERM` (15) → `143`, `SIGKILL` (9) → `137`) — `ExitStatus::code()`
+/// alone only ever gives `None` in the signaled case, with no way to
+/// recover *which* signal from that method alone, so every call site
+/// that needs this exact convention (a subshell's own exit status, an
+/// external command's, and — the case that specifically motivated
+/// pulling this into one shared helper rather than leaving each site's
+/// own `.code().unwrap_or(1)` as it was pre-Phase-4 — a *backgrounded*
+/// job's, since `wait`'s "reports a background job's death by signal as
+/// 128+n" behavior (`conch-shell-builtins`) depends on
+/// [`spawn_background_job`]'s re-exec'd wrapper child correctly
+/// propagating *its own* signal-death status this same way) goes through
+/// this instead.
+fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    match status.code() {
+        Some(code) => code,
+        None => 128 + status.signal().unwrap_or(0),
     }
 }
 
@@ -407,7 +759,7 @@ fn exec_function_call(func: &FunctionDefinition, args: &[String], shell: &mut Sh
 fn exec_if(clause: &IfClause, shell: &mut Shell) -> i32 {
     for (condition, body) in &clause.branches {
         let cond_status = exec_command_list(condition, shell);
-        if shell.pending_control_flow.is_some() {
+        if unwinding(shell) {
             return cond_status;
         }
         if cond_status == 0 {
@@ -442,7 +794,7 @@ fn exec_while_or_until(
     let mut status = 0;
     loop {
         let cond_status = exec_command_list(condition, shell);
-        if shell.pending_control_flow.is_some() {
+        if unwinding(shell) {
             status = cond_status;
             if matches!(take_loop_control_flow(shell), LoopStep::Continue) {
                 continue;
@@ -559,6 +911,14 @@ enum LoopStep {
 /// inner loop to stop entirely, not just skip one inner iteration, since
 /// the target is the *outer* loop's next iteration).
 fn take_loop_control_flow(shell: &mut Shell) -> LoopStep {
+    if shell.foreground_interrupt.is_some() {
+        // A stopped/SIGINT-killed foreground job (see
+        // `ForegroundInterrupt`'s docs) always fully stops this loop and
+        // keeps propagating, unconditionally — it isn't `pending_control_flow`
+        // at all, so it's checked and handled here first, before ever
+        // touching that separate field.
+        return LoopStep::Break;
+    }
     match shell.pending_control_flow.take() {
         None => LoopStep::Continue,
         Some(ControlFlow::Break(1)) => LoopStep::Break,
@@ -603,6 +963,10 @@ fn take_loop_control_flow(shell: &mut Shell) -> LoopStep {
 /// `capture_output`: `true` if this command is *not* the pipeline's last
 /// stage, so its stdout should be captured and returned rather than
 /// written to the real process stdout.
+/// `standalone`: `true` if this is the *only* command in its pipeline
+/// (see [`exec_pipeline`]'s own docs) — passed through to
+/// [`exec_external`], the only place it matters (see that function's
+/// docs for why it's the one that gets to decide, not here).
 ///
 /// Returns the exit status and, when `capture_output` was honored (no
 /// output redirect overrode it), the captured stdout bytes.
@@ -611,6 +975,7 @@ fn exec_simple(
     shell: &mut Shell,
     stdin_data: Option<Vec<u8>>,
     capture_output: bool,
+    standalone: bool,
 ) -> (i32, Option<Vec<u8>>) {
     let assignments = match expand_assignments(cmd, shell) {
         Ok(assignments) => assignments,
@@ -705,9 +1070,12 @@ fn exec_simple(
         &args,
         shell,
         &assignments,
-        stdin_data,
         &redirects,
-        capture_output,
+        PipelineStdio {
+            stdin_data,
+            capture_output,
+            standalone,
+        },
     )
 }
 
@@ -923,19 +1291,57 @@ fn exec_builtin(
     }
 }
 
+/// How an external command's stdio should be wired up, decided entirely
+/// by its *position* within its pipeline (see [`exec_pipeline`]'s own
+/// docs) — bundled into one struct purely to keep [`exec_external`]'s
+/// own argument count reasonable, not because these three are otherwise
+/// conceptually one thing.
+struct PipelineStdio {
+    /// Piped-in bytes from the previous pipeline stage, if any.
+    stdin_data: Option<Vec<u8>>,
+    /// `true` if this command is *not* the pipeline's last stage, so its
+    /// stdout should be captured and returned rather than written to the
+    /// real process stdout.
+    capture_output: bool,
+    /// `true` iff this external command is its *whole* pipeline — in
+    /// which case, when [`Shell::job_control_active`], *this spawn
+    /// itself* becomes a real foreground job: its own new process group
+    /// ([`Shell::prepare_child_for_job_control`]), the controlling
+    /// terminal handed to it for the duration, and stoppable via Ctrl-Z
+    /// into [`Shell::job_table`] ([`run_foreground_job`]) — the
+    /// common-case, no-extra-indirection path (contrast
+    /// [`spawn_background_job`], which needs a whole extra `conch -c`
+    /// re-exec layer only because *that* case can't assume "one external
+    /// command" at all). `standalone` alone isn't sufficient — job
+    /// control must also actually be active
+    /// ([`Shell::job_control_active`]): a `-c`/script invocation, or an
+    /// already-backgrounded/subshell'd child, has no controlling
+    /// terminal to hand around and runs this exact same command with the
+    /// ordinary, pre-Phase-4 `Stdio`/`child.wait()` path instead,
+    /// unchanged.
+    standalone: bool,
+}
+
 fn exec_external(
     name: &str,
     args: &[String],
-    shell: &Shell,
+    shell: &mut Shell,
     assignments: &[(String, String)],
-    stdin_data: Option<Vec<u8>>,
     redirects: &[ExpandedRedirect],
-    capture_output: bool,
+    stdio: PipelineStdio,
 ) -> (i32, Option<Vec<u8>>) {
+    let PipelineStdio {
+        stdin_data,
+        capture_output,
+        standalone,
+    } = stdio;
+
     let mut effective_env: HashMap<String, String> = shell.env_vars.clone();
     for (name, value) in assignments {
         effective_env.insert(name.clone(), value.clone());
     }
+
+    let job_control = standalone && shell.job_control_active;
 
     let mut command = std::process::Command::new(name);
     command
@@ -943,6 +1349,17 @@ fn exec_external(
         .current_dir(&shell.cwd)
         .env_clear()
         .envs(&effective_env);
+    // Every external spawn gets its shell-installed signal dispositions
+    // reset before it execs (see that function's docs) — `job_control`
+    // additionally makes *this* spawn the leader of a brand-new process
+    // group. Since `standalone` (which `job_control` implies) means this
+    // pipeline has exactly one stage, `stdin_data`/`capture_output`
+    // below are always `None`/`false` in that case (nothing could have
+    // piped into or out of a pipeline with no other stage) — so the
+    // ordinary `Stdio::inherit()` branches below are always what's taken
+    // for a job-controlled spawn, with no interaction between the two
+    // concerns to reason about further.
+    shell.prepare_child_for_job_control(&mut command, job_control);
 
     let input_redirect = redirects
         .iter()
@@ -1010,6 +1427,20 @@ fn exec_external(
         }
     };
 
+    if job_control {
+        // `standalone` (which `job_control` implies) guarantees
+        // `stdin_data`/`capture_output` are already `None`/`false` (see
+        // this function's own docs), so there's nothing else to wire up
+        // here — just hand the job the terminal, wait for it, and
+        // reclaim the terminal afterward.
+        let pid = Pid::from_raw(child.id() as i32);
+        let command_text = std::iter::once(name.to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (run_foreground_job(shell, pid, &command_text, None), None);
+    }
+
     if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
         let _ = stdin.write_all(&data);
         // Dropping `stdin` here closes the pipe, signaling EOF to the
@@ -1019,7 +1450,7 @@ fn exec_external(
 
     if output_redirect.is_none() && capture_output {
         match child.wait_with_output() {
-            Ok(output) => (output.status.code().unwrap_or(1), Some(output.stdout)),
+            Ok(output) => (exit_code_of(output.status), Some(output.stdout)),
             Err(err) => {
                 eprintln!("conch: {name}: {err}");
                 (1, None)
@@ -1027,7 +1458,7 @@ fn exec_external(
         }
     } else {
         match child.wait() {
-            Ok(status) => (status.code().unwrap_or(1), None),
+            Ok(status) => (exit_code_of(status), None),
             Err(err) => {
                 eprintln!("conch: {name}: {err}");
                 (1, None)

@@ -47,15 +47,26 @@ pub struct CommandListItem {
 /// How a [`CommandListItem`] was terminated — POSIX `separator_op`
 /// (`;` or `&`) or a bare newline, or nothing (only valid for the last
 /// item, at end of input).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Separator {
     /// `;` or a bare newline: run to completion before the next item.
     Sequential,
-    /// `&`: per POSIX, this marks the preceding pipeline to run
-    /// asynchronously (in the background). Phase 1 only *represents*
-    /// this — `conch-shell-core` doesn't implement backgrounding until
-    /// Phase 4 job control, per the project roadmap.
-    Async,
+    /// `&`: per POSIX, this marks the preceding `and_or` list to run
+    /// asynchronously (in the background) — POSIX 2.9.3.1: "the shell
+    /// executes the complete list ... in a subshell environment," so
+    /// the *entire* `and_or` chain backgrounds as one job, not just its
+    /// first pipeline (confirmed against real bash: `false && echo no &`
+    /// backgrounds the whole chain).
+    ///
+    /// Carries the `and_or`'s own verbatim source text, byte-sliced by
+    /// the parser exactly the way [`SubshellBody::source`] already is
+    /// (see that field's docs for the full "why") — for the identical
+    /// reason: `conch-shell-core`'s executor runs a backgrounded list as
+    /// a genuinely separate process (re-exec'ing `conch -c <source>`,
+    /// generalizing [`SubshellBody`]'s own mechanism rather than
+    /// building parallel infrastructure), which needs this raw text, not
+    /// a re-walk of the already-parsed [`AndOrList`].
+    Async(String),
     /// No trailing separator (end of input).
     None,
 }

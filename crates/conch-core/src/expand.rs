@@ -266,6 +266,44 @@ fn expand_segment(
             Ok(())
         }
         WordSegment::DoubleQuoted(inner) => {
+            // A *syntactically* empty double-quoted region — `""`,
+            // literally nothing between the quotes, i.e. `inner` itself
+            // has zero `WordSegment`s — still counts as one quoted,
+            // non-splitting empty field, not zero: POSIX confirms `""`
+            // is a single empty field (confirmed against real bash:
+            // `set -- "" x; echo $#` is `2`), and this crate's own
+            // `WordSegment::SingleQuoted("")` arm just above already
+            // gets this right by construction (it unconditionally
+            // pushes a `Segment` regardless of whether `text` is
+            // empty). Without this, a word that's *entirely* `""` would
+            // hit the `for` loop below zero times, push nothing, and
+            // silently vanish into zero fields instead of surviving as
+            // one empty argument — caught (not assumed, empirically)
+            // while exercising `trap '' SIG` (POSIX's ignore-a-signal
+            // form) for Phase 4's own differential corpus.
+            //
+            // Deliberately checked on `inner` itself (before expansion),
+            // *not* on whether the loop below ended up pushing anything
+            // — those are different questions: `"$@"` with zero
+            // positional parameters, for instance, has a *non-empty*
+            // `inner` (one `Parameter(At)` segment) that correctly
+            // expands to *zero* pushed segments (its own POSIX-mandated
+            // "vanishes entirely" rule — see
+            // `push_positional_params_as_independent_fields`'s docs),
+            // and must keep doing exactly that; an `out.len()`-based
+            // check would have wrongly given it a phantom empty field
+            // too (caught by `quoted_at_with_zero_positional_params_produces_zero_fields`
+            // regressing when an earlier version of this fix tried
+            // exactly that).
+            if inner.is_empty() {
+                out.push(Segment {
+                    text: String::new(),
+                    glob_eligible: false,
+                    split_eligible: false,
+                    force_field_break_after: false,
+                });
+                return Ok(());
+            }
             for segment in inner {
                 // Everything nested inside double quotes is quoted,
                 // including the *result* of a parameter/command/
@@ -501,8 +539,22 @@ fn expand_parameter(param: &Parameter, shell: &Shell) -> String {
         Parameter::Special(SpecialParameter::At | SpecialParameter::Star) => {
             join_positional_params_with_ifs(shell)
         }
-        Parameter::Special(SpecialParameter::Dash | SpecialParameter::Dollar) => String::new(),
-        Parameter::Special(SpecialParameter::Bang) => String::new(),
+        Parameter::Special(SpecialParameter::Dash) => String::new(),
+        // `$$` -- see `Shell::pid`'s own docs for why this is the
+        // top-level shell's PID even inside a subshell, not
+        // `nix::unistd::getpid()` called fresh here (which would give
+        // whichever real process happens to be running this expansion).
+        Parameter::Special(SpecialParameter::Dollar) => shell.pid.to_string(),
+        // `$!` -- the process-group-leader PID of the most recently
+        // `&`-backgrounded job (`Shell::last_background_pid`, set by
+        // `conch-shell-core::exec::spawn_background_job`), unset (empty,
+        // same as any other unset parameter) until the first `&` this
+        // session — Phase 4 job control; previously always empty here
+        // since backgrounding didn't exist yet.
+        Parameter::Special(SpecialParameter::Bang) => shell
+            .last_background_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -976,6 +1028,16 @@ fn run_command_substitution(body: &str, shell: &Shell) -> Result<String, ExpandE
         .current_dir(&shell.cwd)
         .env_clear()
         .envs(&shell.env_vars)
+        // Command substitution is a POSIX 2.12 "subshell environment"
+        // too -- `$$` inside `` $(...) ``/`` `...` `` must still read as
+        // the top-level shell's PID (`Shell::pid`), matching
+        // `exec_subshell`/`spawn_background_job`'s own identical
+        // propagation and for the same reason.
+        .env("__CONCH_PID", shell.pid.to_string())
+        // Same `trap ''`-ignored-signal inheritance as
+        // `exec_subshell`/`spawn_background_job` -- see
+        // `Shell::ignored_trap_names`'s own docs.
+        .env("__CONCH_IGNORED_SIGNALS", shell.ignored_trap_names())
         .output()
         .map_err(|err| ExpandError::CommandSubstitutionFailed(err.to_string()))?;
 
@@ -1750,6 +1812,29 @@ mod tests {
     fn quoted_at_with_zero_positional_params_produces_zero_fields() {
         let mut shell = Shell::new();
         assert_eq!(fields(r#""$@""#, &mut shell), Vec::<String>::new());
+    }
+
+    #[test]
+    fn empty_double_quoted_word_is_one_empty_field_not_zero() {
+        // Confirmed against real bash: `set -- "" x; echo $#` is `2`,
+        // not `1` -- a syntactically empty `""` still counts as one
+        // (empty) field, distinct from `"$@"` with zero positional
+        // parameters (the *previous* test), which correctly vanishes
+        // into zero fields precisely because it isn't syntactically
+        // empty (there's a `$@` between the quotes; it just expands to
+        // nothing) -- these two must not be conflated. Caught while
+        // exercising `trap '' SIG` for Phase 4's own differential
+        // corpus: single-quoted `''` already got this right (see
+        // `single_quoted_is_never_split`'s neighbor tests), only the
+        // double-quoted form had this gap.
+        let mut shell = Shell::new();
+        assert_eq!(fields(r#""""#, &mut shell), vec![""]);
+    }
+
+    #[test]
+    fn empty_double_quoted_word_glued_to_literal_text_stays_one_field() {
+        let mut shell = Shell::new();
+        assert_eq!(fields(r#"a""b"#, &mut shell), vec!["ab"]);
     }
 
     #[test]
