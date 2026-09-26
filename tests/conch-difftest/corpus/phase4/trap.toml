@@ -1,0 +1,136 @@
+# Phase 4 -- the `trap` builtin: catching signals, ignoring them, resetting
+# to default disposition, and the `EXIT` pseudo-signal.
+#
+# Self-signaling a script with `kill -SIGNAL $$` and observing whether/when
+# the registered trap action runs is deterministic in practice on both
+# bash and dash: a signal sent to the shell's own PID from a command it
+# just ran synchronously is guaranteed to be *pending* by the time that
+# command returns, and both shells check for and run pending traps before
+# continuing to the next command in the list -- confirmed empirically for
+# every case below, run directly against real bash and dash (not only
+# through this harness's own `sh`) while building this corpus.
+#
+# `trap -p` (introspecting the current trap for a signal without
+# triggering it) is genuinely useful for testing trap state without
+# relying on live signal delivery at all -- but dash's `trap` does not
+# implement `-p` (confirmed: `dash: trap: Illegal option -p`), even
+# though POSIX's own `trap` utility description specifies it. The two
+# subshell-inheritance cases at the end of this file that need it are
+# therefore `oracles = ["bash"]` only; everything else here is POSIX
+# baseline and runs against both `bash` and `sh`.
+#
+# `kill -TERM $$`/`kill -USR1 $$` inside a *subshell* is deliberately not
+# used anywhere as a way to test that subshell's own trap state: POSIX
+# subshells keep the top-level shell's original `$$` value unchanged (that
+# is what bash's non-POSIX `$BASHPID` extension exists to work around),
+# so `kill -SIG $$` run from inside a subshell actually signals the real
+# *parent* process, not the subshell itself -- not what a subshell-trap
+# test wants to prove, and confirmed to just add confusing, direction-
+# dependent nondeterminism rather than a clean fact. The `trap -p`-based
+# cases below sidestep this by checking trap *state* directly instead of
+# relying on where a live signal actually lands.
+
+[[case]]
+name = "trap-on-exit-runs-once-when-the-script-ends"
+description = "an EXIT trap's action runs once, after the rest of the script, right before the shell actually exits"
+tags = ["job-control", "trap", "exit"]
+oracles = ["bash", "sh"]
+script = '''
+trap "echo bye" EXIT
+echo hi
+'''
+
+[[case]]
+name = "trap-on-exit-does-not-override-an-explicit-exit-code"
+description = "an EXIT trap still runs when the script calls exit N explicitly, but the trap running doesn't change the script's own final exit status"
+tags = ["job-control", "trap", "exit", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+trap "echo bye" EXIT
+echo hi
+exit 3
+'''
+
+[[case]]
+name = "trap-catches-a-self-sent-signal-before-the-next-command-runs"
+description = "kill -USR1 $$ delivers the signal synchronously enough that the registered trap action runs before the next command in the script does"
+tags = ["job-control", "trap", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+trap "echo caught" USR1
+kill -USR1 $$
+echo after
+'''
+
+[[case]]
+name = "trap-with-an-empty-command-ignores-the-signal"
+description = "trap \"\" SIG makes that signal a no-op when self-sent -- the script survives and continues, unlike the default disposition"
+tags = ["job-control", "trap", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+trap "" USR1
+kill -USR1 $$
+echo survived
+'''
+
+[[case]]
+name = "trap-dash-resets-a-signal-to-its-default-disposition"
+description = "trap - SIG (a bare dash as the action) explicitly restores the signal's default disposition; self-sending it afterward terminates the script via that default action -- the exact same underlying OS-level signal death on both shells, so \"unreached\" never prints and the process outcome compares equal (a terminated-by-signal outcome, not a specific numbered exit code -- see this crate's invoke.rs docs on how that's captured) -- on either shell"
+tags = ["job-control", "trap", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+trap "echo x" USR1
+trap - USR1
+kill -USR1 $$
+echo unreached
+'''
+
+[[case]]
+name = "trap-fires-for-each-of-multiple-signals-registered-together"
+description = "trap 'action' SIG1 SIG2 registers the same action for both signals; self-sending each one in turn runs it each time"
+tags = ["job-control", "trap", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+trap "echo caught" USR1 USR2
+kill -USR1 $$
+kill -USR2 $$
+echo after
+'''
+
+[[case]]
+name = "trap-redefining-overwrites-the-previous-handler-for-that-signal"
+description = "registering a second trap for the same signal replaces the first one outright -- only the latest action ever runs"
+tags = ["job-control", "trap", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+trap "echo first" USR1
+trap "echo second" USR1
+kill -USR1 $$
+echo after
+'''
+
+[[case]]
+name = "trap-set-in-parent-is-visible-inside-a-subshell-bash-only"
+description = "a trap registered before a subshell is entered is still visible inside it, checked via trap -p (a bash-only introspection flag -- see this file's header) rather than a live signal, since $$ inside a subshell still refers to the parent's real PID"
+tags = ["job-control", "trap", "subshell", "bash-extension"]
+oracles = ["bash"]
+script = '''
+trap "echo x" USR1
+if [ -n "$(trap -p USR1)" ]; then echo parent-has-trap; else echo parent-has-default; fi
+(
+  if [ -n "$(trap -p USR1)" ]; then echo child-has-trap; else echo child-has-default; fi
+)
+'''
+
+[[case]]
+name = "trap-ignored-in-parent-is-also-ignored-inside-a-subshell-bash-only"
+description = "the same trap -p introspection (bash-only, see this file's header) applied to an ignored (empty-command) trap instead of a caught one"
+tags = ["job-control", "trap", "subshell", "bash-extension"]
+oracles = ["bash"]
+script = '''
+trap "" USR1
+if [ -n "$(trap -p USR1)" ]; then echo parent-ignored; else echo parent-default; fi
+(
+  if [ -n "$(trap -p USR1)" ]; then echo child-ignored; else echo child-default; fi
+)
+'''

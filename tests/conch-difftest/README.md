@@ -77,6 +77,48 @@ also runs in **report-only mode** via its own
 `CONCH_DIFFTEST_STRICT_PHASE3B` gate -- see "Phase-specific strict gates"
 below.
 
+**Phase 4** (job control: backgrounding with `&`, `wait`, `$!`, `jobs`,
+and `trap`) is being implemented concurrently in
+`crates/conch-parser`/`crates/conch-core` at the time the `phase4/`
+corpus was written. As of this writing `&` is parsed but always runs its
+pipeline synchronously in the foreground rather than actually
+backgrounding it (per `conch-shell-core::exec`'s own doc comment), and
+`wait`/`trap` aren't registered builtins at all yet. This matters more
+than the equivalent gap did for earlier phases: several Phase 4 cases
+synchronize a background job with a `mkfifo` gate (a blocking `read` that
+only unblocks once another command later in the same script writes to
+it) specifically to make "is this job still running right now" a
+deterministic fact instead of a sleep-based guess -- but that pattern
+*depends on `&` actually backgrounding*. Run today against a
+pre-Phase-4 conch binary, the gating command runs synchronously instead,
+blocks forever waiting for a writer that never gets a turn to run, and
+the harness's own [`invoke::wait_with_timeout`] wall-clock bound (added
+alongside this corpus -- see "Non-determinism and normalization" below)
+is what turns that into a clean, reported timeout `Error` instead of
+hanging the whole differential suite (confirmed live: exactly this
+happened against the pre-Phase-4 binary while building this corpus).
+That corpus (22 cases across 3 files) is, like every earlier phase's,
+fully built, self-validated, and oracle-verified against real bash/dash
+today, and also runs in **report-only mode** via its own
+`CONCH_DIFFTEST_STRICT_PHASE4` gate -- see "Phase-specific strict gates"
+below.
+
+Job control is also the first phase whose corpus needed a scoping
+decision from outside this crate: real interactive job control (`fg`/`bg`
+reclaiming the controlling terminal, Ctrl-Z-driven `SIGTSTP`
+suspend/resume) is restricted by POSIX to *interactive* shells, and this
+harness's `-c`/script-file/stdin-pipe invocation modes have no
+controlling terminal at all -- there is nothing for that slice of job
+control to attach to, structurally, not just something hard to make
+deterministic. `corpus/phase4/` therefore covers only the
+non-terminal-dependent slice (backgrounding, `wait`, `$!`, `trap`, and
+`jobs`/`kill -0` status checks for jobs observed via `wait`/exit status
+rather than by racing on real-time terminal output); the terminal-owning
+half is intentionally out of this corpus's scope and is expected to be
+verified manually once that implementation exists, the same way this
+project's other genuinely-interactive surfaces are (see "Interactive mode
+scoping" below).
+
 Every phase's three-test pattern is the same (`{phase}_corpus_validation.rs`,
 `{phase}_oracle_selfcheck.rs`, `{phase}_differential.rs` -- Phase 1's
 happen to be un-prefixed since they were written first):
@@ -105,8 +147,9 @@ named env var rather than a single shared one -- `differential.rs` (Phase
 1) checks `CONCH_DIFFTEST_STRICT`; `phase2_differential.rs` checks
 `CONCH_DIFFTEST_STRICT_PHASE2`; `phase3_differential.rs` checks
 `CONCH_DIFFTEST_STRICT_PHASE3`; `phase3b_differential.rs` checks
-`CONCH_DIFFTEST_STRICT_PHASE3B`; a hypothetical Phase 4 would check
-`CONCH_DIFFTEST_STRICT_PHASE4`; and so on. This is deliberate and is the
+`CONCH_DIFFTEST_STRICT_PHASE3B`; `phase4_differential.rs` checks
+`CONCH_DIFFTEST_STRICT_PHASE4`; a hypothetical Phase 5 would check
+`CONCH_DIFFTEST_STRICT_PHASE5`; and so on. This is deliberate and is the
 whole mechanism that keeps phases independent: CI's `difftest` job runs
 `cargo test -p conch-difftest`, which builds and runs *every* test binary
 in this crate regardless of which corpora are actually finished, so
@@ -167,13 +210,17 @@ tests/conch-difftest/
 │   │   ├── nested_loops.toml            (break N / continue N -- see its own header)
 │   │   ├── case_statements.toml
 │   │   └── subshells_and_groups.toml
-│   └── phase3b/                     <- same style, functions/local/return/positional params
-│       ├── functions.toml
-│       ├── return_and_exit_status.toml
-│       ├── local_scoping.toml
-│       ├── recursion.toml
-│       ├── positional_parameters.toml
-│       └── at_star_field_splitting.toml (the quoted-vs-unquoted $@/$* contrast)
+│   ├── phase3b/                     <- same style, functions/local/return/positional params
+│   │   ├── functions.toml
+│   │   ├── return_and_exit_status.toml
+│   │   ├── local_scoping.toml
+│   │   ├── recursion.toml
+│   │   ├── positional_parameters.toml
+│   │   └── at_star_field_splitting.toml (the quoted-vs-unquoted $@/$* contrast)
+│   └── phase4/                      <- same style, job control (non-terminal-dependent slice)
+│       ├── background_and_wait.toml
+│       ├── jobs_status.toml             (kept minimal -- see its own header)
+│       └── trap.toml
 └── tests/
     ├── corpus_validation.rs
     ├── oracle_selfcheck.rs
@@ -186,7 +233,10 @@ tests/conch-difftest/
     ├── phase3_differential.rs
     ├── phase3b_corpus_validation.rs
     ├── phase3b_oracle_selfcheck.rs
-    └── phase3b_differential.rs
+    ├── phase3b_differential.rs
+    ├── phase4_corpus_validation.rs
+    ├── phase4_oracle_selfcheck.rs
+    └── phase4_differential.rs
 ```
 
 Why a workspace member under `tests/`, not a bare `tests/*.rs` at the
@@ -318,9 +368,6 @@ Phase 1's corpus only needs two rules (`normalize.rs`):
 Later phases will need more, and the mechanism is designed to grow rather
 than be reinvented:
 
-- **Phase 4 (job control)**: `$$`/`$!` PIDs are exactly the workdir
-  problem's shape -- a per-run, harness-known value substituted with a
-  placeholder on both sides.
 - **`$RANDOM`, hostnames**: not literal-string-known in advance the way a
   workdir is; add a masking rule backed by a small, explicit pattern
   match for the one or two fixed shapes actually needed, rather than
@@ -334,6 +381,55 @@ than be reinvented:
 Keep normalization **explicit and opt-in per case** (never applied
 globally) so a case's `normalize` list documents exactly which kind of
 non-determinism it's accounting for.
+
+`$$`/`$!` PIDs were flagged here, before Phase 4's corpus existed, as
+the next obvious candidate for a normalization rule -- a per-run,
+harness-known value substituted with a placeholder on both sides, the
+same shape as the workdir problem. In practice, `corpus/phase4/` needed
+no such rule at all: every case that needs a background job's PID
+captures `$!` into a shell variable and uses it functionally (as an
+argument to `wait`/`kill -0`) rather than ever printing the literal value,
+which sidesteps the non-determinism entirely instead of normalizing it
+away after the fact. Left here as a note in case a future case genuinely
+needs to assert on a PID's literal text -- the mechanism above is still
+the right shape for that if it comes up.
+
+### Wall-clock timeouts (hang prevention)
+
+A different kind of non-determinism, orthogonal to output normalization:
+**can a case hang instead of producing wrong output at all.** Every
+phase through 3b makes this impossible by construction -- nothing before
+Phase 4 (job control) ever runs more than one process at a time, so
+there's nothing for a script to block *waiting on*. Phase 4 changes that.
+Several `corpus/phase4/` cases synchronize with a background job via a
+`mkfifo` gate (a blocking `read` that only unblocks once a later command
+in the same script writes to it) specifically to turn "is this job still
+running" into a deterministic fact instead of a `sleep`-based guess (see
+`corpus/phase4/jobs_status.toml`'s header) -- but that pattern's
+correctness *depends on backgrounding actually working*. Confirmed live
+while building that corpus: run against a conch binary from before Phase
+4 landed (where `&` is parsed but always runs synchronously in the
+foreground), the gating command never actually backgrounds, so the
+`read` blocks forever waiting for a writer that never gets a turn to run.
+
+`invoke::wait_with_timeout` (used by every invocation, every phase, not
+just Phase 4's) bounds this: a shell invocation that hasn't exited within
+`invoke::INVOCATION_TIMEOUT` (10 seconds -- far more than any legitimate
+case should ever need, including on a slow/loaded CI runner) is killed
+and reported as a normal `CaseOutcome::Error`, the same as any other
+harness-level failure to run a shell at all, rather than blocking the
+rest of the suite (and therefore CI) indefinitely. It's implemented as a
+dedicated waiter thread doing a blocking `wait_with_output()` and
+reporting back over a channel with `recv_timeout`, deliberately *not* as
+a `try_wait`-then-`sleep` polling loop -- an earlier version of this
+function used exactly that approach, and even a short poll interval taxes
+*every* invocation (not just hung ones) with up to one interval's worth
+of pure latency, which measurably slowed down this crate's entire test
+suite across every phase before being replaced with the channel-based
+version (see `invoke.rs`'s doc comment on `wait_with_timeout` for the
+specifics). This is unconditional harness behavior, not a per-case
+`normalize` opt-in -- there's no scenario where a script legitimately
+*wants* to hang forever.
 
 ### Interactive mode scoping
 
@@ -475,6 +571,75 @@ count) are the correct way to prove the zero-fields property instead.
 specifically so `local` scoping is proven to nest across more than one
 call-stack frame, not just work once -- see that file's header.
 
+### Phase 4 scoping notes
+
+`corpus/phase4/` covers the non-terminal-dependent slice of job control:
+backgrounding a command list with `&`, `wait` (bare, and targeting a
+specific `$!`-captured pid), and `trap` (catching a signal, ignoring one,
+resetting to default disposition, and the `EXIT` pseudo-signal), plus
+minimal `jobs`/`kill -0` status checks. All of it is POSIX baseline except
+two `trap -p`-based introspection cases (see below), so almost every case
+runs against both `oracles = ["bash", "sh"]`.
+
+**What's deliberately not here, and why:** real interactive job control --
+`fg`/`bg` reclaiming the controlling terminal, `Ctrl-Z`-driven `SIGTSTP`
+suspend/resume -- is restricted by POSIX to interactive shells, and none
+of this harness's invocation modes (`-c`, script-file, stdin-pipe) have a
+controlling terminal at all. This isn't "hard to make deterministic", the
+usual bar for leaving something out of this corpus -- there is
+structurally nothing for that slice of job control to attach to under any
+of these invocation modes. It's expected to be verified manually once
+implemented, the same way this project already treats other genuinely
+interactive surfaces (see "Interactive mode scoping" above).
+
+Three techniques recur across this corpus, worth knowing before adding to
+it:
+
+- **Never print a literal `$!`/`$$` value.** Every case that needs a
+  background job's PID captures it into a variable and uses it
+  functionally (as a `wait`/`kill -0` argument) instead. This is what lets
+  this corpus need no new PID-normalization rule in `normalize.rs` at all
+  -- see "Non-determinism and normalization" above.
+- **Route concurrent jobs' output to separate files, not shared stdout.**
+  `wait` makes "has this job finished yet" deterministic, but it does
+  *not* make "which of two genuinely concurrent jobs' direct stdout
+  writes lands first" deterministic -- that's a real race between two
+  live processes. `background_and_wait.toml`'s multi-job case writes each
+  job's output to its own file and reads them back afterward in a fixed,
+  script-chosen order instead.
+- **Use a `mkfifo` gate, not a `sleep` guess, for "is this still
+  running".** `jobs_status.toml`'s cases need to assert something about a
+  job's state *while it's still running*, which a `sleep` can only ever
+  approximate (and which the project's testability guardrails
+  specifically warn against relying on). A background job that blocks
+  reading from a FIFO until a later command explicitly writes to it makes
+  "is it still running at this exact point" a fact guaranteed by
+  construction. See "Wall-clock timeouts (hang prevention)" above for the
+  harness-level safety net this pattern's correctness actually depends on.
+
+`corpus/phase4/jobs_status.toml`'s header documents two genuine bash-vs-
+dash divergences in `jobs -p` found while building this corpus (pipe/
+command-substitution job-table visibility, and post-`wait` bookkeeping
+timing) -- neither is a `known_difference` (that schema is for a
+deliberate *conch* decision), so both are recorded in
+`known-differences.md`'s "Cross-shell quirks worth knowing" section
+instead, the same way Phase 2's and Phase 3b's oracle-vs-oracle quirks
+are.
+
+`corpus/phase4/trap.toml`'s two subshell-inheritance cases are
+`oracles = ["bash"]` only, using `trap -p` to introspect trap state
+directly rather than relying on a live signal: `kill -SIG $$` run from
+inside a subshell doesn't actually target the subshell itself, since
+POSIX subshells keep the top-level shell's original `$$` value unchanged
+(bash's non-POSIX `$BASHPID` exists specifically to work around this).
+dash's `trap` has no `-p` support at all (confirmed:
+`dash: trap: Illegal option -p`), which is why these two can't be shared-
+oracle cases -- see that file's header and `known-differences.md`'s
+bash-extensions table for the exact wording (this one is technically a
+dash gap against a POSIX-specified flag, not bash extending past POSIX,
+but the practical `oracles = ["bash"]`-only effect on the corpus is the
+same).
+
 ## Wiring in real execution
 
 This is the part whoever picks this crate up once Phase 1 execution
@@ -585,4 +750,45 @@ cargo test -p conch-difftest --test phase3b_differential -- --nocapture
 
 # Phase 3b hard gate, once warranted:
 CONCH_DIFFTEST_STRICT_PHASE3B=1 cargo test -p conch-difftest --test phase3b_differential -- --nocapture
+```
+
+Likewise for Phase 4 once job-control execution lands in
+`crates/conch-parser`/`crates/conch-core`, substituting `phase4_differential`
+and `CONCH_DIFFTEST_STRICT_PHASE4`. As of this writing job control is
+being actively implemented concurrently with this corpus -- literally
+mid-edit: `cargo build --release` against the working tree at the time
+this note was written fails to compile (`crates/conch-core`) -- so unlike
+every earlier phase's entry above, there is no single stable pass/fail
+count to report here yet. Running against the last binary that *did*
+build successfully (a pre-Phase-4 snapshot, where `&` is parsed but
+always runs synchronously and `wait`/`trap` aren't registered builtins)
+showed three patterns worth knowing about rather than one exact number:
+
+- A meaningful minority of cases **coincidentally pass** -- not because
+  job control is implemented, but because every case in this corpus was
+  deliberately written to have one, single, deterministic output
+  ordering (that's the whole point of leaning on `wait`; see "Phase 4
+  scoping notes" above), and running everything synchronously in program
+  order happens to reproduce that exact same ordering for a script that
+  never actually needed concurrency to begin with. This is the same
+  phenomenon Phase 3b's entry above documents for
+  `printf-with-zero-positional-at-is-not-a-valid-zero-fields-demonstration`
+  -- coincidental output equivalence, not a signal that the feature works.
+- Every `trap`-based case reliably fails or errors, confirming `trap`
+  isn't a registered builtin yet (consistent with `local`/`return`/`set`/
+  `shift` all resolving to "tries to exec a same-named external command"
+  at the equivalent point in Phase 3b).
+- Both FIFO-gated cases in `jobs_status.toml` hit the harness's own
+  `INVOCATION_TIMEOUT` and were reported as clean `Error`s rather than
+  hanging the test run -- direct, live confirmation of exactly the
+  scenario "Wall-clock timeouts (hang prevention)" above describes,
+  observed while building this corpus rather than only reasoned about in
+  the abstract.
+
+```sh
+# Phase 4 full report, report-only (today's state):
+cargo test -p conch-difftest --test phase4_differential -- --nocapture
+
+# Phase 4 hard gate, once warranted:
+CONCH_DIFFTEST_STRICT_PHASE4=1 cargo test -p conch-difftest --test phase4_differential -- --nocapture
 ```

@@ -3,9 +3,31 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::case::Invocation;
+
+/// Generous wall-clock ceiling for a single shell invocation.
+///
+/// Every case in every phase up to and including Phase 3/3b completes in
+/// well under a second, by construction: nothing before Phase 4 (job
+/// control) involves more than one process at a time, so there's nothing
+/// for a script to block *waiting on*. Phase 4 changes that -- a
+/// background job synchronized via a FIFO (`mkfifo`; blocking `read`
+/// until another command writes to it) is the harness's own preferred
+/// pattern for turning "is the job still running" into a deterministic
+/// yes/no fact (see `corpus/phase4/`'s README notes), but it also means a
+/// bug in a still-in-progress job-control implementation (the writer-side
+/// command never actually running, a background job never actually
+/// getting spawned, ...) can make a script block forever instead of
+/// failing. Without a bound here, that turns into the whole differential
+/// suite -- and therefore CI -- hanging indefinitely rather than reporting
+/// a clean failure. 10 seconds is chosen to be far larger than any
+/// legitimate case should ever need (including on a slow/loaded CI
+/// runner) while still being a finite bound.
+const INVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The raw, unnormalized outcome of running a script under one shell.
 ///
@@ -89,13 +111,77 @@ pub fn run(
         // instead of hanging waiting for more input.
     }
 
-    let output = child.wait_with_output()?;
+    wait_with_timeout(child, INVOCATION_TIMEOUT)
+}
 
-    Ok(RunOutcome {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code(),
-    })
+/// Waits for `child` to exit, capturing its stdout/stderr via
+/// [`std::process::Child::wait_with_output`], but killing it (and
+/// reporting a [`std::io::ErrorKind::TimedOut`] error instead of a
+/// [`RunOutcome`]) if it hasn't exited within `timeout`. See
+/// [`INVOCATION_TIMEOUT`]'s doc comment for why this exists at all: a
+/// black-box `wait_with_output()` call has no way to bound how long it
+/// blocks, which is exactly the failure mode a hung job-control script
+/// needs to be turned into a reportable error instead of.
+///
+/// Deliberately *not* implemented as a poll-`try_wait`-then-sleep loop:
+/// an earlier version of this function did exactly that, and even a short
+/// poll interval taxes every single invocation with up to one interval's
+/// worth of pure latency (confirmed while building this -- a 20ms poll
+/// interval alone roughly quintupled this crate's own test suite's real
+/// wall-clock time, since the overwhelming majority of invocations exit
+/// in a couple of milliseconds and were each still paying the fixed
+/// polling tax). Instead, `child` is handed to a dedicated waiter thread
+/// that makes the ordinary *blocking* `wait_with_output()` call --
+/// exactly as cheap as the no-timeout version this replaced, since the
+/// OS itself wakes that thread the instant the child exits -- and reports
+/// back over a channel; this thread only ever does a bounded
+/// [`mpsc::Receiver::recv_timeout`] on that channel. On timeout, the
+/// child is killed **by PID** (via the external `kill` utility) rather
+/// than through `Child::kill`, since `child` itself has already been
+/// moved into the waiter thread by that point and `Child::kill` isn't
+/// `Sync` in a way that would let both threads share it without a lock
+/// that would just reintroduce the same head-of-line blocking this is
+/// avoiding.
+fn wait_with_timeout(child: Child, timeout: Duration) -> std::io::Result<RunOutcome> {
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        // The receiver may already have timed out and returned by the
+        // time this finishes (plausible: it's the losing side of a race
+        // against a process that was just killed for having timed out),
+        // in which case the send fails with nothing listening -- fine to
+        // ignore, there's no one left to report to.
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Ok(RunOutcome {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            exit_code: output.status.code(),
+        }),
+        Ok(Err(err)) => Err(err),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Best-effort: the child may have exited in the tiny window
+            // between the channel timing out and this running, in which
+            // case `kill` harmlessly fails against an already-gone PID.
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .status();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "shell invocation did not exit within {timeout:?} and was killed -- see \
+                     INVOCATION_TIMEOUT's doc comment"
+                ),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "waiter thread for child process disconnected without reporting an outcome",
+        )),
+    }
 }
 
 /// Locates the conch binary under test, or `None` if it isn't available
@@ -190,6 +276,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.stdout, b"via-stdin\n");
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn a_hanging_process_is_killed_and_reported_as_a_timed_out_error() {
+        // Uses `wait_with_timeout` directly with a short timeout rather
+        // than going through `run()` (which always uses the real,
+        // multi-second `INVOCATION_TIMEOUT`) so this test itself stays
+        // fast. `sleep 5` stands in for the shape of bug this guards
+        // against: a job-control script that never terminates on its own
+        // (see `INVOCATION_TIMEOUT`'s doc comment).
+        let child = Command::new("sleep")
+            .arg("5")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = wait_with_timeout(child, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hung child should have been killed well before its own 5s sleep finished"
+        );
+    }
+
+    #[test]
+    fn a_process_finishing_before_the_deadline_returns_its_real_outcome() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("echo quick")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let outcome = wait_with_timeout(child, Duration::from_secs(10)).unwrap();
+        assert_eq!(outcome.stdout, b"quick\n");
         assert_eq!(outcome.exit_code, Some(0));
     }
 
