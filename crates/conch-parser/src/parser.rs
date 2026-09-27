@@ -1,6 +1,8 @@
 //! The recursive-descent parser implementation, one function per
 //! POSIX 2.10.2 grammar production it implements.
 
+use std::collections::HashMap;
+
 use conch_shell_lexer::{Operator, Span, Token, TokenKind, Word, WordSegment};
 
 use crate::ast::{
@@ -11,7 +13,12 @@ use crate::ast::{
 };
 use crate::error::ParseError;
 
-/// Parses a complete `input` into a [`CommandList`].
+/// Parses a complete `input` into a [`CommandList`], with no alias table
+/// at all — equivalent to [`parse_with_aliases`] with an empty one. Most
+/// callers want this: alias expansion is an interactive-shell-only bash
+/// extension (see that function's own docs), and every non-interactive
+/// entry point (`-c`, a script file, `eval`, `.`/`source`) should use
+/// this plain form instead.
 ///
 /// # Errors
 ///
@@ -21,8 +28,45 @@ use crate::error::ParseError;
 /// least *recognized*, real POSIX/bash grammar — see that variant's
 /// docs), or is otherwise not valid POSIX shell grammar.
 pub fn parse(input: &str) -> Result<CommandList, ParseError> {
+    parse_with_aliases(input, &HashMap::new())
+}
+
+/// [`parse`], but consulting `aliases` (name → replacement text) the
+/// same way real bash does: checked against the first word of *every*
+/// simple command (POSIX 2.10.2 rule 1's own reserved-word-recognition
+/// spot — [`Parser::parse_command`] — is exactly where this needs to
+/// hook in too, since an alias's replacement can itself turn out to be a
+/// reserved word, a nested alias, or introduce entirely new operator
+/// tokens the original source never had, e.g. `alias ll='ls -la | less'`
+/// splicing in a genuine pipe), never inside a quoted word or any other
+/// word position (arguments, case patterns, ...) — reusing
+/// [`Word::as_plain_literal`] is what gives this the same quote-awareness
+/// [`reserved_word`] already relies on, for free.
+///
+/// # Known gap
+///
+/// This crate parses a *whole* input string up front, in one pass, with
+/// no interleaved execution — unlike real bash, which reads and expands
+/// one command at a time, so `alias foo=bar` immediately affects a
+/// *later* command in the very same interactive input. Since `aliases`
+/// here is a single, fixed snapshot for this entire `parse_with_aliases`
+/// call, `alias foo=bar; foo` typed as one semicolon-joined line does
+/// *not* see its own just-defined alias — a narrow, honestly-documented
+/// gap. It doesn't come up across separate interactive lines, though:
+/// the interactive REPL loop (`conch`'s own binary crate) already calls
+/// this fresh, with the shell's then-current alias table, once per line
+/// read, so `alias foo=bar` on one line and `foo` on the next already
+/// works correctly.
+///
+/// # Errors
+///
+/// See [`parse`].
+pub fn parse_with_aliases(
+    input: &str,
+    aliases: &HashMap<String, String>,
+) -> Result<CommandList, ParseError> {
     let tokens = conch_shell_lexer::lex(input)?;
-    Parser::new(input, tokens).parse_command_list()
+    Parser::new(input, tokens, aliases).parse_command_list()
 }
 
 struct Parser<'a> {
@@ -47,14 +91,20 @@ struct Parser<'a> {
     /// only this struct and the primitives themselves changed.
     tokens: Vec<Token>,
     pos: usize,
+    /// See [`crate::parse_with_aliases`]'s own docs — consulted by
+    /// [`Self::maybe_expand_alias`] only, at the one grammar spot
+    /// ([`Self::parse_command`]) where a fresh simple command's first
+    /// word is recognized.
+    aliases: &'a HashMap<String, String>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, tokens: Vec<Token>) -> Self {
+    fn new(source: &'a str, tokens: Vec<Token>, aliases: &'a HashMap<String, String>) -> Self {
         Self {
             source,
             tokens,
             pos: 0,
+            aliases,
         }
     }
 
@@ -243,6 +293,16 @@ impl<'a> Parser<'a> {
     ///
     /// [`Command`]: crate::ast::Command
     fn parse_command(&mut self) -> Result<Command, ParseError> {
+        // Alias expansion (see `crate::parse_with_aliases`'s own docs)
+        // happens *before* even the function-definition/subshell/
+        // reserved-word checks just below: bash's own model expands
+        // aliases textually, as the command is read, before any of that
+        // structural recognition even applies — so an alias whose
+        // replacement happens to start with `if`/`{`/... needs to be
+        // seen as that reserved word/compound command by everything
+        // that follows, not treated as a plain command name that merely
+        // happens to be spelled "if".
+        self.maybe_expand_alias()?;
         // Function definitions are checked *before* everything else in
         // this function, including the subshell/reserved-word compound-
         // command dispatch just below — both function-definition forms
@@ -747,6 +807,55 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             Some(TokenKind::Word(word)) => reserved_word(word),
             _ => None,
+        }
+    }
+
+    /// [`Self::parse_command`]'s alias-expansion hook — see
+    /// [`crate::parse_with_aliases`]'s own docs for the full grounding.
+    /// Repeatedly checks whether the current token is a plain, unquoted
+    /// `Word` ([`Word::as_plain_literal`], the exact same quote-aware
+    /// check [`reserved_word`] already relies on) matching a known
+    /// alias; if so, re-lexes that alias's replacement text and splices
+    /// the resulting tokens in place of the one aliased word (so a
+    /// replacement introducing a real operator, e.g. `alias ll='ls -la |
+    /// less'`'s `|`, becomes a genuine pipe, not literal text), then
+    /// checks again in case the *new* current token is itself an alias
+    /// (chained aliases, `alias ll='la -l'; alias la='ls -a'`).
+    ///
+    /// Guards against infinite self-reference (`alias ls='ls -la'`) with
+    /// a set of names already expanded *within this one call* — the
+    /// moment a name would be expanded a second time in the same chain,
+    /// expansion stops there and that occurrence is left as a plain,
+    /// literal command name for the rest of parsing to handle normally
+    /// (exactly matching real bash's own observed behavior for this
+    /// classic case).
+    ///
+    /// Known gap, not implemented: bash also re-checks the word
+    /// *following* an expansion whose replacement text ends in a blank
+    /// (the classic `alias sudo='sudo '` trick, letting `sudo ll` expand
+    /// both words) — a real, bash-documented behavior, but a narrower,
+    /// more advanced one than plain single-word aliasing, and left as a
+    /// documented gap given this phase's own scope/time constraints
+    /// rather than attempted partially.
+    fn maybe_expand_alias(&mut self) -> Result<(), ParseError> {
+        let mut expanding: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let Some(TokenKind::Word(word)) = self.peek_kind() else {
+                return Ok(());
+            };
+            let Some(name) = word.as_plain_literal() else {
+                return Ok(());
+            };
+            let Some(replacement) = self.aliases.get(name) else {
+                return Ok(());
+            };
+            let name = name.to_string();
+            let replacement = replacement.clone();
+            if !expanding.insert(name) {
+                return Ok(());
+            }
+            let new_tokens = conch_shell_lexer::lex(&replacement)?;
+            self.tokens.splice(self.pos..self.pos + 1, new_tokens);
         }
     }
 

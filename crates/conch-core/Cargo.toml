@@ -18,8 +18,11 @@ thiserror = "2"
 # respectively) -- no broader `nix` surface than that is pulled in.
 # Already resolved at 0.31.3 transitively via `rustyline`'s own
 # termios/tty handling, so this adds no new version to the dependency
-# graph, only new feature flags on an already-locked crate.
-nix = { version = "0.31", features = ["process", "signal", "term"] }
+# graph, only new feature flags on an already-locked crate. `fs` (Phase 5)
+# adds `sys::stat::{umask, Mode}` for the `umask` builtin -- there's no
+# umask-only wrapper anywhere else in the `nix`/`libc` surface already in
+# use here.
+nix = { version = "0.31", features = ["process", "signal", "term", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"

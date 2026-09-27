@@ -107,6 +107,19 @@ pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
     for item in &list.items {
         status = exec_command_list_item(item, shell);
         shell.last_status = status;
+        // `set -e` (errexit) — see `Shell::errexit`'s own docs for
+        // exactly what this checkpoint's placement does and doesn't
+        // exempt. Skipped while `unwinding` (a pending `break`/
+        // `continue`/`return`, or a stopped/SIGINT-killed foreground
+        // job) — that's a distinct, higher-priority signal already
+        // being propagated, and letting *this* additionally trigger a
+        // hard process exit on the same statement would race the two
+        // rather than cleanly deferring to whichever the caller
+        // actually needs to see first.
+        if shell.errexit && status != 0 && shell.errexit_suppressed == 0 && !unwinding(shell) {
+            shell.run_exit_trap();
+            std::process::exit(status);
+        }
         // A safe checkpoint (per `conch-shell-core::signals`' module
         // docs) between every command — reaps any background job that
         // changed state and runs any `trap`'d signal's command text.
@@ -778,13 +791,26 @@ fn exec_function_call(func: &FunctionDefinition, args: &[String], shell: &mut Sh
     status
 }
 
+/// Runs a condition list for `if`/`while`/`until` — identical to
+/// [`exec_command_list`] except it also increments/decrements
+/// [`Shell::errexit_suppressed`] around the call, so a failing condition
+/// never triggers `set -e` (see that field's own docs for why: without
+/// this, `set -e; if grep -q foo file; then ...; fi` would exit the
+/// whole shell the first time `grep` found no match).
+fn exec_condition_list(condition: &CommandList, shell: &mut Shell) -> i32 {
+    shell.errexit_suppressed += 1;
+    let status = exec_command_list(condition, shell);
+    shell.errexit_suppressed -= 1;
+    status
+}
+
 /// POSIX `if_clause`/`else_part` — see
 /// [`conch_shell_parser::IfClause`]'s docs for how the AST already
 /// flattens the `elif` chain, which is what keeps this a single loop
 /// rather than needing recursion to mirror the grammar's own nesting.
 fn exec_if(clause: &IfClause, shell: &mut Shell) -> i32 {
     for (condition, body) in &clause.branches {
-        let cond_status = exec_command_list(condition, shell);
+        let cond_status = exec_condition_list(condition, shell);
         if unwinding(shell) {
             return cond_status;
         }
@@ -819,7 +845,7 @@ fn exec_while_or_until(
     shell.loop_depth += 1;
     let mut status = 0;
     loop {
-        let cond_status = exec_command_list(condition, shell);
+        let cond_status = exec_condition_list(condition, shell);
         if unwinding(shell) {
             status = cond_status;
             if matches!(take_loop_control_flow(shell), LoopStep::Continue) {
@@ -1015,10 +1041,16 @@ fn exec_simple(
         // A bare assignment-only simple command (`FOO=bar`, no command
         // name) assigns persistently to the shell rather than just the
         // one command's environment.
+        let mut status = 0;
         for (name, value) in assignments {
+            if shell.readonly_vars.contains(&name) {
+                eprintln!("conch: {name}: readonly variable");
+                status = 1;
+                continue;
+            }
             shell.shell_vars.insert(name, value);
         }
-        return (0, None);
+        return (status, None);
     };
 
     // Brace expansion (`{a,b,c}`) runs before anything else and can turn
@@ -1058,6 +1090,20 @@ fn exec_simple(
         }
     };
 
+    // `set -x` (xtrace) — printed after expansion (so this shows the
+    // *actual* command/args, not the unexpanded source text) but before
+    // dispatch, matching real bash's own ordering. See `Shell::xtrace`'s
+    // own docs for the "no configurable `PS4`" simplification.
+    if shell.xtrace {
+        let mut line = String::from("+ ");
+        line.push_str(&name);
+        for arg in &args {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        eprintln!("{line}");
+    }
+
     // Command search order: functions → builtins (special or regular
     // alike) → PATH. POSIX 2.9.1/2.9.5 actually puts special builtins
     // *ahead* of functions, specifically because a function is never
@@ -1087,6 +1133,7 @@ fn exec_simple(
             &args,
             &assignments,
             &redirects,
+            stdin_data,
             capture_output,
         );
     }
@@ -1239,9 +1286,57 @@ fn expand_redirects(
 /// every `ExpandError` variant, same as before this function existed.
 fn report_expand_error(err: &ExpandError, shell: &Shell) {
     eprintln!("conch: {err}");
-    if !shell.is_interactive && matches!(err, ExpandError::ParameterNullOrUnset(_)) {
+    // `ExpandError::UnboundVariable` (`set -u`) joins `ParameterNullOrUnset`
+    // (`${var:?}`) here — confirmed directly against real bash (not
+    // assumed) that a `set -u` violation aborts the whole non-interactive
+    // shell exactly like `${var:?}` does, despite looking at first like
+    // an ordinary "ignorable special-builtin error" case — see
+    // `Shell::nounset`'s own docs for the full reasoning on why the two
+    // are actually governed by the same POSIX rule.
+    if !shell.is_interactive
+        && matches!(
+            err,
+            ExpandError::ParameterNullOrUnset(_) | ExpandError::UnboundVariable(_)
+        )
+    {
         std::process::exit(1);
     }
+}
+
+/// Builds whichever of the three stdin sources a builtin should see for
+/// this invocation, in the same priority order [`exec_external`] already
+/// uses for an external command: an explicit `<`-style input redirect on
+/// the command itself first (opened fresh, so a builtin genuinely reads
+/// the file rather than whatever happened to be piped in from an earlier
+/// pipeline stage); failing that, `stdin_data` piped in from the previous
+/// pipeline stage, if any; failing that, the real inherited process
+/// stdin — the common case for an interactive/script `read` with no
+/// redirect or pipe at all.
+///
+/// Returns `Err` (already reported to stderr, matching
+/// [`exec_external`]'s own "can't open the redirect target" handling) if
+/// the input redirect's target couldn't be opened.
+fn builtin_stdin(
+    redirects: &[ExpandedRedirect],
+    stdin_data: Option<Vec<u8>>,
+) -> Result<Box<dyn std::io::Read>, ()> {
+    if let Some(redirect) = redirects
+        .iter()
+        .rev()
+        .find(|r| r.fd == 0 && matches!(r.operator, RedirectOperator::Input))
+    {
+        return match std::fs::File::open(&redirect.target) {
+            Ok(file) => Ok(Box::new(file)),
+            Err(err) => {
+                eprintln!("conch: {}: {err}", redirect.target);
+                Err(())
+            }
+        };
+    }
+    if let Some(data) = stdin_data {
+        return Ok(Box::new(std::io::Cursor::new(data)));
+    }
+    Ok(Box::new(std::io::stdin()))
 }
 
 fn exec_builtin(
@@ -1250,6 +1345,7 @@ fn exec_builtin(
     args: &[String],
     assignments: &[(String, String)],
     redirects: &[ExpandedRedirect],
+    stdin_data: Option<Vec<u8>>,
     capture_output: bool,
 ) -> (i32, Option<Vec<u8>>) {
     // Prefix assignments before a builtin are applied to the shell's own
@@ -1265,6 +1361,10 @@ fn exec_builtin(
         ));
     }
 
+    let mut stdin_reader = match builtin_stdin(redirects, stdin_data) {
+        Ok(reader) => reader,
+        Err(()) => return (1, None),
+    };
     let mut stdout_buf: Vec<u8> = Vec::new();
     let mut stderr_buf: Vec<u8> = Vec::new();
     // Take the builtin out of the registry for the duration of the call:
@@ -1277,7 +1377,13 @@ fn exec_builtin(
     let builtin = shell
         .take_builtin(name)
         .expect("caller already checked this builtin exists");
-    let status = builtin.run(shell, args, &mut stdout_buf, &mut stderr_buf);
+    let status = builtin.run(
+        shell,
+        args,
+        &mut *stdin_reader,
+        &mut stdout_buf,
+        &mut stderr_buf,
+    );
     shell.register_builtin(name.to_string(), builtin);
 
     for (name, previous_value) in previous {
@@ -1302,7 +1408,7 @@ fn exec_builtin(
                 RedirectOperator::Output | RedirectOperator::Append
             )
     }) {
-        if let Err(err) = write_redirect(output_redirect, &stdout_buf) {
+        if let Err(err) = write_redirect(output_redirect, &stdout_buf, shell.noclobber) {
             eprintln!("conch: {}: {err}", output_redirect.target);
             return (1, None);
         }
@@ -1419,23 +1525,15 @@ fn exec_external(
     }
 
     match output_redirect {
-        Some(redirect) => {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(matches!(redirect.operator, RedirectOperator::Append))
-                .truncate(!matches!(redirect.operator, RedirectOperator::Append))
-                .open(&redirect.target);
-            match file {
-                Ok(file) => {
-                    command.stdout(file);
-                }
-                Err(err) => {
-                    eprintln!("conch: {}: {err}", redirect.target);
-                    return (1, None);
-                }
+        Some(redirect) => match open_output_redirect(redirect, shell.noclobber) {
+            Ok(file) => {
+                command.stdout(file);
             }
-        }
+            Err(err) => {
+                eprintln!("conch: {}: {err}", redirect.target);
+                return (1, None);
+            }
+        },
         None => {
             command.stdout(if capture_output {
                 Stdio::piped()
@@ -1493,14 +1591,183 @@ fn exec_external(
     }
 }
 
-fn write_redirect(redirect: &ExpandedRedirect, data: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
+fn write_redirect(
+    redirect: &ExpandedRedirect,
+    data: &[u8],
+    noclobber: bool,
+) -> std::io::Result<()> {
+    let mut file = open_output_redirect(redirect, noclobber)?;
+    file.write_all(data)
+}
+
+/// Opens `redirect`'s target for an output (`>`) or append (`>>`)
+/// redirect — shared by a builtin's own redirect application
+/// ([`write_redirect`]) and an external command's ([`exec_external`]),
+/// which both need the identical `set -C` (noclobber) behavior: `>>` is
+/// never affected by it (appending to an existing file was never
+/// "clobbering" it in the first place), but a plain `>` to a file that
+/// already exists is refused outright rather than silently truncated.
+///
+/// Uses `create_new` (an atomic "fail if it already exists" open) for
+/// the noclobber case rather than a separate existence check followed by
+/// a later, distinct open — the same check-and-use-must-be-one-syscall,
+/// TOCTOU-avoiding pattern already followed everywhere else in this
+/// codebase that resolves a path before using it (see e.g.
+/// `conch-shell-builtins`'s `.`/`source` docs for the same reasoning
+/// applied there).
+fn open_output_redirect(
+    redirect: &ExpandedRedirect,
+    noclobber: bool,
+) -> std::io::Result<std::fs::File> {
+    let is_append = matches!(redirect.operator, RedirectOperator::Append);
+    if noclobber && !is_append {
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&redirect.target);
+    }
+    std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .append(matches!(redirect.operator, RedirectOperator::Append))
-        .truncate(!matches!(redirect.operator, RedirectOperator::Append))
-        .open(&redirect.target)?;
-    file.write_all(data)
+        .append(is_append)
+        .truncate(!is_append)
+        .open(&redirect.target)
+}
+
+// ---- command resolution: shared by the `type`/`command` builtins --------
+
+/// What kind of command `name` resolves to, in the same function → builtin
+/// → `PATH` order [`exec_simple`] itself already uses (see that function's
+/// own docs for why POSIX's "special builtins ahead of functions" ordering
+/// is deliberately not followed here) — shared by the `type`/`command`
+/// builtins (`conch-shell-builtins`) so neither reimplements command
+/// resolution, per this phase's own design note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandResolution {
+    /// A shell function (`name() { ...; }`).
+    Function,
+    /// A builtin (special or regular alike — `type`/`command` don't need
+    /// to distinguish the two).
+    Builtin,
+    /// An external command found on `PATH` (or, if `name` itself
+    /// contained a `/`, at that exact path) — carries the resolved path
+    /// exactly as `type`/`command -v` print it.
+    External(String),
+    /// Nothing by that name resolves at all.
+    NotFound,
+}
+
+/// Resolves `name` the same way [`exec_simple`] would actually run it —
+/// see [`CommandResolution`]'s own docs.
+#[must_use]
+pub fn resolve_command(shell: &Shell, name: &str) -> CommandResolution {
+    if shell.functions.contains_key(name) {
+        return CommandResolution::Function;
+    }
+    if shell.builtin(name).is_some() {
+        return CommandResolution::Builtin;
+    }
+    match find_in_path(shell, name) {
+        Some(path) => CommandResolution::External(path),
+        None => CommandResolution::NotFound,
+    }
+}
+
+/// Searches `shell`'s `PATH` for an executable file named `name`,
+/// returning its resolved path — the `PATH`-search half of command
+/// resolution POSIX 2.9.1.1 describes, and the one piece of that
+/// resolution `exec_external`'s own spawn doesn't need to do itself
+/// (`std::process::Command::new` already performs the equivalent search
+/// internally, via `execvp`-shaped behavior, using the child's own
+/// environment) — this exists purely for `type`/`command -v`
+/// (`conch-shell-builtins`), which need to *report* the resolved path
+/// without actually running anything.
+///
+/// A `name` containing a `/` is never searched for on `PATH` at all
+/// (POSIX 2.9.1.1: "If the command name contains a <slash>, ... a
+/// pathname search shall not be performed") — it's checked directly, and
+/// only that one path is ever returned.
+#[must_use]
+pub fn find_in_path(shell: &Shell, name: &str) -> Option<String> {
+    if name.contains('/') {
+        return is_executable_file(std::path::Path::new(name)).then(|| name.to_string());
+    }
+    let path_var = shell.get_var("PATH").unwrap_or("");
+    for dir in path_var.split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let candidate = std::path::Path::new(dir).join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Whether `path` is a regular file with at least one executable bit
+/// set — POSIX's own definition of a `PATH`-search match (2.9.1.1: "the
+/// utility shall be searched for using the value of PATH ... an
+/// executable file"), not merely a file that exists.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+// ---- umask ----------------------------------------------------------------
+
+/// The process's current umask (POSIX permission-bits form, e.g. `0o022`)
+/// — the `umask` builtin (`conch-shell-builtins`)'s read half. There's no
+/// syscall that only *reads* the umask without also setting it
+/// (`umask(2)` always both sets a new value and returns the old one), so
+/// this uses the standard read-old/write-back-immediately trick: briefly
+/// set it to an arbitrary value, capture what it was, then restore that
+/// exact value — no window where some *other* thread's file creation
+/// could observe the wrong mask matters here (this crate's real
+/// execution model is single-threaded — see e.g.
+/// `Shell::reap_children`'s own docs making the same assumption
+/// explicit), so this is safe in practice despite looking racy in
+/// isolation.
+#[must_use]
+pub fn current_umask() -> u32 {
+    let previous = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o777));
+    nix::sys::stat::umask(previous);
+    u32::from(previous.bits())
+}
+
+/// Sets the process's umask to `mask` (only the low 9 permission bits are
+/// meaningful — matching real bash silently truncating a wider value the
+/// same way) — the `umask` builtin's write half.
+pub fn set_umask(mask: u32) {
+    let bits = u16::try_from(mask & 0o777).unwrap_or(0o777);
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(bits));
+}
+
+// ---- file-permission checks: shared by the `test`/`[` builtin -------------
+
+/// Whether the *real* process (this shell) has read/write/execute
+/// permission on `path`, per `access(2)`'s own uid/gid-aware semantics —
+/// deliberately not approximated from `std::fs::Metadata`'s raw mode
+/// bits (which say nothing about *this process's* uid/gid relative to the
+/// file's owner/group), and deliberately in `conch-shell-core` rather
+/// than `conch-shell-builtins` (which has no direct `nix` dependency of
+/// its own — see this crate's own module docs) even though the only
+/// caller today is the `test`/`[` builtin's `-r`/`-w`/`-x` unary
+/// operators.
+#[must_use]
+pub fn path_readable(path: &str) -> bool {
+    nix::unistd::access(path, nix::unistd::AccessFlags::R_OK).is_ok()
+}
+
+/// See [`path_readable`]'s docs.
+#[must_use]
+pub fn path_writable(path: &str) -> bool {
+    nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_ok()
+}
+
+/// See [`path_readable`]'s docs.
+#[must_use]
+pub fn path_executable(path: &str) -> bool {
+    nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
 #[cfg(test)]
@@ -1561,6 +1828,7 @@ mod tests {
             &self,
             _shell: &mut Shell,
             _args: &[String],
+            _stdin: &mut dyn std::io::Read,
             _stdout: &mut dyn std::io::Write,
             _stderr: &mut dyn std::io::Write,
         ) -> i32 {
@@ -1644,6 +1912,102 @@ mod tests {
         assert_eq!(run("while false; do false; done", &mut shell), 0);
     }
 
+    // ---- set -e (errexit) ---------------------------------------------------
+    //
+    // A failing command with `errexit` actually enabled calls
+    // `std::process::exit` directly, which would abort this entire test
+    // binary (Rust unit tests share one process) -- so, matching this
+    // module's own existing precedent for `report_expand_error`'s
+    // identically-shaped fatal path (never unit-tested for the actual
+    // process exit either, only for the value that would trigger it),
+    // these tests only ever exercise the *suppression* paths: if the
+    // suppression logic below is correct, none of them ever reach the
+    // `std::process::exit` call at all, so the test process surviving
+    // normally *is* the assertion. A real end-to-end "does it actually
+    // exit" check belongs in `tests/conch-difftest`, against the real
+    // compiled binary in its own process, not here.
+
+    #[test]
+    fn errexit_does_not_trigger_for_a_failing_if_condition() {
+        let mut shell = Shell::new();
+        shell.errexit = true;
+        assert_eq!(run("if false; then :; fi", &mut shell), 0);
+    }
+
+    #[test]
+    fn errexit_does_not_trigger_for_a_failing_while_condition() {
+        let mut shell = Shell::new();
+        shell.errexit = true;
+        assert_eq!(run("while false; do :; done", &mut shell), 0);
+    }
+
+    #[test]
+    fn errexit_suppression_resets_after_the_condition_finishes() {
+        // Once the loop's *condition* stops being evaluated, an ordinary
+        // failing command in the *body* must still be free to trigger
+        // errexit normally -- this only confirms `errexit_suppressed`
+        // doesn't leak past the condition it was scoped to (the run
+        // itself never reaches a failing body command, so this can't
+        // actually crash the test binary either way).
+        let mut shell = Shell::new();
+        assert_eq!(shell.errexit_suppressed, 0);
+        run("if true; then :; fi", &mut shell);
+        assert_eq!(shell.errexit_suppressed, 0);
+    }
+
+    // ---- set -x (xtrace) -----------------------------------------------------
+    //
+    // The trace line itself goes straight to the real process stderr
+    // (`eprintln!`), not through any capturable writer this module's own
+    // tests already have a handle on -- so, like `run_foreground_job`'s
+    // own diagnostics, this only confirms xtrace doesn't change
+    // behavior/exit status, not the exact printed text.
+
+    #[test]
+    fn xtrace_does_not_change_exit_status_or_behavior() {
+        let mut shell = Shell::new();
+        shell.xtrace = true;
+        assert_eq!(run("true", &mut shell), 0);
+        assert_eq!(run("false", &mut shell), 1);
+    }
+
+    // ---- set -C (noclobber) ---------------------------------------------------
+
+    #[test]
+    fn noclobber_refuses_to_overwrite_an_existing_file_via_output_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "first\n").unwrap();
+        let mut shell = Shell::new();
+        shell.noclobber = true;
+        let script = format!("echo second > {}", path.display());
+        run(&script, &mut shell);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+    }
+
+    #[test]
+    fn without_noclobber_the_same_redirect_overwrites_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "first\n").unwrap();
+        let mut shell = Shell::new();
+        let script = format!("echo second > {}", path.display());
+        run(&script, &mut shell);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+    }
+
+    #[test]
+    fn noclobber_does_not_affect_append_redirects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "first\n").unwrap();
+        let mut shell = Shell::new();
+        shell.noclobber = true;
+        let script = format!("echo second >> {}", path.display());
+        run(&script, &mut shell);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+    }
+
     // ---- subshell / brace group isolation -----------------------------------
     //
     // Subshell *execution* (isolation of cwd/variables/exit, exit-status
@@ -1682,6 +2046,7 @@ mod tests {
             &self,
             shell: &mut Shell,
             _args: &[String],
+            _stdin: &mut dyn std::io::Read,
             _stdout: &mut dyn std::io::Write,
             _stderr: &mut dyn std::io::Write,
         ) -> i32 {
@@ -1696,6 +2061,7 @@ mod tests {
             &self,
             shell: &mut Shell,
             _args: &[String],
+            _stdin: &mut dyn std::io::Read,
             _stdout: &mut dyn std::io::Write,
             _stderr: &mut dyn std::io::Write,
         ) -> i32 {
@@ -1835,6 +2201,7 @@ mod tests {
                 &self,
                 _shell: &mut Shell,
                 _args: &[String],
+                _stdin: &mut dyn std::io::Read,
                 _stdout: &mut dyn std::io::Write,
                 _stderr: &mut dyn std::io::Write,
             ) -> i32 {
@@ -1892,6 +2259,7 @@ mod tests {
             &self,
             shell: &mut Shell,
             _args: &[String],
+            _stdin: &mut dyn std::io::Read,
             _stdout: &mut dyn std::io::Write,
             _stderr: &mut dyn std::io::Write,
         ) -> i32 {
@@ -1944,6 +2312,7 @@ mod tests {
             &self,
             shell: &mut Shell,
             _args: &[String],
+            _stdin: &mut dyn std::io::Read,
             _stdout: &mut dyn std::io::Write,
             _stderr: &mut dyn std::io::Write,
         ) -> i32 {

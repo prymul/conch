@@ -100,6 +100,12 @@ pub enum ExpandError {
     /// `name: message` style.
     #[error("{0}")]
     ParameterNullOrUnset(String),
+    /// `set -u` (nounset) triggered: a plain, unguarded reference to an
+    /// unset parameter — see [`crate::Shell::nounset`]'s own docs for why
+    /// this is treated the same fatal-in-non-interactive-mode way as
+    /// [`Self::ParameterNullOrUnset`].
+    #[error("{0}: unbound variable")]
+    UnboundVariable(String),
     /// `${parameter:=word}` / `${parameter=word}` tried to assign to a
     /// positional or special parameter — POSIX explicitly disallows
     /// assigning to either this way.
@@ -168,9 +174,10 @@ pub fn expand_word_single(word: &Word, shell: &mut Shell) -> Result<String, Expa
 pub fn expand_word_fields(word: &Word, shell: &mut Shell) -> Result<Vec<String>, ExpandError> {
     let segments = expand_to_segments(word, shell)?;
     let fields = split_fields(segments, &ifs(shell));
+    let noglob = shell.noglob;
     fields
         .into_iter()
-        .map(|field| glob_field(field, &shell.cwd))
+        .map(|field| glob_field(field, &shell.cwd, noglob))
         .collect::<Result<Vec<Vec<String>>, ExpandError>>()
         .map(|matches| matches.into_iter().flatten().collect())
 }
@@ -371,6 +378,21 @@ fn expand_segment(
             Ok(())
         }
         WordSegment::Parameter(param) => {
+            // `set -u` (nounset) — a plain, unguarded reference to an
+            // unset parameter is a fatal expansion error (see
+            // `Shell::nounset`'s own docs for why this is fatal, unlike
+            // most other special-builtin-adjacent errors this phase
+            // otherwise treats as non-fatal). Deliberately checked only
+            // here, in the plain-reference arm — not inside
+            // `expand_parameter` itself, which every parameter-expansion
+            // *operator* (`${var:-default}` and siblings, via
+            // `evaluate_parameter_expansion`'s own `current`) also calls
+            // unconditionally to see what it's working with; those
+            // operators' whole purpose is handling an unset parameter
+            // gracefully, so nounset must never fire for them.
+            if shell.nounset && !is_parameter_set(param, shell) {
+                return Err(ExpandError::UnboundVariable(describe_parameter(param)));
+            }
             out.push(Segment {
                 text: expand_parameter(param, shell),
                 glob_eligible: true,
@@ -1162,12 +1184,15 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
 /// returns the field's literal text unchanged (POSIX default behavior —
 /// no match means the pattern stands for itself, not an error and not an
 /// empty result).
-fn glob_field(field: Vec<Segment>, cwd: &Path) -> Result<Vec<String>, ExpandError> {
-    let has_unquoted_meta = field
-        .iter()
-        .any(|s| s.glob_eligible && s.text.chars().any(|c| matches!(c, '*' | '?' | '[')));
+fn glob_field(field: Vec<Segment>, cwd: &Path, noglob: bool) -> Result<Vec<String>, ExpandError> {
+    let has_unquoted_meta = !noglob
+        && field
+            .iter()
+            .any(|s| s.glob_eligible && s.text.chars().any(|c| matches!(c, '*' | '?' | '[')));
 
-    // No real wildcard anywhere in this field: skip pattern-building
+    // No real wildcard anywhere in this field (or `set -f`/`noglob` is
+    // active, which is treated exactly like "no wildcard" — see this
+    // function's own `noglob` parameter): skip pattern-building
     // entirely and just concatenate the raw text. Building an escaped
     // glob pattern here (and then un-escaping it back) only for this
     // branch to throw the escaping away is both pointless and exactly
@@ -1957,5 +1982,62 @@ mod tests {
 
         set_positional(&mut shell, &["a", "b"]);
         assert_eq!(single("${@-fallback}", &mut shell), "a b");
+    }
+
+    // ---- set -u (nounset) ---------------------------------------------------
+
+    #[test]
+    fn nounset_errors_on_a_plain_reference_to_an_unset_variable() {
+        let mut shell = Shell::new();
+        shell.nounset = true;
+        let err = single_err("$UNSET_VAR", &mut shell);
+        assert_eq!(err, ExpandError::UnboundVariable("UNSET_VAR".to_string()));
+    }
+
+    #[test]
+    fn nounset_does_not_error_on_a_set_variable() {
+        let mut shell = Shell::new();
+        shell.nounset = true;
+        shell.shell_vars.insert("X".to_string(), "1".to_string());
+        assert_eq!(single("$X", &mut shell), "1");
+    }
+
+    #[test]
+    fn nounset_never_fires_for_operators_that_handle_unset_themselves() {
+        // `${var:-default}` and siblings exist specifically to handle an
+        // unset parameter gracefully -- `set -u` must never turn *that*
+        // into an error just because the operator's own `current` lookup
+        // (`expand_parameter`) sees the same "not found" state a plain
+        // `$var` reference would.
+        let mut shell = Shell::new();
+        shell.nounset = true;
+        assert_eq!(single("${UNSET_VAR:-fallback}", &mut shell), "fallback");
+    }
+
+    #[test]
+    fn nounset_off_by_default_leaves_an_unset_reference_as_empty() {
+        let mut shell = Shell::new();
+        assert_eq!(single("$UNSET_VAR", &mut shell), "");
+    }
+
+    // ---- set -f (noglob) ------------------------------------------------------
+
+    #[test]
+    fn noglob_leaves_a_glob_pattern_completely_unexpanded() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        shell.noglob = true;
+        assert_eq!(fields("*.txt", &mut shell), vec!["*.txt".to_string()]);
+    }
+
+    #[test]
+    fn without_noglob_the_same_pattern_still_expands() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        assert_eq!(fields("*.txt", &mut shell), vec!["a.txt".to_string()]);
     }
 }

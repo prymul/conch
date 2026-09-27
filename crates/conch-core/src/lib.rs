@@ -7,7 +7,11 @@ mod job;
 mod signals;
 
 pub use brace::brace_expand;
-pub use exec::{exec_command_list, exec_program, resume_job_in_foreground};
+pub use exec::{
+    CommandResolution, current_umask, exec_command_list, exec_program, find_in_path,
+    path_executable, path_readable, path_writable, resolve_command, resume_job_in_foreground,
+    set_umask,
+};
 pub use expand::{ExpandError, expand_word_fields, expand_word_single};
 pub use job::{Job, JobState, JobTable};
 pub use signals::TrapAction;
@@ -73,7 +77,7 @@ pub enum ControlFlow {
 
 use std::collections::HashMap;
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Mutable state for one shell session.
@@ -152,14 +156,197 @@ pub struct Shell {
     pub functions: HashMap<String, conch_shell_parser::FunctionDefinition>,
     /// How many function calls are currently on the call stack — `return`
     /// (`conch-shell-builtins`) only makes sense with this `> 0` (POSIX:
-    /// outside a function — or a sourced script, which conch doesn't
-    /// implement yet — `return` is an error; confirmed against real bash
-    /// this doesn't just silently no-op the way `break`/`continue` do
-    /// outside a loop, unlike those it returns a genuine nonzero exit
-    /// status). Incremented/decremented by
+    /// outside a function or a sourced script, `return` is an error;
+    /// confirmed against real bash this doesn't just silently no-op the
+    /// way `break`/`continue` do outside a loop, unlike those it returns
+    /// a genuine nonzero exit status). Incremented/decremented by
     /// `conch-shell-core::exec::exec_function_call`, exactly mirroring
-    /// [`Self::loop_depth`]'s own convention.
+    /// [`Self::loop_depth`]'s own convention. See [`Self::source_depth`]
+    /// for the sibling counter that makes `return` *also* valid inside a
+    /// sourced script with no enclosing function at all, and
+    /// [`Self::in_return_scope`] for the single check `return` actually
+    /// uses (both counters, not just this one).
     pub function_depth: u32,
+    /// How many `.`/`source` invocations are currently on the call stack
+    /// — the `.`/`source` builtin (`conch-shell-builtins`)'s own sibling
+    /// of [`Self::function_depth`], for the same "`return` is valid here"
+    /// reason (POSIX: `return` is explicitly valid inside a sourced
+    /// script too, not just a function call — see [`Self::in_return_scope`]).
+    /// Deliberately *not* folded into `function_depth` itself: unlike a
+    /// function call, a sourced script is **not** its own `break`/
+    /// `continue` boundary (POSIX: `.` runs "in the current execution
+    /// environment," so a `break` inside a sourced file correctly
+    /// escapes to whatever loop already enclosed the `. file` call
+    /// itself, exactly as if that file's text had been pasted in place)
+    /// — `conch-shell-core::exec`'s own `.`/`source` execution
+    /// deliberately never resets [`Self::loop_depth`] the way
+    /// `exec_function_call` does, which only works because this is a
+    /// wholly separate counter `take_loop_control_flow` never looks at.
+    pub source_depth: u32,
+    /// The `getopts` builtin (`conch-shell-builtins`)'s own persisted
+    /// scan state — POSIX's `getopts` needs to resume parsing *partway
+    /// through* an argument across separate invocations (bundled short
+    /// options like `-abc` are consumed one character per call, without
+    /// advancing `OPTIND` until the whole argument is exhausted), which
+    /// needs somewhere to live between calls beyond the `OPTIND` shell
+    /// variable itself (a plain 1-based argument index has no room to
+    /// also encode "and this many characters into it"). `sub_index` is
+    /// that within-argument character offset (1-based, so `1` means
+    /// "just after the leading `-`" — i.e. a fresh argument);
+    /// `last_optind` is the `OPTIND` value `getopts` itself most recently
+    /// set, used to detect whether the *user* changed `OPTIND` by hand
+    /// since the last call (the conventional way to restart option
+    /// parsing, e.g. `OPTIND=1` to re-scan `$@`) — when it doesn't match
+    /// what's currently stored in the `OPTIND` shell variable, `getopts`
+    /// resets `sub_index` back to `1` rather than trying to resume a
+    /// scan mid-argument that may not even be the same argument anymore.
+    ///
+    /// Known narrow gap (confirmed against real bash, not assumed):
+    /// resetting `OPTIND` by hand to *the exact same numeric value*
+    /// `getopts` already left it at — specifically while mid-scan
+    /// through a bundled-option argument like `-abc` — restarts scanning
+    /// from the beginning of that argument in real bash but does *not*
+    /// here, since this can only detect a *different* value, not the
+    /// fact that an assignment happened at all (real bash apparently
+    /// tracks the assignment event itself, not just `OPTIND`'s resulting
+    /// value, which would need a generic "was this shell variable
+    /// written to since I last read it" flag this crate's plain
+    /// `HashMap`-based variable storage has no room for). The ordinary,
+    /// overwhelmingly common reset idiom — `OPTIND=1` issued *after* a
+    /// `getopts` loop has already finished, when `OPTIND` is genuinely
+    /// different from `1` — works correctly.
+    pub getopts_sub_index: usize,
+    pub getopts_last_optind: Option<i64>,
+    /// How many `eval` calls are currently on the call stack — the
+    /// `eval` builtin (`conch-shell-builtins`)'s own recursion guard.
+    /// `eval` deliberately introduces *no* execution boundary at all
+    /// (unlike a function call/`.`/subshell — see that builtin's own
+    /// docs for the full "why"): a self-referential `eval` (`x='eval
+    /// $x'; eval "$x"`) has no natural place to stop other than a real
+    /// Rust stack overflow without an explicit counter like this one —
+    /// the same "turn a runaway-recursion mechanism into a clean error
+    /// instead of a crash" precedent [`crate::expand`]'s own
+    /// `MAX_ARITH_RECURSION` already established for a self-referential
+    /// arithmetic variable, applied here for the identical reason.
+    pub eval_depth: u32,
+    /// `set -e`/`set +e` (`errexit`, bash manual §4.3.1 / POSIX 2.14) —
+    /// the `set` builtin (`conch-shell-builtins`)'s own flag, enforced by
+    /// `conch-shell-core::exec::exec_command_list` after each top-level
+    /// `and_or` list item: if it exits nonzero (and isn't itself being
+    /// tested — see [`Self::errexit_suppressed`]), the shell exits with
+    /// that same status (running the `EXIT` trap first, same as any
+    /// other termination path).
+    ///
+    /// Known simplification: POSIX's own `errexit` exemption list is
+    /// broader than what's implemented here. What *is* exempt, for free,
+    /// by this checkpoint's own placement: a pipeline stage other than
+    /// the last (only the last stage's status ever reaches this check at
+    /// all — matching bash's *default*, non-`pipefail` behavior), and
+    /// any command that's part of an `&&`/`||` chain other than the
+    /// chain's own final, fully-resolved result (`exec_and_or` only ever
+    /// returns *after* short-circuit evaluation finishes, so an
+    /// internal failure never reaches this checkpoint as its own
+    /// separate item). What needs the explicit
+    /// `Self::errexit_suppressed` guard instead: a command whose status
+    /// is being tested by `if`/`while`/`until` — without it, `set -e; if
+    /// grep -q foo file; then ...; fi` would exit the whole shell the
+    /// *first* time `grep` found no match, which would make `errexit`
+    /// incompatible with the most common `if`-with-a-failing-condition
+    /// idiom entirely, not just imprecise. Not exempted at all (a real,
+    /// acknowledged gap, not silently claimed correct): a pipeline
+    /// negated with `!` — moot for now since `!` itself isn't in this
+    /// parser's grammar scope yet (see `conch-shell-parser`'s own docs);
+    /// this will need the same suppression treatment once it lands.
+    pub errexit: bool,
+    /// How many `if`/`while`/`until` *condition* evaluations are
+    /// currently in progress — see [`Self::errexit`]'s own docs for why
+    /// this exists. Incremented/decremented by `conch-shell-core::exec`
+    /// around (only) a condition-list's own execution, never a loop/`if`
+    /// body's — mirrors [`Self::loop_depth`]'s counter-not-boolean shape
+    /// so nested conditions (`if grep -q x a && grep -q y b; then`,
+    /// where the condition itself is a whole `and_or` list, or a
+    /// `while`-condition lexically containing another `if`) compose
+    /// correctly without one exiting early un-suppressing what an outer
+    /// one still needs suppressed.
+    pub errexit_suppressed: u32,
+    /// `set -x`/`set +x` (`xtrace`, bash manual §4.3.1 / POSIX 2.14) —
+    /// prints each simple command to stderr immediately before running
+    /// it (`+ name arg1 arg2`, bash's own default `PS4` prefix; this
+    /// doesn't implement a configurable `PS4` at all, a documented,
+    /// narrower-scope gap), after expansion so the *actual* command/args
+    /// are shown, not the unexpanded source text.
+    pub xtrace: bool,
+    /// `set -f`/`set +f` (`noglob`, POSIX 2.14) — disables pathname
+    /// expansion (globbing) entirely while set: a glob metacharacter in
+    /// an unquoted word stands for itself, literally, exactly as if
+    /// nothing in the current directory ever matched it. Checked in
+    /// `conch-shell-core::expand`'s own field-expansion path, immediately
+    /// before it would otherwise attempt to glob a field at all.
+    pub noglob: bool,
+    /// `set -C`/`set +C` (`noclobber`, bash manual §4.3.1 — a bash
+    /// extension, not POSIX baseline `set`) — a plain `>` redirection
+    /// (not `>>`, and not `>|`, which explicitly overrides this even
+    /// when set — `>|` isn't implemented in this parser's redirect
+    /// grammar yet, so that override has no way to be reached regardless)
+    /// refuses to overwrite a file that already exists, rather than
+    /// silently truncating it. Checked in `conch-shell-core::exec`,
+    /// immediately before opening an output-redirect target for both a
+    /// builtin's and an external command's own redirect handling.
+    pub noclobber: bool,
+    /// `set -u`/`set +u` (`nounset`, bash manual §4.3.1 / POSIX 2.14) —
+    /// referencing an unset parameter in a plain (unguarded) expansion
+    /// becomes a fatal expansion error rather than silently expanding to
+    /// an empty string. Deliberately triggers the *same*
+    /// fatal-in-non-interactive-shell path `${parameter:?word}` already
+    /// does (`conch-shell-core::exec`'s `report_expand_error`) — despite
+    /// `set -u` being a "special builtin's own flag" on its face, this
+    /// specific violation is confirmed (directly against real bash, not
+    /// assumed) to abort the whole non-interactive shell exactly like
+    /// `${var:?}` does, *not* the more lenient "report and keep going"
+    /// treatment this same project gives an ordinary special-builtin
+    /// command error (`unset`/`eval`/etc.) elsewhere in this phase — the
+    /// two look similar but are governed by different POSIX rules
+    /// (2.6.2's fatal-unset-expansion class, vs. 2.9.1's special-builtin-
+    /// error class, which POSIX only ever makes fatality *optional* for
+    /// and this project deliberately doesn't take bash further than bash
+    /// itself does).
+    pub nounset: bool,
+    /// `alias`/`unalias` (bash extension, not POSIX) — name → replacement
+    /// text, consulted by `conch_shell_parser::parse_with_aliases` (see
+    /// that function's own docs for the full expansion algorithm and its
+    /// one documented gap). Bare storage only; this field itself doesn't
+    /// decide *whether* aliasing is active for a given parse — see
+    /// `conch`'s own binary crate for the interactive-only policy
+    /// decision (real bash's own default: aliases expand in interactive
+    /// shells only, never in `-c`/script-file/`eval`/`.`-sourced text).
+    pub aliases: HashMap<String, String>,
+    /// `readonly name[=value]` / `declare -r` (POSIX 2.9.1 special
+    /// builtin `readonly`) — names a subsequent plain assignment must
+    /// reject. Checked only at the one assignment site the differential
+    /// corpus actually exercises (a bare `name=value` simple command,
+    /// `conch-shell-core::exec::exec_simple`'s own no-command-name
+    /// branch) — a *prefix* assignment (`name=value cmd`) isn't checked
+    /// against this yet, a narrower, documented scope decision rather
+    /// than an oversight, given the temporary/per-call nature of a
+    /// prefix assignment makes it a meaningfully rarer way to violate
+    /// `readonly` in practice.
+    ///
+    /// A rejected reassignment is reported and non-fatal (matching real
+    /// bash's own default over dash's stricter one — the same
+    /// established "match bash, not merely-POSIX-permitted dash"
+    /// precedent as `eval`'s syntax-error handling): the script
+    /// continues to whatever comes after it. Confirmed against real bash
+    /// this is only an *approximation* of one genuine subtlety: bash
+    /// aborts the rest of the *same source line* specifically (so `readonly
+    /// x=5; x=6; echo "still:$x"` on one semicolon-joined line prints
+    /// nothing at all, while the identical three commands split across
+    /// separate lines print `still:5`) — this crate parses a whole
+    /// input in one pass with no physical-line boundary preserved
+    /// anywhere in the resulting `CommandList` to replicate that
+    /// distinction with, so this always takes the "separate lines"
+    /// behavior (report, keep going) regardless of how the source was
+    /// actually laid out.
+    pub readonly_vars: std::collections::HashSet<String>,
     /// One frame per currently-active function call (pushed on entry,
     /// popped on return — `conch-shell-core::exec::exec_function_call`),
     /// each holding the `(name, previous binding)` pairs the `local`
@@ -363,6 +550,18 @@ impl Shell {
             positional_params: Vec::new(),
             functions: HashMap::new(),
             function_depth: 0,
+            source_depth: 0,
+            getopts_sub_index: 1,
+            getopts_last_optind: None,
+            eval_depth: 0,
+            errexit: false,
+            errexit_suppressed: 0,
+            xtrace: false,
+            noglob: false,
+            noclobber: false,
+            nounset: false,
+            aliases: HashMap::new(),
+            readonly_vars: std::collections::HashSet::new(),
             local_stack: Vec::new(),
             builtins: HashMap::new(),
             special_builtins: std::collections::HashSet::new(),
@@ -515,10 +714,24 @@ impl Shell {
     }
 
     /// Whether a `local` declaration is currently valid (POSIX/bash:
-    /// `local` — like `return` — is only meaningful inside a function
-    /// call).
+    /// `local` is only meaningful inside a function call — deliberately
+    /// *not* also true merely because a `.`/source call is active, unlike
+    /// [`Self::in_return_scope`]; confirmed against real bash `local`
+    /// used inside a sourced script with no enclosing function is still
+    /// the same "can only be used in a function" error, even though
+    /// `return` there is valid).
     pub fn in_function_call(&self) -> bool {
         !self.local_stack.is_empty()
+    }
+
+    /// Whether a `return` is currently valid — POSIX: inside a function
+    /// call ([`Self::in_function_call`]) *or* a `.`/`source` invocation
+    /// ([`Self::source_depth`]), unlike [`Self::in_function_call`] alone
+    /// (which `local` uses instead — see that method's own docs for why
+    /// the two deliberately check different things).
+    #[must_use]
+    pub fn in_return_scope(&self) -> bool {
+        self.in_function_call() || self.source_depth > 0
     }
 
     /// Pops the innermost function call's `local` restore-list frame and
@@ -549,11 +762,23 @@ impl Default for Shell {
 /// program — `cd`, `exit`, `export`, and similar commands that must
 /// mutate the shell's own state.
 ///
-/// `stdout`/`stderr` are passed explicitly (rather than the builtin
-/// writing to the real process streams directly) so that redirecting a
-/// builtin's output (`echo hi > file`) works the same way it does for an
-/// external command, and so builtins are testable against an in-memory
-/// buffer instead of asserting on real stdout.
+/// `stdin`/`stdout`/`stderr` are passed explicitly (rather than the
+/// builtin reading/writing the real process streams directly) so that
+/// redirecting a builtin's I/O (`read x < file`, `echo hi > file`, `cmd |
+/// read x`) works the same way it does for an external command, and so
+/// builtins are testable against in-memory buffers instead of asserting
+/// on real stdio.
+///
+/// `stdin` is whichever of the following `conch-shell-core::exec`
+/// resolved for this specific invocation, in priority order: an explicit
+/// `<`-style input redirect on the command itself, piped-in bytes from
+/// the previous pipeline stage, or (the common case for an
+/// interactive/script `read`) the real inherited process stdin — see
+/// `exec::exec_builtin`'s own docs for exactly how it picks. Every
+/// builtin except `read` ignores this today (none of the others consume
+/// input), but it's part of the trait itself, not a `read`-specific
+/// side channel, so any future stdin-consuming builtin gets the same
+/// redirect/pipe-aware behavior for free.
 pub trait Builtin {
     /// Runs the builtin with the given arguments (not including the
     /// builtin's own name) and returns its exit status.
@@ -561,6 +786,7 @@ pub trait Builtin {
         &self,
         shell: &mut Shell,
         args: &[String],
+        stdin: &mut dyn Read,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> i32;
@@ -576,6 +802,7 @@ mod tests {
             &self,
             _shell: &mut Shell,
             _args: &[String],
+            _stdin: &mut dyn Read,
             _stdout: &mut dyn Write,
             _stderr: &mut dyn Write,
         ) -> i32 {

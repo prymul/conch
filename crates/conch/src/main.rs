@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use conch_shell_core::{JobState, Shell, exec_program};
-use conch_shell_parser::parse;
+use conch_shell_parser::{parse, parse_with_aliases};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -130,7 +130,15 @@ fn run_interactive(shell: &mut Shell) -> i32 {
                     continue;
                 }
                 let _ = editor.add_history_entry(line.as_str());
-                match parse(&line) {
+                // Alias expansion is an interactive-shell-only bash
+                // extension (real bash's own default) — matching that
+                // here means the interactive prompt loop is the *one*
+                // entry point that uses `parse_with_aliases` at all;
+                // every other one (`-c`, a script file, `eval`,
+                // `.`/`source`) keeps using plain `parse`, which never
+                // consults `Shell::aliases` regardless of what's
+                // defined.
+                match parse_with_aliases(&line, &shell.aliases) {
                     Ok(list) => {
                         shell.last_status = exec_program(&list, shell);
                     }

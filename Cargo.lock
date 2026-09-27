@@ -53,6 +53,8 @@ name = "conch-shell-builtins"
 version = "0.2.0"
 dependencies = [
  "conch-shell-core",
+ "conch-shell-parser",
+ "tempfile",
 ]
 
 [[package]]

@@ -195,7 +195,25 @@ impl Shell {
     pub fn init_signal_handling(&mut self) {
         match pipe() {
             Ok((read, write)) => {
-                if let Err(err) = set_nonblocking(&read).and_then(|()| set_nonblocking(&write)) {
+                // `O_NONBLOCK` (see the module docs) *and* `FD_CLOEXEC`
+                // on both ends — caught by a security review (CWE-403):
+                // without `FD_CLOEXEC`, every external command this
+                // shell has ever spawned since Phase 4 landed silently
+                // inherited both ends of this pipe (`Command::spawn`
+                // only sweep-closes fds *it* opened, never arbitrary
+                // pre-existing ones like this pair) — low practical
+                // severity on its own (the pipe carries no meaningful
+                // data), but directly wrong for the `exec` builtin
+                // specifically: replacing the process image via `execve`
+                // has no `pre_exec` hook to close it by hand the way an
+                // ordinary spawn's fd-reset closure does, so
+                // `FD_CLOEXEC` is the *only* thing that can shed it
+                // there.
+                if let Err(err) = set_nonblocking(&read)
+                    .and_then(|()| set_nonblocking(&write))
+                    .and_then(|()| set_cloexec(&read))
+                    .and_then(|()| set_cloexec(&write))
+                {
                     eprintln!("conch: warning: signal self-pipe setup failed: {err}");
                 }
                 // The write end's raw fd is published to `handle_signal`
@@ -545,7 +563,7 @@ impl Shell {
     /// A bash-shaped message if `spec` isn't a recognized signal
     /// name/number or `EXIT`.
     pub fn trap_set_by_name(&mut self, spec: &str, action: TrapAction) -> Result<(), String> {
-        let signal = parse_signal_spec(spec)?;
+        let signal = parse_signal_spec(spec).map_err(|err| format!("trap: {err}"))?;
         self.set_trap(signal, action);
         Ok(())
     }
@@ -560,7 +578,7 @@ impl Shell {
     ///
     /// See [`Self::trap_set_by_name`].
     pub fn trap_describe_by_name(&self, spec: &str) -> Result<Option<String>, String> {
-        let signal = parse_signal_spec(spec)?;
+        let signal = parse_signal_spec(spec).map_err(|err| format!("trap: {err}"))?;
         let action = match signal {
             None => self.exit_trap.clone().map(TrapAction::Command),
             Some(signal) => self.traps.get(&signal).cloned(),
@@ -587,6 +605,99 @@ impl Shell {
             ));
         }
         lines
+    }
+
+    /// `kill`'s core mechanic (`conch-shell-builtins`) — see that
+    /// builtin's own docs for the `-s`/`-SIGNAME`/`-N`/target argument
+    /// parsing this expects already separated out. `target` starting
+    /// with `%` resolves through the exact same job-table machinery
+    /// `fg`/`bg` already use ([`crate::JobTable::resolve_spec`]/
+    /// [`Self::signal_job`] — process-group-targeted, never a bare
+    /// remembered PID, per `job`'s own module docs on why); anything
+    /// else is parsed as a raw PID and signaled directly via `kill(2)`,
+    /// since it was never one of this shell's own tracked jobs to begin
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// A bash-shaped message if `signal_name` isn't recognized, `target`
+    /// doesn't resolve to a known job or parse as a PID, or the
+    /// underlying `kill`/`killpg` call itself failed (most commonly:
+    /// no such process).
+    pub fn kill_by_spec(&self, target: &str, signal_name: &str) -> Result<(), String> {
+        // Signal `0` (`kill -0`/`kill -s 0`) is `kill(2)`'s own special
+        // "send nothing at all, just check whether the target could be
+        // signaled" form — confirmed a real, load-bearing case (not a
+        // theoretical one) by a strict-mode differential regression this
+        // exact special-casing fixes: `kill -0 $pid` is the standard
+        // idiom for "is this job still running?" (see
+        // `corpus/phase4/jobs_status.toml`'s own `kill -0`-based case),
+        // and before this crate registered its own `kill` builtin at
+        // all, that idiom fell through to the real external `kill(1)`
+        // utility, which already handles `0` correctly — this needs the
+        // identical special case to keep matching now that it's
+        // shadowed. `0` is deliberately *not* routed through
+        // `parse_signal_spec` at all: that function treats a bare `"0"`
+        // as an ordinary (invalid) signal *number* to resolve via
+        // `Signal::try_from`, which correctly fails for `0` (there is no
+        // `Signal` variant numbered zero) — exactly wrong for this case.
+        let signal: Option<nix::sys::signal::Signal> = if signal_name == "0" {
+            None
+        } else {
+            match parse_signal_spec(signal_name).map_err(|err| format!("kill: {err}"))? {
+                Some(signal) => Some(signal),
+                None => return Err(format!("kill: {signal_name}: EXIT is not a signal")),
+            }
+        };
+        if target.starts_with('%') {
+            let id = self
+                .job_table
+                .resolve_spec(Some(target))
+                .map_err(|err| format!("kill: {err}"))?;
+            return self
+                .signal_job(id, signal)
+                .map_err(|err| format!("kill: ({target}) - {err}"));
+        }
+        let pid = target
+            .parse::<i32>()
+            .map_err(|_| format!("kill: {target}: arguments must be process or job IDs"))?;
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal)
+            .map_err(|err| format!("kill: ({target}) - {err}"))
+    }
+
+    /// `kill -l [spec]` (`conch-shell-builtins`) — translates one signal
+    /// spec to its bash-style bare name (no `SIG` prefix — e.g. `9` or
+    /// `KILL` both describe to `"KILL"`) or, for a number outside the
+    /// ordinary signal range that looks like a `128+n` exit status
+    /// (POSIX/bash's own convention for "killed by signal `n`" — see
+    /// `conch-shell-core::exec`'s own `exit_code_of` docs for the same
+    /// convention applied elsewhere), the name for signal `n`.
+    ///
+    /// # Errors
+    ///
+    /// A bash-shaped message if `spec` isn't recognized at all, even
+    /// after the `128+n` adjustment.
+    pub fn describe_signal(spec: &str) -> Result<String, String> {
+        if let Ok(number) = spec.parse::<i32>()
+            && number > 128
+            && let Ok(signal) = Signal::try_from(number - 128)
+        {
+            return Ok(signal.as_ref().trim_start_matches("SIG").to_string());
+        }
+        parse_signal_spec(spec)
+            .map_err(|err| format!("kill: {err}"))?
+            .map(|signal| signal.as_ref().trim_start_matches("SIG").to_string())
+            .ok_or_else(|| format!("kill: {spec}: EXIT is not a signal"))
+    }
+
+    /// `kill -l` with no operand — every signal this platform defines,
+    /// bare-named (no `SIG` prefix), in signal-number order, matching
+    /// real bash's own `-l` listing.
+    #[must_use]
+    pub fn all_signal_names() -> Vec<String> {
+        Signal::iterator()
+            .map(|signal| signal.as_ref().trim_start_matches("SIG").to_string())
+            .collect()
     }
 
     /// Runs the `EXIT` trap, if any, exactly once — the `exit` builtin
@@ -702,11 +813,33 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> nix::Result<()> {
     Errno::result(res).map(drop)
 }
 
+/// Sets `FD_CLOEXEC` on `fd` — added for the self-pipe specifically (see
+/// [`Shell::init_signal_handling`]'s own docs for the CWE-403 this
+/// closes) via `nix::fcntl::fcntl` directly rather than another raw
+/// `nix::libc` call the way [`set_nonblocking`] predates: this crate
+/// already enables `nix`'s `fs` feature (for `sys::stat::umask`/
+/// `unistd::access`, Phase 5's `umask`/`test`/`[` builtins), so the
+/// broader-feature concern that originally justified `set_nonblocking`'s
+/// own raw-`libc` approach no longer applies to a *new* fcntl use here.
+fn set_cloexec<Fd: AsFd>(fd: &Fd) -> nix::Result<()> {
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map(drop)
+}
+
 /// Parses one `trap`-argument-shaped signal spec: a bare number
 /// (`"2"`), a name with or without the `SIG` prefix (`"INT"`/`"SIGINT"`,
 /// case-insensitive — matching real bash accepting either), or `"EXIT"`
 /// (`Ok(None)` — POSIX's one non-signal "condition" `trap` accepts, see
 /// [`Shell::set_trap`]'s own `signal: Option<Signal>` shape).
+///
+/// The error message carries no tool-name prefix of its own (unlike an
+/// earlier version of this function, which hardcoded `trap: `) — both
+/// `trap` and, since Phase 5, `kill` (via [`Shell::kill_by_spec`]) share
+/// this parser, and each prepends its own name; see [`Shell::trap_set_by_name`]/
+/// [`Shell::trap_describe_by_name`] for `trap`'s own prefixing.
 fn parse_signal_spec(spec: &str) -> Result<Option<Signal>, String> {
     if spec.eq_ignore_ascii_case("exit") {
         return Ok(None);
@@ -714,7 +847,7 @@ fn parse_signal_spec(spec: &str) -> Result<Option<Signal>, String> {
     if let Ok(number) = spec.parse::<i32>() {
         return Signal::try_from(number)
             .map(Some)
-            .map_err(|_| format!("trap: {spec}: invalid signal number"));
+            .map_err(|_| format!("{spec}: invalid signal number"));
     }
     let upper = spec.to_ascii_uppercase();
     let full_name = if upper.starts_with("SIG") {
@@ -725,7 +858,7 @@ fn parse_signal_spec(spec: &str) -> Result<Option<Signal>, String> {
     full_name
         .parse::<Signal>()
         .map(Some)
-        .map_err(|_| format!("trap: {spec}: invalid signal specification"))
+        .map_err(|_| format!("{spec}: invalid signal specification"))
 }
 
 /// `trap -p`'s per-entry output shape — see

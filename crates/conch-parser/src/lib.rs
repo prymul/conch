@@ -96,7 +96,7 @@ pub use error::ParseError;
 pub use parameter_expansion::{
     NullMode, ParamExpansionError, ParameterExpansion, ParameterOperator, parse_parameter_expansion,
 };
-pub use parser::parse;
+pub use parser::{parse, parse_with_aliases};
 
 #[cfg(test)]
 mod tests;

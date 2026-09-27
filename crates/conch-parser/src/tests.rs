@@ -1076,3 +1076,111 @@ fn function_definition_can_be_a_pipeline_stage_target() {
         Command::Simple(_)
     ));
 }
+
+// ---- alias expansion ------------------------------------------------------
+
+fn aliases(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn plain_alias_expands_to_a_command_name_and_extra_args() {
+    let table = aliases(&[("ll", "ls -la")]);
+    let list = parse_with_aliases("ll", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-la"]));
+}
+
+#[test]
+fn alias_replacement_combines_with_trailing_arguments_from_the_original_command() {
+    let table = aliases(&[("ll", "ls -la")]);
+    let list = parse_with_aliases("ll /tmp", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-la", "/tmp"]));
+}
+
+#[test]
+fn alias_replacement_can_introduce_a_real_pipe_operator() {
+    let table = aliases(&[("ll", "ls -la | less")]);
+    let list = parse_with_aliases("ll", &table).unwrap();
+    assert_eq!(list.items[0].and_or.first.commands.len(), 2);
+}
+
+#[test]
+fn chained_aliases_expand_through_multiple_levels() {
+    let table = aliases(&[("ll", "la -h"), ("la", "ls -a")]);
+    let list = parse_with_aliases("ll", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-a", "-h"]));
+}
+
+#[test]
+fn self_referential_alias_does_not_infinitely_expand() {
+    // Confirmed against real bash: `alias ls='ls -la'; ls` runs the
+    // *real* `ls` with `-la` appended, rather than looping forever.
+    let table = aliases(&[("ls", "ls -la")]);
+    let list = parse_with_aliases("ls", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-la"]));
+}
+
+#[test]
+fn alias_only_applies_to_an_unquoted_command_word() {
+    // Reuses `Word::as_plain_literal`'s exact quote-awareness -- a
+    // quoted use of a name that happens to match an alias must never
+    // expand, the same way a quoted reserved word never re-triggers
+    // reserved-word recognition.
+    let table = aliases(&[("ll", "ls -la")]);
+    let cmd = parse_one_simple_command_with_aliases("\"ll\"", &table);
+    // Quoted, so `as_plain_literal()` is `None` -- never even eligible
+    // for alias lookup at all, let alone expanded; `args` staying empty
+    // additionally confirms `ls -la` was never spliced in.
+    assert_eq!(cmd.name.as_ref().and_then(Word::as_plain_literal), None);
+    assert!(cmd.args.is_empty());
+}
+
+#[test]
+fn alias_applies_to_every_pipeline_stage_not_just_the_first() {
+    let table = aliases(&[("g", "grep")]);
+    let list = parse_with_aliases("echo hi | g x", &table).unwrap();
+    let Command::Simple(second) = &list.items[0].and_or.first.commands[1] else {
+        unreachable!()
+    };
+    assert_eq!(second.name, Some(plain_word("grep")));
+}
+
+#[test]
+fn an_undefined_name_is_never_touched() {
+    let table = aliases(&[("ll", "ls -la")]);
+    let cmd = parse_one_simple_command_with_aliases("echo ll", &table);
+    // `ll` here is an *argument*, not a command word -- never checked
+    // against the alias table at all, matching how reserved-word
+    // recognition also only ever applies at the command-word position.
+    assert_eq!(cmd.args, plain_words(&["ll"]));
+}
+
+fn parse_one_simple_command_with_aliases(
+    input: &str,
+    table: &std::collections::HashMap<String, String>,
+) -> SimpleCommand {
+    let list = parse_with_aliases(input, table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
+    cmd.clone()
+}
