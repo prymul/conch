@@ -105,9 +105,10 @@ echo "still:$x"
 
 [[case]]
 name = "unset-on-a-readonly-variable-is-non-fatal-on-bash-but-aborts-the-script-on-dash"
-description = "confirmed bash-vs-dash divergence: attempting to unset a readonly variable fails on both shells, but bash treats it as an ordinary non-fatal error and keeps running (printing \"still:5\"), while dash aborts the whole script immediately, even on this same physical line -- a stdout-content difference, so this is bash-only rather than a shared case"
+description = "confirmed bash-vs-dash divergence: attempting to unset a readonly variable fails on both shells, but bash treats it as an ordinary non-fatal error and keeps running (printing \"still:5\"), while dash aborts the whole script immediately, even on this same physical line -- a stdout-content difference, so this is bash-only rather than a shared case. This also checks stderr: bash fully suppresses unset's own diagnostic when it's redirected on the very same command, the same wording-independent guarantee eval-syntax-error-is-non-fatal-on-bash checks (see that case's own note)"
 tags = ["builtins", "unset", "readonly", "cross-shell-quirk"]
 oracles = ["bash"]
+compare = ["stdout", "stderr", "exit-code"]
 script = '''
 readonly x=5; unset x 2>/dev/null; echo "still:$x"
 '''

@@ -1668,6 +1668,41 @@ struct PipelineStdio {
     standalone: bool,
 }
 
+/// Reports one of `exec_external`'s own diagnostics (a redirect target
+/// that couldn't be opened, the command itself not being found, a
+/// `wait`/spawn failure) the way real bash does: as if printed *by* the
+/// failed command itself, so an existing `2>`/`2>>` redirect on that same
+/// command also applies to it — not just to whatever the command would
+/// have written on its own. Real bug, caught by a testing/security
+/// review sweeping for more instances of the exact class the builtin
+/// stderr-redirect fix (`exec_builtin`, right above this function) had
+/// already closed: `f() { :; }; unset -f f; f 2>/dev/null`'s "command not
+/// found" diagnostic (once `f` falls through to external-command lookup)
+/// was leaking to the real process stderr regardless of the same
+/// command's own `2>/dev/null` — this is the identical bug shape, one
+/// call site removed, since external-command failures go through this
+/// function, never `exec_builtin`.
+///
+/// Falls back to the real process stderr if there's no such redirect, or
+/// if the redirect target itself can't be opened (nothing better to
+/// report through in that case).
+fn report_external_diagnostic(message: &str, redirects: &[ExpandedRedirect], noclobber: bool) {
+    let err_redirect = redirects.iter().rev().find(|r| {
+        r.fd == 2
+            && matches!(
+                r.operator,
+                RedirectOperator::Output | RedirectOperator::Append
+            )
+    });
+    if let Some(err_redirect) = err_redirect
+        && let Ok(mut file) = open_output_redirect(err_redirect, noclobber)
+    {
+        let _ = writeln!(file, "{message}");
+        return;
+    }
+    eprintln!("{message}");
+}
+
 fn exec_external(
     name: &str,
     args: &[String],
@@ -1718,6 +1753,13 @@ fn exec_external(
                 RedirectOperator::Output | RedirectOperator::Append
             )
     });
+    let err_redirect = redirects.iter().rev().find(|r| {
+        r.fd == 2
+            && matches!(
+                r.operator,
+                RedirectOperator::Output | RedirectOperator::Append
+            )
+    });
 
     match input_redirect {
         Some(redirect) => match std::fs::File::open(&redirect.target) {
@@ -1725,7 +1767,11 @@ fn exec_external(
                 command.stdin(file);
             }
             Err(err) => {
-                eprintln!("conch: {}: {err}", redirect.target);
+                report_external_diagnostic(
+                    &format!("conch: {}: {err}", redirect.target),
+                    redirects,
+                    shell.noclobber,
+                );
                 return (1, None);
             }
         },
@@ -1744,7 +1790,11 @@ fn exec_external(
                 command.stdout(file);
             }
             Err(err) => {
-                eprintln!("conch: {}: {err}", redirect.target);
+                report_external_diagnostic(
+                    &format!("conch: {}: {err}", redirect.target),
+                    redirects,
+                    shell.noclobber,
+                );
                 return (1, None);
             }
         },
@@ -1757,10 +1807,43 @@ fn exec_external(
         }
     }
 
+    // The external command's own real-time stderr output (as opposed to
+    // *conch's own* diagnostics about it, handled via
+    // `report_external_diagnostic` throughout this function) — mirrors
+    // `input_redirect`/`output_redirect`'s exact shape immediately above.
+    // Real bug, found and fixed alongside this function's diagnostic
+    // paths: before this, a `2>`/`2>>` redirect on an external command
+    // was silently never honored at all for the command's own output
+    // (only conch's *builtin* stderr-redirect handling, `exec_builtin`,
+    // existed) — the child always inherited the real process stderr
+    // regardless of any redirect specified.
+    match err_redirect {
+        Some(redirect) => match open_output_redirect(redirect, shell.noclobber) {
+            Ok(file) => {
+                command.stderr(file);
+            }
+            Err(err) => {
+                report_external_diagnostic(
+                    &format!("conch: {}: {err}", redirect.target),
+                    redirects,
+                    shell.noclobber,
+                );
+                return (1, None);
+            }
+        },
+        None => {
+            command.stderr(Stdio::inherit());
+        }
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
-            eprintln!("conch: {name}: {err}");
+            report_external_diagnostic(
+                &format!("conch: {name}: {err}"),
+                redirects,
+                shell.noclobber,
+            );
             return (127, None);
         }
     };
@@ -1790,7 +1873,11 @@ fn exec_external(
         match child.wait_with_output() {
             Ok(output) => (exit_code_of(output.status), Some(output.stdout)),
             Err(err) => {
-                eprintln!("conch: {name}: {err}");
+                report_external_diagnostic(
+                    &format!("conch: {name}: {err}"),
+                    redirects,
+                    shell.noclobber,
+                );
                 (1, None)
             }
         }
@@ -1798,7 +1885,11 @@ fn exec_external(
         match child.wait() {
             Ok(status) => (exit_code_of(status), None),
             Err(err) => {
-                eprintln!("conch: {name}: {err}");
+                report_external_diagnostic(
+                    &format!("conch: {name}: {err}"),
+                    redirects,
+                    shell.noclobber,
+                );
                 (1, None)
             }
         }
@@ -2271,6 +2362,47 @@ mod tests {
         let mut shell = Shell::new();
         shell.register_builtin("stderrwriter", Box::new(StderrWriter));
         assert_eq!(run("stderrwriter", &mut shell), 0);
+    }
+
+    // ---- an external command's own stderr respects a `2>` redirect ----------
+    //
+    // Same bug class as the builtin fix just above, one call site removed
+    // (`exec_external`, not `exec_builtin`) — found and fixed together:
+    // a command-not-found (or other `exec_external`-reported) diagnostic
+    // was leaking to the real process stderr regardless of a `2>`
+    // redirect on that same command, and an external command's own
+    // real-time stderr output wasn't being redirected at all (the child
+    // always inherited the real process stderr unconditionally, since
+    // `exec_external` never called `Command::stderr` at all before this).
+
+    #[test]
+    fn command_not_found_diagnostic_respects_a_2_redirect_on_the_same_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("err.txt");
+        let mut shell = Shell::new();
+        let script = format!("nope_not_a_real_command_hopefully 2> {}", path.display());
+        let status = run(&script, &mut shell);
+        assert_eq!(status, 127);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("nope_not_a_real_command_hopefully")
+        );
+    }
+
+    #[test]
+    fn an_external_commands_own_stderr_output_respects_a_2_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist");
+        let err_path = dir.path().join("err.txt");
+        let mut shell = Shell::new();
+        let script = format!("ls {} 2> {}", missing.display(), err_path.display());
+        run(&script, &mut shell);
+        let captured = std::fs::read_to_string(&err_path).unwrap();
+        assert!(
+            !captured.is_empty(),
+            "expected `ls`'s own stderr to land in the redirect target"
+        );
     }
 
     // ---- subshell / brace group isolation -----------------------------------

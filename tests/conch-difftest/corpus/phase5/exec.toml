@@ -23,9 +23,10 @@ exec sh -c "exit 5"
 
 [[case]]
 name = "exec-nonexistent-command-is-a-failure-not-a-crash"
-description = "exec on a command that doesn't exist fails cleanly (exit 127) rather than somehow terminating differently -- the shell process is still intact at the moment exec fails, since nothing has been replaced yet"
+description = "exec on a command that doesn't exist fails cleanly (exit 127) rather than somehow terminating differently -- the shell process is still intact at the moment exec fails, since nothing has been replaced yet. exec itself is one of POSIX's special built-ins, so this failure aborts the rest of the script on both shells (the trailing echo never actually runs; only the overall exit code -- 127 -- demonstrates the \"fails cleanly\" half). This also checks stderr: both shells fully suppress exec's own command-not-found diagnostic when it's redirected on the very same command, the same wording-independent guarantee eval-syntax-error-is-non-fatal-on-bash checks (see that case's own note)"
 tags = ["builtins", "exec", "error-handling"]
 oracles = ["bash", "sh"]
+compare = ["stdout", "stderr", "exit-code"]
 script = '''
 exec nonexistent-cmd-xyz 2>/dev/null
 echo "exit:$?"

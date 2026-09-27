@@ -40,9 +40,10 @@ echo "[${x}]"
 
 [[case]]
 name = "unset-dash-f-targets-a-function-instead-of-a-variable"
-description = "-f targets a shell function by name; after unsetting it, calling that name falls through to command lookup (command not found), the same as if the function had never been defined"
+description = "-f targets a shell function by name; after unsetting it, calling that name falls through to command lookup (command not found), the same as if the function had never been defined. This also checks stderr: both shells fully suppress the command-not-found diagnostic when redirected on the very same command -- unlike eval-syntax-error-is-non-fatal-on-bash's already-fixed equivalent for a builtin's own diagnostic (see that case's note), this is checking the separate external-command-lookup error path"
 tags = ["builtins", "unset", "functions"]
 oracles = ["bash", "sh"]
+compare = ["stdout", "stderr", "exit-code"]
 script = '''
 f() { echo hi; }
 unset -f f
