@@ -1,0 +1,129 @@
+# Phase 5 -- the `getopts` builtin for parsing "$@"-style option arguments.
+#
+# All POSIX baseline, so every case runs against both `bash` and `sh`,
+# with one exception: `getopts-without-optind-reset-sees-nothing-on-a-
+# second-call-bash-only` is bash-only, documenting a genuine, confirmed
+# bash-vs-dash implementation divergence in how `OPTIND` interacts with a
+# *second*, unrelated `getopts` parse that doesn't explicitly reset
+# `OPTIND` first -- see that case's own note and
+# `known-differences.md`'s cross-shell-quirks section.
+#
+# Every case sets its own argument list via `set --` first rather than
+# relying on real script arguments, and every case that calls a function
+# passes `"$@"` to it explicitly -- an ordinary function call does *not*
+# inherit the caller's positional parameters automatically (confirmed
+# empirically while building this corpus; easy to assume otherwise), so a
+# function needs `"$@"` forwarded to it just like any other command would.
+
+[[case]]
+name = "getopts-parses-boolean-flags"
+description = "getopts consumes recognized single-character flags one at a time across successive loop iterations"
+tags = ["builtins", "getopts"]
+oracles = ["bash", "sh"]
+script = '''
+set -- -a -b hello
+while getopts "ab" opt; do
+  echo "opt:$opt"
+done
+shift $((OPTIND - 1))
+echo "rest:$*"
+'''
+
+[[case]]
+name = "getopts-parses-a-flag-that-takes-an-argument"
+description = "a colon after a letter in the option string (f:) means that flag consumes the next word as its argument, available in OPTARG"
+tags = ["builtins", "getopts"]
+oracles = ["bash", "sh"]
+script = '''
+set -- -f value.txt rest
+while getopts "f:" opt; do
+  echo "opt:$opt arg:$OPTARG"
+done
+shift $((OPTIND - 1))
+echo "rest:$*"
+'''
+
+[[case]]
+name = "getopts-combined-short-flags-in-one-word"
+description = "-ab is parsed as two separate flags (-a then -b), the classic combined-short-option form"
+tags = ["builtins", "getopts"]
+oracles = ["bash", "sh"]
+script = '''
+set -- -ab
+while getopts "ab" opt; do
+  echo "opt:$opt"
+done
+'''
+
+[[case]]
+name = "getopts-double-dash-ends-option-parsing"
+description = "a literal -- ends option parsing; everything after it is left as an ordinary operand, even if it looks like a flag"
+tags = ["builtins", "getopts"]
+oracles = ["bash", "sh"]
+script = '''
+set -- -a -- -b
+while getopts "ab" opt; do
+  echo "opt:$opt"
+done
+shift $((OPTIND - 1))
+echo "rest:$*"
+'''
+
+[[case]]
+name = "getopts-unknown-option-with-leading-colon-reports-it-silently-via-question-mark"
+description = "a leading : in the option string switches getopts into silent error-reporting mode: an unrecognized flag sets opt to ? and OPTARG to the offending flag character, without getopts printing its own error message"
+tags = ["builtins", "getopts", "error-handling"]
+oracles = ["bash", "sh"]
+script = '''
+set -- -z
+while getopts ":ab" opt; do
+  echo "opt:[$opt] OPTARG:[$OPTARG]"
+done
+'''
+
+[[case]]
+name = "getopts-missing-required-argument-with-leading-colon-reports-it-via-colon"
+description = "with silent mode (leading :) and a flag that requires an argument but doesn't get one, opt is set to a literal colon and OPTARG holds the flag character that was missing its argument"
+tags = ["builtins", "getopts", "error-handling"]
+oracles = ["bash", "sh"]
+script = '''
+set -- -f
+while getopts ":f:" opt; do
+  echo "opt:[$opt] OPTARG:[$OPTARG]"
+done
+'''
+
+[[case]]
+name = "getopts-optind-must-be-reset-to-reuse-across-two-independent-parses"
+description = "OPTIND is an ordinary, persistent shell variable, not something getopts resets automatically -- reusing it for a second, independent option-parsing pass (even inside a different function call) requires manually setting OPTIND=1 first, and both shells agree this is required"
+tags = ["builtins", "getopts", "optind"]
+oracles = ["bash", "sh"]
+script = '''
+parse() {
+  while getopts "a" opt; do
+    echo "opt:$opt"
+  done
+}
+set -- -a
+parse "$@"
+set -- -a
+OPTIND=1
+parse "$@"
+'''
+
+[[case]]
+name = "getopts-without-optind-reset-sees-nothing-on-a-second-call-bash-only"
+description = "the same script as the OPTIND-reset case, but without the reset -- bash's getopts finds nothing on the second call (OPTIND is still pointing past where the first, unrelated argument list ended), while dash's getopts finds the flag again regardless. This is a genuine confirmed implementation divergence, not just wording, so it's bash-only rather than a shared case"
+tags = ["builtins", "getopts", "optind", "cross-shell-quirk"]
+oracles = ["bash"]
+script = '''
+parse() {
+  while getopts "a" opt; do
+    echo "opt:$opt"
+  done
+}
+set -- -a
+parse "$@"
+set -- -a
+parse "$@"
+'''

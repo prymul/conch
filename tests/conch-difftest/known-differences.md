@@ -230,6 +230,8 @@ against two oracles.
 | Glob bracket-expression `^` as a negation synonym for `!` (a glibc `fnmatch()` extension bash's linked libc happens to support) | `^` is an ordinary literal character inside the bracket set -- POSIX only defines `!` for negation | `corpus/phase2/globbing.toml` |
 | `function fname { ...; }` (and `function fname() { ...; }`) as an alternate function-definition keyword syntax alongside POSIX's `fname() compound_command` | Treats `function`, the function name, and the literal `{` as ordinary words -- an attempt to run a command named `function` (`function: not found`) -- then runs the body's own commands as plain top-level statements with no group around them at all, and finally hits a syntax error on the orphaned closing `}` (confirmed: dash exits 2, having never reached the intended function call) | `corpus/phase3b/functions.toml` |
 | `trap -p SIG` (print the current trap action for a signal without triggering it) -- note this one is *not* actually a bash-beyond-POSIX extension the way every other row here is: POSIX's own `trap` utility description specifies `-p`. It's included in this table anyway because the practical effect on corpus cases is identical (dash has no `-p` support at all to agree with, so those cases are `oracles = ["bash"]` only) | `dash: trap: Illegal option -p` -- an immediate usage error, confirmed empirically; dash's `trap` implements no introspection flag at all | `corpus/phase4/trap.toml` |
+| `. file arg1 arg2` passing extra arguments as the sourced file's own positional parameters -- also, like `trap -p` above, actually POSIX-specified rather than a bash extension, included here purely because dash's practical non-support makes every corpus case around it `oracles = ["bash"]` only | `$1`/`$2`/etc. inside the sourced file are simply empty -- dash accepts the extra arguments syntactically but never binds them to anything, confirmed empirically | `corpus/phase5/source_and_eval.toml` |
+| `type -t name` (single-word machine-readable output: one of builtin/file/function/alias/keyword) | Doesn't recognize `-t` as a flag at all -- treats it as a command name to look up in its own right (`-t: not found`), printed as a spurious extra line before still answering the real query in `type`'s ordinary human-readable prose form | `corpus/phase5/type_and_command.toml` |
 
 ## Cross-shell quirks worth knowing (neither shell is simply "wrong")
 
@@ -307,6 +309,79 @@ just the target(s) that do agree.
   output *after* a `wait`; `kill -0 $pid` is used instead for any
   liveness check that needs to hold both before and after, since both
   shells agree on that precisely.
+
+- **POSIX "special built-in" errors abort the whole script on dash, but
+  are often just an ordinary non-fatal error on bash.** POSIX 2.14 lists
+  fourteen "special built-ins" (`.`, `:`, `break`, `continue`, `eval`,
+  `exec`, `exit`, `export`, `readonly`, `return`, `set`, `shift`, `times`,
+  `trap`, `unset`) and permits (without requiring) a non-interactive
+  shell to terminate immediately if one of them encounters certain kinds
+  of error -- e.g. an assignment error, or, more broadly on some shells,
+  any usage error at all. dash consistently takes the strict reading:
+  `readonly`/`unset` reassignment-of-readonly errors, `set -u`'s
+  unset-variable-reference error, and `eval`'s own parse errors on
+  malformed input all abort the *entire remaining script* on dash, even
+  when the failing call and the very next command are joined on the same
+  physical line by `;`. bash is considerably more lenient across this
+  same set: an `eval` parse error or an `unset`-on-readonly failure are
+  just ordinary non-fatal errors that don't stop the script at all; a
+  plain `x=6` reassignment of a readonly `x`, or a `set -u` violation,
+  *do* abort -- but only the current physical source line, with
+  execution resuming normally on the next one (this is the same
+  same-line-vs-next-line asymmetry already documented above for
+  `${var:?message}` and arithmetic division by zero -- those are both
+  instances of this exact same general rule, now confirmed to extend
+  well beyond parameter/arithmetic expansion errors). See
+  `corpus/phase5/declare_and_readonly.toml`'s and
+  `corpus/phase5/source_and_eval.toml`'s cases for `readonly`/`unset`/
+  `eval`, and `corpus/phase5/set_options.toml` for `set -u` -- each
+  either narrows `compare` to `["stdout"]` (when a same-line comparison
+  happens to still agree, differing only in the reported exit code) or
+  splits into a dedicated `oracles = ["bash"]` case plus, where useful, a
+  mirroring `oracles = ["sh"]` case, exactly like the `alias` divergence
+  below.
+
+- **`getopts`/`OPTIND` interaction across two independent, unrelated
+  parses without an explicit `OPTIND=1` reset differs.** Reusing
+  `getopts` for a second, unrelated argument list (e.g. inside a second
+  call to a function that parses its own `"$@"` with `getopts`) without
+  first resetting `OPTIND=1` finds nothing at all on bash (OPTIND is
+  still pointing past the end of the *first* argument list), but finds
+  the option again on dash regardless. The correct, portable pattern
+  (`OPTIND=1` before reusing `getopts`) is unaffected and produces
+  identical output on both shells -- see
+  `corpus/phase5/getopts.toml`'s `getopts-optind-must-be-reset-to-reuse-
+  across-two-independent-parses` for that pattern, and its bash-only
+  `...-without-optind-reset-sees-nothing-on-a-second-call-bash-only` for
+  the divergence itself.
+
+- **A handful of builtin usage/lookup errors agree on producing no
+  stdout, but disagree on the specific nonzero exit code.** `command -v`
+  of an unresolvable name (bash: 1, dash: 127) and `readonly`/`unset`
+  reassignment errors on the same physical line (bash: 1, dash: 2 --
+  see the special-built-ins entry above) are both real, confirmed
+  instances of this: both shells agree completely on *content* (nothing
+  printed to stdout), just not on the numeric status. Every affected
+  corpus case narrows `compare` to `["stdout"]` rather than dropping to a
+  single-shell oracle, since the stdout-level fact being tested is
+  genuinely shared.
+
+- **Non-interactive alias expansion is enabled by default on dash, but
+  requires an explicit opt-in on bash.** POSIX leaves whether a
+  non-interactive shell expands aliases at all as implementation-defined,
+  and the two oracle shells this project uses landed on opposite
+  defaults: dash expands an alias defined on an earlier line by default,
+  with nothing to configure; bash does the same only after
+  `shopt -s expand_aliases` is set first (a bash-only mechanism -- there
+  is no dash equivalent to point at, since dash never needed one). Both
+  shells agree, with no configuration needed at all, that an alias
+  defined and used on the *same* physical line never expands regardless
+  (alias substitution happens while that line is still being parsed,
+  before the later-in-the-same-line definition is known). See
+  `corpus/phase5/alias.toml` for the full set: one shared case for the
+  same-line rule, an `oracles = ["bash"]` case showing the opt-in
+  requirement, and an `oracles = ["sh"]` case showing dash's default-on
+  behavior for the identical script.
 
 ## Entry format
 

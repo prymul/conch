@@ -1,0 +1,230 @@
+# Phase 5 -- `test` / `[` (POSIX calls these two names for the same
+# utility), with deliberate, explicit coverage of the argument-count-based
+# disambiguation rules (POSIX 2.9.4.5's 0/1/2/3/4-argument forms) --
+# these are a classic source of subtle bugs (`[ "$x" = "y" ]` silently
+# misparsing when `$x` is empty and unquoted is the single most common
+# real-world instance), not just the ordinary comparison-operator cases
+# that are easy to remember to test anyway.
+#
+# All cases here compare exit code (and, where relevant, stdout) rather
+# than stderr wording, per this crate's usual default -- several of these
+# constructs are deliberately-invalid-argument-count error cases, and
+# bash/dash's error message text for those differs even when their exit
+# codes agree, exactly like `command-not-found-exit-code` in
+# `corpus/phase1/simple_commands.toml`.
+#
+# All POSIX baseline; every case runs against both `bash` and `sh`.
+
+[[case]]
+name = "test-zero-arguments-is-false"
+description = "test with no arguments at all is false (exit 1) -- the 0-argument form of the disambiguation rules"
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test
+echo $?
+'''
+
+[[case]]
+name = "test-one-argument-nonempty-string-is-true"
+description = "the 1-argument form: test STRING is true exactly when STRING is not the empty string"
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test "nonempty"
+echo $?
+'''
+
+[[case]]
+name = "test-one-argument-empty-string-is-false"
+description = "the 1-argument form applied to an actual empty string is false"
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test ""
+echo $?
+'''
+
+[[case]]
+name = "test-one-argument-that-looks-like-a-flag-is-still-just-a-nonempty-string"
+description = "with exactly one argument, test never interprets it as a unary operator -- \"-n\" as the sole argument is just a nonempty string, so this is true, not a unary-operator-with-a-missing-operand error"
+tags = ["builtins", "test", "argument-count"]
+oracles = ["bash", "sh"]
+script = '''
+test "-n"
+echo $?
+'''
+
+[[case]]
+name = "test-two-argument-bang-negates-whether-the-string-is-empty"
+description = "the 2-argument form ! STRING is true exactly when STRING is empty (the negation of the 1-argument rule)"
+tags = ["builtins", "test", "argument-count"]
+oracles = ["bash", "sh"]
+script = '''
+test ! ""
+echo $?
+test ! "x"
+echo $?
+'''
+
+[[case]]
+name = "test-dash-z-and-dash-n-unary-string-operators"
+description = "the ordinary 2-argument unary operators: -z (is empty) and -n (is non-empty)"
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test -z ""
+echo $?
+test -n "x"
+echo $?
+'''
+
+[[case]]
+name = "test-three-argument-string-equality-and-inequality"
+description = "the 3-argument form: STRING1 = STRING2 and STRING1 != STRING2"
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test "a" = "a"
+echo $?
+test "a" = "b"
+echo $?
+test "a" != "b"
+echo $?
+'''
+
+[[case]]
+name = "test-three-argument-bang-negates-a-two-argument-expression"
+description = "the 3-argument form also covers ! followed by a 2-argument unary expression, negating it as a whole"
+tags = ["builtins", "test", "argument-count"]
+oracles = ["bash", "sh"]
+script = '''
+test ! -z ""
+echo $?
+'''
+
+[[case]]
+name = "test-unquoted-empty-variable-expansion-vanishes-as-a-word-entirely"
+description = "the classic real-world test/[ bug: an unquoted empty variable contributes zero words (ordinary field splitting), so \"test $x = abc\" with an empty, unquoted $x is not a 3-argument string comparison at all -- it's a 2-argument test = abc, which both shells reject as a malformed expression with the same exit status (differing only in error wording, per this file's header)"
+tags = ["builtins", "test", "quoting", "argument-count"]
+oracles = ["bash", "sh"]
+script = '''
+x=""
+test $x = "abc"
+echo $?
+'''
+
+[[case]]
+name = "test-four-argument-bang-negates-a-three-argument-expression"
+description = "the 4-argument form: ! followed by a full 3-argument expression negates the whole comparison"
+tags = ["builtins", "test", "argument-count"]
+oracles = ["bash", "sh"]
+script = '''
+test ! "a" = "b"
+echo $?
+'''
+
+[[case]]
+name = "test-dash-a-and-dash-o-logical-combinators"
+description = "-a (logical and) and -o (logical or) combine two sub-expressions inside a single test invocation"
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test "a" = "a" -a "b" = "b"
+echo $?
+test "a" = "x" -o "b" = "b"
+echo $?
+'''
+
+[[case]]
+name = "test-numeric-comparisons"
+description = "the -eq/-ne/-lt/-le/-gt/-ge numeric comparison operators, distinct from string = / !="
+tags = ["builtins", "test"]
+oracles = ["bash", "sh"]
+script = '''
+test 3 -eq 3
+echo $?
+test 2 -lt 3
+echo $?
+test 5 -gt 10
+echo $?
+'''
+
+[[case]]
+name = "test-non-numeric-operand-to-a-numeric-comparison-is-an-error"
+description = "a non-integer operand to -eq (and the other numeric operators) is a usage error on both shells, with the same exit status, even though the error wording itself differs (\"integer expected\" vs \"Illegal number\")"
+tags = ["builtins", "test", "error-handling"]
+oracles = ["bash", "sh"]
+script = '''
+test abc -eq 1
+echo $?
+'''
+
+[[case]]
+name = "bracket-form-is-equivalent-to-test"
+description = "[ ... ] is the same utility as test, just requiring a literal ] as its final argument"
+tags = ["builtins", "test", "bracket"]
+oracles = ["bash", "sh"]
+script = '''
+[ "a" = "a" ] && echo yes
+'''
+
+[[case]]
+name = "bracket-form-missing-closing-bracket-is-a-usage-error"
+description = "omitting the trailing ] is a hard usage error on both shells (same exit status, different wording), not silently tolerated"
+tags = ["builtins", "test", "bracket", "error-handling"]
+oracles = ["bash", "sh"]
+script = '''
+[ "a" = "a"
+echo $?
+'''
+
+[[case]]
+name = "test-file-exists"
+description = "-e tests for the mere existence of a path, regardless of its type"
+tags = ["builtins", "test", "file-operators"]
+oracles = ["bash", "sh"]
+script = '''
+touch f
+[ -e f ] && echo exists
+[ -e nope ] || echo missing
+'''
+
+[[case]]
+name = "test-regular-file-vs-directory"
+description = "-f (regular file) and -d (directory) distinguish path types; each is false for the other's kind of path"
+tags = ["builtins", "test", "file-operators"]
+oracles = ["bash", "sh"]
+script = '''
+touch f
+mkdir d
+[ -f f ] && echo isfile
+[ -d d ] && echo isdir
+[ -d f ] || echo file-is-not-a-dir
+'''
+
+[[case]]
+name = "test-file-size-with-dash-s"
+description = "-s is true for a file with nonzero size, false for an empty one -- distinct from -e (mere existence)"
+tags = ["builtins", "test", "file-operators"]
+oracles = ["bash", "sh"]
+script = '''
+echo content > nonempty.txt
+: > empty.txt
+[ -s nonempty.txt ] && echo has-content
+[ -s empty.txt ] || echo is-empty
+'''
+
+[[case]]
+name = "test-file-permission-operators"
+description = "-r (readable) and -x (executable) reflect the file's actual permission bits"
+tags = ["builtins", "test", "file-operators"]
+oracles = ["bash", "sh"]
+script = '''
+touch f
+chmod +x f
+[ -r f ] && echo readable
+[ -x f ] && echo executable
+chmod -x f
+[ -x f ] || echo no-longer-executable
+'''

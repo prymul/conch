@@ -1,0 +1,75 @@
+# Phase 5 -- `.` (dot) / `source`, and `eval`.
+#
+# `.` is POSIX baseline; `source` is a bash-only synonym for it (dash:
+# `source: not found`, since dash never registers it as a builtin at
+# all). `eval` is POSIX baseline throughout.
+
+[[case]]
+name = "dot-source-runs-a-file-in-the-current-shells-scope"
+description = "unlike running a script as a separate command, . file executes it in the *current* shell -- variables it sets are visible afterward, the same contrast Phase 3's subshell-vs-brace-group cases establish for compound commands"
+tags = ["builtins", "source", "dot"]
+oracles = ["bash", "sh"]
+script = '''
+echo "x=5" > lib.sh
+. ./lib.sh
+echo "$x"
+'''
+
+[[case]]
+name = "dot-source-passes-extra-arguments-as-positional-parameters-bash-only"
+description = "arguments after the filename become the sourced file's own $1, $2, ... for the duration of running it -- a POSIX-specified feature of . that dash does not actually implement (confirmed empirically: $1/$2 are simply empty inside the sourced file on dash), similar to dash's missing trap -p support in corpus/phase4/trap.toml -- both are real POSIX-conformance gaps in dash itself, not bash extensions"
+tags = ["builtins", "source", "dot", "positional-parameters", "cross-shell-quirk"]
+oracles = ["bash"]
+script = '''
+echo "echo \"1=\$1 2=\$2\"" > lib.sh
+. ./lib.sh one two
+'''
+
+[[case]]
+name = "source-is-a-bash-only-synonym-for-dot"
+description = "source behaves exactly like . on bash; dash has no source builtin at all (confirmed: \"source: not found\"), so this is bash-only"
+tags = ["builtins", "source", "bash-extension"]
+oracles = ["bash"]
+script = '''
+echo "x=5" > lib.sh
+source ./lib.sh
+echo "$x"
+'''
+
+[[case]]
+name = "eval-runs-a-string-as-a-command"
+description = "the most basic eval usage: the argument string is parsed and executed as if it had been written directly in the script"
+tags = ["builtins", "eval"]
+oracles = ["bash", "sh"]
+script = '''
+eval "echo hi"
+'''
+
+[[case]]
+name = "eval-concatenates-and-re-parses-multiple-words"
+description = "eval joins all of its arguments with spaces before parsing, which is what lets a command be built up piece by piece from variables and still work"
+tags = ["builtins", "eval"]
+oracles = ["bash", "sh"]
+script = '''
+cmd=echo
+arg=hi
+eval "$cmd" "$arg"
+'''
+
+[[case]]
+name = "eval-syntax-error-is-non-fatal-on-bash"
+description = "eval is one of POSIX's \"special built-ins\" (along with ., :, break, continue, exec, exit, export, readonly, return, set, shift, times, trap, and unset -- see known-differences.md for the consolidated writeup of this recurring pattern across this corpus). A malformed command string is a parse error at the point eval runs it; bash treats that as an ordinary, non-fatal error and keeps running even on the very same physical line"
+tags = ["builtins", "eval", "error-handling", "cross-shell-quirk"]
+oracles = ["bash"]
+script = '''
+eval "if" 2>/dev/null; echo "exit:$?"
+'''
+
+[[case]]
+name = "eval-syntax-error-aborts-the-whole-script-on-dash"
+description = "the exact same script as the bash-only case above, but on dash: a special built-in's error (here, eval's own parse failure) aborts the entire remaining script outright, even on this same physical line -- POSIX explicitly permits this stricter behavior for special built-ins in a non-interactive shell, and dash takes it"
+tags = ["builtins", "eval", "error-handling", "cross-shell-quirk"]
+oracles = ["sh"]
+script = '''
+eval "if" 2>/dev/null; echo "exit:$?"
+'''

@@ -119,6 +119,31 @@ verified manually once that implementation exists, the same way this
 project's other genuinely-interactive surfaces are (see "Interactive mode
 scoping" below).
 
+**Phase 5** (builtins completeness: `read`, `getopts`, `test`/`[`,
+`printf`, `declare`, `unset`, `alias`, `source`/`.`, `eval`, `exec`,
+`type`, `command`, `umask`, `kill`, and completing `set`'s option-flag
+half) is being implemented concurrently in
+`crates/conch-parser`/`crates/conch-core` at the time the `phase5/`
+corpus was written. This is the first phase whose corpus needed a harness
+addition rather than only new cases: `read` fundamentally needs
+stdin-driven input, which nothing before this phase required (Phase 1-4
+are all argv/script-text driven), so [`case::Case::stdin`] and
+`invoke::configure_stdin` were added -- see "The case format" below for
+the field itself and "Wiring in real execution" for how `Invocation::
+StdinPipe` (which delivers the *script* over stdin) stays independent of
+it. As of this writing conch's implementation of this builtin set is
+partial rather than all-or-nothing -- run against the binary at the time
+this was written, `test`/`[`, `printf`, `type`/`command`, `umask`, and
+most of `unset`/`source`/`eval` already pass, while `read`, `getopts`,
+`declare`, `exec`, and `set`'s option flags don't yet (confirmed:
+`read x` silently leaves `x` empty rather than actually reading stdin,
+and a `getopts` loop produces no output at all). That corpus (97 cases
+across 13 files) is, like every earlier phase's, fully built,
+self-validated, and oracle-verified against real bash/dash today, and
+also runs in **report-only mode** via its own
+`CONCH_DIFFTEST_STRICT_PHASE5` gate -- see "Phase-specific strict gates"
+below.
+
 Every phase's three-test pattern is the same (`{phase}_corpus_validation.rs`,
 `{phase}_oracle_selfcheck.rs`, `{phase}_differential.rs` -- Phase 1's
 happen to be un-prefixed since they were written first):
@@ -148,8 +173,9 @@ named env var rather than a single shared one -- `differential.rs` (Phase
 `CONCH_DIFFTEST_STRICT_PHASE2`; `phase3_differential.rs` checks
 `CONCH_DIFFTEST_STRICT_PHASE3`; `phase3b_differential.rs` checks
 `CONCH_DIFFTEST_STRICT_PHASE3B`; `phase4_differential.rs` checks
-`CONCH_DIFFTEST_STRICT_PHASE4`; a hypothetical Phase 5 would check
-`CONCH_DIFFTEST_STRICT_PHASE5`; and so on. This is deliberate and is the
+`CONCH_DIFFTEST_STRICT_PHASE4`; `phase5_differential.rs` checks
+`CONCH_DIFFTEST_STRICT_PHASE5`; a hypothetical Phase 6 would check
+`CONCH_DIFFTEST_STRICT_PHASE6`; and so on. This is deliberate and is the
 whole mechanism that keeps phases independent: CI's `difftest` job runs
 `cargo test -p conch-difftest`, which builds and runs *every* test binary
 in this crate regardless of which corpora are actually finished, so
@@ -217,10 +243,24 @@ tests/conch-difftest/
 │   │   ├── recursion.toml
 │   │   ├── positional_parameters.toml
 │   │   └── at_star_field_splitting.toml (the quoted-vs-unquoted $@/$* contrast)
-│   └── phase4/                      <- same style, job control (non-terminal-dependent slice)
-│       ├── background_and_wait.toml
-│       ├── jobs_status.toml             (kept minimal -- see its own header)
-│       └── trap.toml
+│   ├── phase4/                      <- same style, job control (non-terminal-dependent slice)
+│   │   ├── background_and_wait.toml
+│   │   ├── jobs_status.toml             (kept minimal -- see its own header)
+│   │   └── trap.toml
+│   └── phase5/                      <- same style, builtins completeness
+│       ├── read.toml                    (first user of Case::stdin)
+│       ├── getopts.toml
+│       ├── test_and_bracket.toml        (POSIX's 0/1/2/3/4-argument disambiguation rules)
+│       ├── printf.toml
+│       ├── declare_and_readonly.toml    (declare is bash-only; no array support at all)
+│       ├── unset.toml
+│       ├── alias.toml
+│       ├── source_and_eval.toml
+│       ├── exec.toml
+│       ├── type_and_command.toml
+│       ├── umask.toml
+│       ├── kill.toml
+│       └── set_options.toml             (set's option-flag half; set -- is in phase3b)
 └── tests/
     ├── corpus_validation.rs
     ├── oracle_selfcheck.rs
@@ -236,7 +276,10 @@ tests/conch-difftest/
     ├── phase3b_differential.rs
     ├── phase4_corpus_validation.rs
     ├── phase4_oracle_selfcheck.rs
-    └── phase4_differential.rs
+    ├── phase4_differential.rs
+    ├── phase5_corpus_validation.rs
+    ├── phase5_oracle_selfcheck.rs
+    └── phase5_differential.rs
 ```
 
 Why a workspace member under `tests/`, not a bare `tests/*.rs` at the
@@ -260,6 +303,7 @@ oracles = ["bash", "sh"]                 # default: ["bash"]; each compared inde
 invocation = "dash-c"                    # "dash-c" (default) | "script-file" | "stdin-pipe"
 compare = ["stdout", "exit-code"]        # default; "stderr" is opt-in, see below
 normalize = []                            # see normalize.rs; e.g. ["workdir"]
+stdin = "some input\n"                   # optional; see below -- not the same as invocation = "stdin-pipe"
 script = '''
 echo hello world
 '''
@@ -267,7 +311,22 @@ echo hello world
 
 Always use TOML **literal** multi-line strings (`'''...'''`) for `script`,
 never basic strings (`"""..."""`) -- shell scripts are full of backslashes
-and quotes that a basic string would try to escape-interpret.
+and quotes that a basic string would try to escape-interpret. `stdin` is
+the opposite case: it's literal *input data* for a stdin-driven builtin
+like `read` (Phase 5+), not shell source, so an ordinary TOML basic
+string with explicit `\n` escapes is usually the clearest way to spell
+out exactly what's on each line, including whether there's a trailing
+newline at all -- see `corpus/phase5/read.toml` for the real, shipping
+examples.
+
+`stdin` is independent of `invocation`, and deliberately cannot be
+combined with `invocation = "stdin-pipe"` (a validation error --
+`stdin-pipe` already uses the child's one stdin stream to deliver the
+*script itself*, so there's no way to unambiguously also deliver separate
+`read`-input data over that same stream). For every other invocation
+mode, `stdin` is the *only* thing written to the child's stdin, which
+otherwise defaults to closed -- see `case::Case::stdin`'s doc comment and
+`invoke::configure_stdin`.
 
 Full field reference lives as doc comments on `case::Case` and its enums
 (`Oracle`, `Invocation`, `CompareTarget`, `NormalizeRule`,
@@ -640,6 +699,65 @@ dash gap against a POSIX-specified flag, not bash extending past POSIX,
 but the practical `oracles = ["bash"]`-only effect on the corpus is the
 same).
 
+### Phase 5 scoping notes
+
+`corpus/phase5/` covers the Phase 5 plan bullet's builtin set: `read`,
+`getopts`, `test`/`[`, `printf`, `declare`, `unset`, `alias`, `source`/
+`.`, `eval`, `exec`, `type`, `command`, `umask`, `kill`, and completing
+`set`'s option-flag half (`set --`/positional-parameter manipulation
+itself is already `corpus/phase3b/positional_parameters.toml`'s
+territory). Almost all of it is POSIX baseline; `declare` is the one
+whole-file exception (bash-only, see below).
+
+**The harness addition this phase needed:** `read` fundamentally needs
+data arriving on stdin, and nothing before Phase 5 required that --
+Phase 1-4 are entirely argv/script-text driven. `Invocation::StdinPipe`
+already existed, but it delivers the *script itself* over stdin, which
+is a different thing entirely and can't also carry separate `read`-input
+data over that same one stream. `case::Case::stdin` (an optional field,
+literal input bytes, validated to conflict with `stdin-pipe`) plus
+`invoke::configure_stdin` close that gap -- see "The case format" above
+for the field and `corpus/phase5/read.toml` for the cases that actually
+exercise it. This is the same shape of harness-before-corpus need Phase 4
+had for `invoke::wait_with_timeout`: a genuinely new *kind* of
+non-determinism/capability gap, not just more cases in the existing
+mold, gets a harness change, not a workaround inside a case's script.
+
+**`declare` and arrays:** `declare` has no dash equivalent at all
+(confirmed: `dash: declare: not found`), so every `declare` case is
+`oracles = ["bash"]` only, in `declare_and_readonly.toml`. Separately,
+and unconditionally regardless of which shell: conch has no array
+support at all, project-wide, not just as a Phase 5 scoping choice -- so
+nothing here exercises `declare -a`/`declare -A`, only scalar-variable
+attributes (`-r`, `-i`, `-x`, `-f`).
+
+**`test`/`[`'s argument-count disambiguation rules:** deliberately given
+real, dedicated coverage in `test_and_bracket.toml` rather than just the
+comparison-operator cases that are easy to remember to test anyway --
+POSIX 2.9.4.5 specifies distinct 0/1/2/3/4-argument forms, and the
+classic real-world `[ $x = y ]` bug (an unquoted, empty `$x` vanishing as
+a word entirely and silently shifting a 3-argument comparison into a
+malformed 2-argument one) gets its own case rather than being left as
+lore.
+
+**A recurring pattern found while building this corpus is big enough to
+warrant its own consolidated writeup rather than one-off notes per
+case:** POSIX's "special built-in" utilities (`.`, `:`, `break`,
+`continue`, `eval`, `exec`, `exit`, `export`, `readonly`, `return`,
+`set`, `shift`, `times`, `trap`, `unset`) are permitted to abort a
+non-interactive shell entirely on certain errors, and dash consistently
+takes that permission where bash is far more lenient -- `readonly`/
+`unset` violations, `set -u`'s unset-variable error, and `eval` syntax
+errors all abort the whole rest of the script on dash (even mid-`;`-
+joined-line), while bash either treats the same error as ordinary and
+non-fatal, or aborts only the current physical source line and resumes
+on the next one. This turns out to be the exact same rule already
+documented for `${var:?message}` and arithmetic division by zero in
+Phase 2's corpus, just not previously named as a general pattern -- see
+`known-differences.md`'s cross-shell-quirks section for the full
+writeup, and `declare_and_readonly.toml`/`source_and_eval.toml`/
+`set_options.toml` for the corpus cases.
+
 ## Wiring in real execution
 
 This is the part whoever picks this crate up once Phase 1 execution
@@ -791,4 +909,33 @@ cargo test -p conch-difftest --test phase4_differential -- --nocapture
 
 # Phase 4 hard gate, once warranted:
 CONCH_DIFFTEST_STRICT_PHASE4=1 cargo test -p conch-difftest --test phase4_differential -- --nocapture
+```
+
+Likewise for Phase 5 once its builtins land in
+`crates/conch-parser`/`crates/conch-core`/`crates/conch-builtins`,
+substituting `phase5_differential` and `CONCH_DIFFTEST_STRICT_PHASE5`. As
+of this writing, unlike Phase 4's entry above, the workspace *does* build
+successfully -- Phase 5's builtin set is landing incrementally rather
+than all at once, and running against that binary showed 109/175 passing
+(`test`/`[`, `printf`, `type`/`command`, `umask`, and most of `unset`/
+`source`/`eval` already agree with bash/dash; `read`, `getopts`,
+`declare`, `exec`, and `set`'s option flags don't yet -- confirmed by
+hand, e.g. `read x` against that binary silently leaves `x` empty rather
+than actually consuming stdin). Zero cases hit the harness's own
+`INVOCATION_TIMEOUT`, including the `mkfifo`-free stdin-driven `read`
+cases and Phase 5's own `kill`-based cases -- worth calling out
+specifically because Phase 4's equivalent entry above is the reason that
+mechanism exists at all, and this is it staying quiet (as it should)
+against a binary that's actually making incremental progress rather than
+being completely unimplemented or actively mid-deadlock. Take the exact
+109/175 split as a snapshot, not a target to chase here -- this crate's
+job is the corpus and harness, not tracking a specific implementation's
+day-to-day progress.
+
+```sh
+# Phase 5 full report, report-only (today's state):
+cargo test -p conch-difftest --test phase5_differential -- --nocapture
+
+# Phase 5 hard gate, once warranted:
+CONCH_DIFFTEST_STRICT_PHASE5=1 cargo test -p conch-difftest --test phase5_differential -- --nocapture
 ```

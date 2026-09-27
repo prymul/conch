@@ -1,0 +1,53 @@
+# Phase 5 -- the `umask` builtin.
+#
+# `umask` mutates real, process-wide OS state (the file-creation mask),
+# but that's not actually a source of non-determinism here: every case
+# either sets an explicit value before reading it back (fully
+# self-contained), or reads whatever mask the test harness's own process
+# happened to inherit -- which candidate and oracle always share equally
+# in an oracle-vs-oracle comparison, since both are spawned as children of
+# this same harness process (see `runner.rs`). No corpus case anywhere
+# hardcodes a specific starting mask value; every comparison is live,
+# side-by-side, the same principle as every other environment-dependent
+# case in this crate. All POSIX baseline, so every case runs against both
+# `bash` and `sh`.
+
+[[case]]
+name = "umask-with-no-arguments-prints-the-current-mask"
+description = "umask alone prints the current file-creation mask in the standard four-digit octal form -- whatever that value actually is, both shells (inheriting it from the same parent process) report it identically"
+tags = ["builtins", "umask"]
+oracles = ["bash", "sh"]
+script = '''
+umask
+'''
+
+[[case]]
+name = "umask-set-then-read-back"
+description = "setting an explicit octal mask and reading it back proves umask actually changed the process's mask, not just accepted the argument silently"
+tags = ["builtins", "umask"]
+oracles = ["bash", "sh"]
+script = '''
+umask 077
+umask
+'''
+
+[[case]]
+name = "umask-dash-s-prints-the-symbolic-form"
+description = "-S prints the mask as symbolic permissions-that-remain (e.g. u=rwx,g=rx,o=rx) instead of octal"
+tags = ["builtins", "umask"]
+oracles = ["bash", "sh"]
+script = '''
+umask 022
+umask -S
+'''
+
+[[case]]
+name = "umask-affects-permissions-of-a-newly-created-file"
+description = "the practical effect of umask: a restrictive mask actually reduces the permission bits a newly created file ends up with"
+tags = ["builtins", "umask", "file-operators"]
+oracles = ["bash", "sh"]
+script = '''
+umask 077
+touch restricted.txt
+[ -r restricted.txt ] && [ -w restricted.txt ] && echo "owner-can-read-and-write"
+'''

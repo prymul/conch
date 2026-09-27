@@ -1,0 +1,72 @@
+# Phase 5 -- `alias`/`unalias`.
+#
+# Non-interactive alias expansion turned out to be a genuine, confirmed
+# bash-vs-dash divergence, not just an edge case: bash disables alias
+# expansion entirely in non-interactive shells (`-c` and script-file
+# alike) unless `shopt -s expand_aliases` is set first, while dash
+# expands aliases in non-interactive shells by default, with no opt-in
+# needed at all. POSIX itself explicitly leaves non-interactive alias
+# expansion implementation-defined, so neither behavior is "wrong" --
+# this is a real cross-shell quirk, documented in
+# `known-differences.md`. Every case below is therefore split by which
+# shell(s) it's actually true for, rather than forced into a shared
+# `["bash", "sh"]` case with a caveat.
+#
+# One thing both shells *do* agree on regardless: an alias defined and
+# used on the very same physical line never expands, because alias
+# substitution happens while a line is being read/parsed, before the
+# alias defined partway through that same line is known yet -- see
+# `alias-same-line-definition-and-use-never-expands` below.
+
+[[case]]
+name = "alias-same-line-definition-and-use-never-expands"
+description = "defining an alias and invoking it on the same physical line (joined by ;) never expands, on either shell, regardless of whether bash's expand_aliases opt-in is set -- the alias isn't known yet while that line is still being parsed"
+tags = ["builtins", "alias"]
+oracles = ["bash", "sh"]
+script = '''
+shopt -s expand_aliases 2>/dev/null; alias ll="echo listing"; ll 2>/dev/null; echo "exit:$?"
+'''
+
+[[case]]
+name = "alias-non-interactive-expansion-requires-shopt-on-bash"
+description = "without shopt -s expand_aliases, an alias defined on an earlier line still isn't expanded when used on a later one in a non-interactive bash -- it falls through to an ordinary command lookup and fails"
+tags = ["builtins", "alias", "cross-shell-quirk"]
+oracles = ["bash"]
+script = '''
+alias ll="echo listing"
+ll
+'''
+
+[[case]]
+name = "alias-non-interactive-expansion-is-on-by-default-on-dash"
+description = "the exact same script as the bash-only case above (alias defined on one line, used on the next, no opt-in of any kind) succeeds on dash without any equivalent to shopt -s expand_aliases -- dash simply expands non-interactive aliases by default"
+tags = ["builtins", "alias", "cross-shell-quirk"]
+oracles = ["sh"]
+script = '''
+alias ll="echo listing"
+ll
+'''
+
+[[case]]
+name = "alias-different-line-use-succeeds-on-bash-once-shopt-is-set"
+description = "with shopt -s expand_aliases set first, bash's non-interactive alias expansion works the same way dash's does by default -- the alias just needs to be defined on an earlier line than its use"
+tags = ["builtins", "alias", "bash-extension"]
+oracles = ["bash"]
+script = '''
+shopt -s expand_aliases
+alias ll="echo listing"
+ll
+'''
+
+[[case]]
+name = "unalias-removes-a-previously-defined-alias"
+description = "after unalias, the name falls back to ordinary command lookup, the same as if the alias had never been defined"
+tags = ["builtins", "alias", "unalias", "bash-extension"]
+oracles = ["bash"]
+script = '''
+shopt -s expand_aliases
+alias ll="echo listing"
+unalias ll
+ll 2>/dev/null
+echo "exit:$?"
+'''

@@ -1,0 +1,42 @@
+# Phase 5 -- the `kill` builtin, focused on the aspects Phase 4's
+# extensive `kill -SIGNAL $$` self-signaling (for `trap` testing, see
+# `corpus/phase4/trap.toml`) didn't already cover: the default signal,
+# and signal-name/number equivalence. Both cases target a genuinely
+# separate nested shell process (via `"$0" -c ...`) rather than the
+# script's own `$$`, for the same reason `corpus/phase4/background_and_
+# wait.toml`'s signal-death case does -- so the target can actually
+# receive and act on the signal, rather than being the same process that
+# sent it. All POSIX baseline, so every case runs against both `bash`
+# and `sh`.
+
+[[case]]
+name = "kill-with-no-signal-specified-defaults-to-term"
+description = "kill pid with no -SIGNAL/-s option sends SIGTERM by default -- proven here by having the target ignore SIGTERM explicitly and observing it survive its full sleep instead of dying early"
+tags = ["builtins", "kill", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+"$0" -c "trap \"\" TERM; sleep 1" &
+pid=$!
+sleep 0.1
+kill "$pid" 2>/dev/null
+wait "$pid"
+echo "waited:$?"
+'''
+
+[[case]]
+name = "kill-by-signal-name-and-by-number-are-equivalent"
+description = "kill -TERM and kill -15 send the exact same signal -- both produce the identical 128+signum wait status on the target"
+tags = ["builtins", "kill", "signals"]
+oracles = ["bash", "sh"]
+script = '''
+"$0" -c "sleep 5" &
+pid1=$!
+kill -TERM "$pid1"
+wait "$pid1"
+echo "name:$?"
+"$0" -c "sleep 5" &
+pid2=$!
+kill -15 "$pid2"
+wait "$pid2"
+echo "number:$?"
+'''

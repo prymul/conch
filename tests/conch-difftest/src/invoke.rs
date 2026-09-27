@@ -63,14 +63,43 @@ impl ShellUnderTest {
     }
 }
 
+/// Sets up `cmd`'s stdin for the `DashC`/`ScriptFile` invocation modes and
+/// returns the payload (if any) that the caller still needs to actually
+/// write after spawning: `Some(input)` pipes stdin and returns its bytes;
+/// `None` closes stdin entirely, matching every pre-Phase-5 invocation's
+/// behavior (an unguarded `read` sees immediate EOF rather than blocking).
+fn configure_stdin(cmd: &mut Command, stdin_input: Option<&str>) -> Option<Vec<u8>> {
+    match stdin_input {
+        Some(input) => {
+            cmd.stdin(Stdio::piped());
+            Some(input.as_bytes().to_vec())
+        }
+        None => {
+            cmd.stdin(Stdio::null());
+            None
+        }
+    }
+}
+
 /// Runs `script` under `shell` using the given [`Invocation`] mode, inside
 /// `workdir` (which the caller is responsible for creating fresh per run --
 /// see the crate README on why every run gets its own temp directory).
+///
+/// `stdin_input`, when `Some`, is fed to the child's stdin verbatim --
+/// this is [`crate::case::Case::stdin`]'s mechanism, for cases that
+/// exercise stdin-driven builtins like `read` (Phase 5+); see that field's
+/// doc comment for why it's independent of (and, per
+/// [`crate::case::Case::validate`], mutually exclusive with)
+/// `Invocation::StdinPipe`. `None` preserves every earlier phase's
+/// behavior exactly: stdin closed for `DashC`/`ScriptFile` (so an
+/// unguarded `read` sees immediate EOF rather than hanging), the script
+/// itself delivered over stdin for `StdinPipe`.
 pub fn run(
     shell: &ShellUnderTest,
     invocation: Invocation,
     script: &str,
     workdir: &Path,
+    stdin_input: Option<&str>,
 ) -> std::io::Result<RunOutcome> {
     let mut cmd = Command::new(shell.program());
     cmd.current_dir(workdir);
@@ -80,22 +109,29 @@ pub fn run(
     // Keeps the tempfile alive (if any) until after the child has been
     // spawned; the child only needs the path to exist at spawn time.
     let mut _script_file_guard = None;
-    let mut stdin_payload = None;
+    // Every arm below assigns this before it's read; no meaningful
+    // default value exists (each invocation mode's stdin payload -- if
+    // any -- depends entirely on which arm runs).
+    let stdin_payload;
 
     match invocation {
         Invocation::DashC => {
             cmd.arg("-c").arg(script);
-            cmd.stdin(Stdio::null());
+            stdin_payload = configure_stdin(&mut cmd, stdin_input);
         }
         Invocation::ScriptFile => {
             let mut file = tempfile::NamedTempFile::new_in(workdir)?;
             file.write_all(script.as_bytes())?;
             file.flush()?;
             cmd.arg(file.path());
-            cmd.stdin(Stdio::null());
+            stdin_payload = configure_stdin(&mut cmd, stdin_input);
             _script_file_guard = Some(file);
         }
         Invocation::StdinPipe => {
+            // `stdin_input` is `None` here by construction -- see this
+            // function's doc comment and `Case::validate`'s rejection of
+            // the combination -- so the script itself is unambiguously
+            // the only thing written to the child's stdin below.
             cmd.stdin(Stdio::piped());
             stdin_payload = Some(script.as_bytes().to_vec());
         }
@@ -245,6 +281,7 @@ mod tests {
             Invocation::DashC,
             "echo hello",
             workdir.path(),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.stdout, b"hello\n");
@@ -259,6 +296,7 @@ mod tests {
             Invocation::ScriptFile,
             "echo one\necho two\n",
             workdir.path(),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.stdout, b"one\ntwo\n");
@@ -273,9 +311,51 @@ mod tests {
             Invocation::StdinPipe,
             "echo via-stdin\n",
             workdir.path(),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.stdout, b"via-stdin\n");
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn dash_c_invocation_with_stdin_input_feeds_a_read_builtin() {
+        // The Phase 5 case this exists for: a script running via `-c`
+        // (its *script text* is an argv argument, same as always) that
+        // also needs separate data available on stdin for `read` to
+        // consume -- distinct from `Invocation::StdinPipe`, which
+        // delivers the script itself over stdin instead.
+        let workdir = tempfile::tempdir().unwrap();
+        let outcome = run(
+            &ShellUnderTest::Oracle("bash"),
+            Invocation::DashC,
+            "read x; echo \"got:$x\"",
+            workdir.path(),
+            Some("hello\n"),
+        )
+        .unwrap();
+        assert_eq!(outcome.stdout, b"got:hello\n");
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn dash_c_invocation_without_stdin_input_closes_stdin() {
+        // Preserves every pre-Phase-5 case's assumption: with no `stdin`
+        // input configured, an unguarded `read` sees immediate EOF rather
+        // than hanging waiting for input that will never come (confirmed
+        // directly against bash: `read`'s own exit status is 1 on EOF,
+        // but that doesn't halt a `;`-joined list, so the trailing `echo`
+        // still runs and the *script's* exit code is 0).
+        let workdir = tempfile::tempdir().unwrap();
+        let outcome = run(
+            &ShellUnderTest::Oracle("bash"),
+            Invocation::DashC,
+            "read x; echo \"got:$x\"",
+            workdir.path(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.stdout, b"got:\n");
         assert_eq!(outcome.exit_code, Some(0));
     }
 
@@ -324,6 +404,7 @@ mod tests {
             Invocation::DashC,
             "exit 7",
             workdir.path(),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.exit_code, Some(7));
@@ -337,6 +418,7 @@ mod tests {
             Invocation::DashC,
             "pwd",
             workdir.path(),
+            None,
         )
         .unwrap();
         let canonical = std::fs::canonicalize(workdir.path()).unwrap();
