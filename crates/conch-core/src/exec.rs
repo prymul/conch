@@ -62,8 +62,8 @@ use std::process::Stdio;
 
 use conch_shell_parser::{
     AndOrList, CaseClause, Command, CommandList, CommandListItem, CompoundCommand,
-    CompoundCommandKind, ForClause, FunctionDefinition, IfClause, LogicalOp, Pipeline, Redirect,
-    RedirectOperator, Separator, SimpleCommand, Word,
+    CompoundCommandKind, ForClause, FunctionDefinition, IfClause, LogicalOp, Parameter, Pipeline,
+    Redirect, RedirectOperator, Separator, SimpleCommand, SpecialParameter, Word, WordSegment,
 };
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
@@ -268,32 +268,198 @@ fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
 /// (driven off `SIGCHLD`, see that module's docs) is what eventually
 /// notices it finished.
 ///
-/// `source` is `item.separator`'s own captured raw text — *except* when
-/// `and_or` is already, itself, exactly one bare subshell
-/// (`(cmd) &`, no `&&`/`||`, no pipe): reusing
-/// [`conch_shell_parser::SubshellBody::source`] directly there avoids
-/// double-wrapping (re-exec'ing `conch -c "(cmd)"` would itself spawn a
-/// second, redundant subshell re-exec internally once that child parses
-/// it back out) — see this phase's design review for the same
-/// reasoning.
+/// `source` is `item.separator`'s own captured raw text — *except* in two
+/// cases, both of which exist for the identical underlying reason (avoid
+/// double-wrapping a re-exec that the freshly spawned child would just
+/// immediately do *again*, one layer down, itself):
+///
+/// - `and_or` is already, itself, exactly one bare subshell (`(cmd) &`,
+///   no `&&`/`||`, no pipe): reusing
+///   [`conch_shell_parser::SubshellBody::source`] directly there avoids
+///   double-wrapping (re-exec'ing `conch -c "(cmd)"` would itself spawn a
+///   second, redundant subshell re-exec internally once that child parses
+///   it back out) — see this phase's design review for the same
+///   reasoning.
+/// - `and_or` is exactly one bare `"$0" -c <script>` (or `<this binary's
+///   own path> -c <script>`) invocation — see
+///   [`bare_self_reexec_script`]'s docs for why this is the same
+///   double-wrapping hazard in different clothes, and a real, observed
+///   bug (not a theoretical one) fixed here: `kill $!`/`wait $!` need
+///   `$!` to be the pid of the process that's actually going to run
+///   `<script>` (and thus actually own whatever `trap`/signal
+///   disposition it sets for itself), not an intermediate hop that never
+///   itself runs any of `<script>`'s own text.
 ///
 /// POSIX: the exit status of an asynchronous list is always `0`
 /// (confirmed against real bash) — this shell has never even *started*
 /// waiting for the job by the time this returns, so `0` is the only
 /// value that could ever be correct here regardless.
 fn exec_async(and_or: &AndOrList, source: &str, shell: &mut Shell) -> i32 {
-    let source = match &and_or.first.commands.as_slice() {
-        [
-            Command::Compound(CompoundCommand {
-                kind: CompoundCommandKind::Subshell(body),
-                redirects,
-            }),
-        ] if and_or.rest.is_empty() && redirects.is_empty() => body.source.as_str(),
-        _ => source,
-    };
+    if let [
+        Command::Compound(CompoundCommand {
+            kind: CompoundCommandKind::Subshell(body),
+            redirects,
+        }),
+    ] = and_or.first.commands.as_slice()
+        && and_or.rest.is_empty()
+        && redirects.is_empty()
+    {
+        spawn_background_job(body.source.as_str(), shell, true);
+        return 0;
+    }
 
-    spawn_background_job(source, shell);
+    // The self-reexec shape needs one real expansion (the inner
+    // `<script>` word) to produce the text a nested `conch -c` would
+    // actually run — unlike the subshell case above, there's no raw
+    // source span to reuse verbatim, since `<script>` is an ordinary
+    // *word* (quoting/expansion sites included), not literal shell
+    // script text framed by parens. See `bare_self_reexec_script`'s docs
+    // for why `shell` is only ever consulted here for a zero-expansion
+    // AST-shape check, and this is the *only* expansion this function
+    // ever performs — a non-matching shape falls through to the
+    // `spawn_background_job(source, ...)` call below having expanded
+    // nothing at all, so there's no risk of the fallback path's own
+    // (freshly spawned child's) expansion of the same text ever running
+    // twice.
+    if let Some(script) = bare_self_reexec_script(and_or, shell)
+        && let Ok(inner_source) = expand_word_single(script, shell)
+    {
+        // `subshell_pid: false` — see `spawn_background_job`'s own docs
+        // for why this one call site is the exception: this spawn is
+        // standing in for what would otherwise be an *ordinary
+        // external-command* spawn (`exec_external`, from a would-be
+        // wrapper's own foreground execution of `<self> -c <script>`),
+        // never a subshell of the *current* script, so `$$` inside
+        // `<script>` must read as this spawned process's own real pid
+        // (exactly the pid registered as `$!` here — matching real
+        // bash's single fork+exec, where the same process serves both
+        // roles) rather than being pinned to the top-level shell's pid
+        // the way a genuine async-subshell spawn's `$$` is.
+        spawn_background_job(&inner_source, shell, false);
+        return 0;
+    }
+
+    spawn_background_job(source, shell, true);
     0
+}
+
+/// Recognizes `and_or` as exactly one bare `Command::Simple` invocation of
+/// the shape `<self> -c <script>` — where `<self>` is `$0` (bare or
+/// double-quoted — both spellings are common) or a literal path identical
+/// to either this process's own [`std::env::current_exe`] or
+/// [`Shell::arg0`] — with no assignments, no redirects, and no trailing
+/// arguments beyond `<script>` itself. Returns the `<script>` word on a
+/// match, for [`exec_async`] to expand.
+///
+/// **Why this matters**: [`spawn_background_job`] always re-execs `conch
+/// -c <source>` as the backgrounded job. If `<source>` is itself exactly
+/// `<self> -c <script>`, the freshly spawned job (call it wrapper-1) does
+/// nothing but turn around and run *that* as an ordinary foreground
+/// external command — spawning a *second* nested `conch -c <script>`
+/// (wrapper-2) and blockingly waiting for it. `$!`, though, is already
+/// fixed to wrapper-1's pid by the time wrapper-2 is ever spawned:
+/// wrapper-1 never itself runs any of `<script>`'s own text (in
+/// particular, never installs any `trap` `<script>` sets on itself), so
+/// signaling `$!` reaches the wrong process entirely — confirmed via a
+/// real reproduction, not a theoretical concern: `"$0" -c "trap '' TERM;
+/// sleep 5" &` backgrounded this way has `kill $!` hit wrapper-1 (which
+/// dies immediately, TERM's disposition never having been touched there)
+/// instead of wrapper-2 (which actually ran `trap '' TERM` on itself).
+/// Real bash never has this problem because it forks exactly once for the
+/// whole `&`: that one child directly `execve`s into `<self>`, becoming
+/// wrapper-2 in place rather than forking it as a distinct process one
+/// layer down.
+///
+/// This function only ever inspects `and_or`'s AST shape and (for the
+/// literal-path spelling) reads `shell.arg0`/`current_exe()` — it
+/// deliberately never *expands* the command name itself, even though
+/// `expand_word_single` could resolve a bare `$0` cheaply and
+/// side-effect-free: a command name built from something with genuine
+/// expansion side effects (a contrived `` `echo "$0"` -c "..." & `` using
+/// command substitution to spell out the name, say) must never be
+/// evaluated *here*, on a path that might turn out not to match and fall
+/// back to [`spawn_background_job`]'s own from-scratch re-parse — that
+/// would run the exact same side-effecting expansion a second time. Every
+/// check below is either pure AST-shape matching or a side-effect-free
+/// OS query, so a non-matching shape is guaranteed to reach
+/// [`exec_async`]'s fallback having evaluated nothing at all.
+///
+/// Known, accepted narrow gap (consistent with this crate's existing
+/// precedent for similar re-exec plumbing — see [`exec_subshell`]'s own
+/// "known gap" docs): the one expansion this enables ([`exec_async`]'s
+/// call to `expand_word_single` on `<script>`) now runs directly against
+/// the *live* top-level `shell`, rather than inside a freshly spawned
+/// child's own disposable, from-scratch-reconstructed `Shell` the way it
+/// would for the ordinary (non-unwrapped) async path. For the overwhelming
+/// majority of real uses (a literal or variable-interpolated script
+/// string) this is unobservable — the expanded text is identical either
+/// way. The one case where it isn't: a `${var:=default}`-shaped
+/// assign-if-unset inside `<script>` would, with this fast path taken,
+/// mutate `var` in the *parent* shell's own live variable table (matching
+/// what a genuine `fork` would do, since `<script>` was always going to
+/// see the parent's variables one way or another) rather than only in a
+/// disposable copy that dies with the job — a real difference from the
+/// general async path's isolation, but one confirmed to require a
+/// deliberately unusual construction to observe at all, and not something
+/// this pass's fix is worth further scope to close.
+fn bare_self_reexec_script<'a>(and_or: &'a AndOrList, shell: &Shell) -> Option<&'a Word> {
+    if !and_or.rest.is_empty() {
+        return None;
+    }
+    let [Command::Simple(simple)] = and_or.first.commands.as_slice() else {
+        return None;
+    };
+    if !simple.assignments.is_empty() || !simple.redirects.is_empty() {
+        return None;
+    }
+    let name = simple.name.as_ref()?;
+    if !is_self_invocation(name, shell) {
+        return None;
+    }
+    let [flag, script] = simple.args.as_slice() else {
+        return None;
+    };
+    if flag.as_plain_literal() != Some("-c") {
+        return None;
+    }
+    Some(script)
+}
+
+/// Whether `name` is, purely by its AST shape or a literal-text
+/// comparison (never by expanding anything — see
+/// [`bare_self_reexec_script`]'s docs for why that matters), certain to
+/// resolve to invoking this exact shell binary again: a bare or
+/// double-quoted `$0` (`$0`/`"$0"` — both lex to the same
+/// [`SpecialParameter::Zero`], see `conch-shell-lexer`'s own token docs),
+/// or a plain literal (no quoting or expansion sites at all —
+/// [`Word::as_plain_literal`]) identical to either this running process's
+/// own [`std::env::current_exe`] or [`Shell::arg0`] (the shell's own
+/// recorded `$0`, which `$0`'s own expansion would produce anyway — see
+/// `conch-shell-core::expand`'s handling of [`SpecialParameter::Zero`]).
+fn is_self_invocation(name: &Word, shell: &Shell) -> bool {
+    let is_dollar_zero = |segments: &[WordSegment]| {
+        matches!(
+            segments,
+            [WordSegment::Parameter(Parameter::Special(
+                SpecialParameter::Zero
+            ))]
+        )
+    };
+    if is_dollar_zero(&name.segments) {
+        return true;
+    }
+    if let [WordSegment::DoubleQuoted(inner)] = name.segments.as_slice()
+        && is_dollar_zero(inner)
+    {
+        return true;
+    }
+    let Some(literal) = name.as_plain_literal() else {
+        return false;
+    };
+    if literal == shell.arg0 {
+        return true;
+    }
+    std::env::current_exe().is_ok_and(|exe| std::path::Path::new(literal) == exe)
 }
 
 /// The actual `conch -c <source>` re-exec + process-group + job-table
@@ -309,7 +475,29 @@ fn exec_async(and_or: &AndOrList, source: &str, shell: &mut Shell) -> i32 {
 /// happened to run first) reaped before [`crate::job::JobTable::register`]
 /// below ever runs, leaving a job-table entry that's permanently stuck
 /// `Running` for a process that's already gone.
-fn spawn_background_job(source: &str, shell: &mut Shell) {
+///
+/// `subshell_pid`: `true` for every ordinary async list (the common
+/// case, and the bare-subshell fast path in [`exec_async`]) — `$$`
+/// inside `source` must read as the *top-level* shell's own pid, per
+/// POSIX 2.12's "subshell environment," so this sets `__CONCH_PID`
+/// accordingly (see the `env` call below). `false` *only* for
+/// [`exec_async`]'s self-reexec fast path
+/// ([`bare_self_reexec_script`]): that spawn is standing in for what
+/// would otherwise be an ordinary *external-command* spawn
+/// (`exec_external`, from a would-be wrapper's own foreground execution
+/// of `<self> -c <script>`) one layer down, never a subshell of the
+/// *current* script — confirmed as a real, observed regression (not a
+/// theoretical concern), caught by this crate's own differential suite:
+/// `corpus/phase4/background_and_wait.toml`'s
+/// `wait-reports-a-background-jobs-death-by-uncaught-signal-as-128-plus-signal-number`
+/// deliberately constructs `"$0" -c "kill -TERM \$\$" &` specifically
+/// *because* `$$` inside a genuine subshell can't be used to target only
+/// itself (it reads as the top-level shell's own pid there); pinning
+/// `__CONCH_PID` for this fast path too would make `kill -TERM $$` hit
+/// the top-level shell instead of the freshly spawned job, killing the
+/// entire top-level process out from under the very script that
+/// backgrounded it.
+fn spawn_background_job(source: &str, shell: &mut Shell, subshell_pid: bool) {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
@@ -325,6 +513,13 @@ fn spawn_background_job(source: &str, shell: &mut Shell) {
         .current_dir(&shell.cwd)
         .env_clear()
         .envs(&shell.env_vars)
+        // POSIX 2.9.3.1: an *ignored* trap (`trap '' SIG`, no command
+        // text) is inherited into an async subshell environment too,
+        // unlike a *caught* one — see `Shell::ignored_trap_names`'s own
+        // docs for why propagating exactly this (and only this) subset
+        // of trap state through an environment variable is safe.
+        .env("__CONCH_IGNORED_SIGNALS", shell.ignored_trap_names());
+    if subshell_pid {
         // An asynchronous list is a POSIX 2.12 "subshell environment"
         // exactly like `(...)` is -- `$$` inside the backgrounded list
         // itself must still read as the *top-level* shell's PID, not
@@ -335,14 +530,12 @@ fn spawn_background_job(source: &str, shell: &mut Shell) {
         // ordinary external-command spawn (`exec_external`), which
         // builds its child's environment from `shell.env_vars` alone
         // (already stripped of this key by `Shell::new`), never from
-        // this process's raw OS environment.
-        .env("__CONCH_PID", shell.pid.to_string())
-        // POSIX 2.9.3.1: an *ignored* trap (`trap '' SIG`, no command
-        // text) is inherited into an async subshell environment too,
-        // unlike a *caught* one — see `Shell::ignored_trap_names`'s own
-        // docs for why propagating exactly this (and only this) subset
-        // of trap state through an environment variable is safe.
-        .env("__CONCH_IGNORED_SIGNALS", shell.ignored_trap_names());
+        // this process's raw OS environment -- see this function's own
+        // `subshell_pid` docs for the one call site that deliberately
+        // sets `subshell_pid: false` because *it itself* is standing in
+        // for exactly that kind of ordinary external-command spawn.
+        command.env("__CONCH_PID", shell.pid.to_string());
+    }
     // New process group (this child becomes its own leader) regardless
     // of whether *this* session has an interactive terminal to hand
     // around — a background job still needs its own pgid so a later
@@ -1397,7 +1590,28 @@ fn exec_builtin(
         }
     }
 
-    if !stderr_buf.is_empty() {
+    // A builtin's *stderr* output must respect a `2>`/`2>>` redirect on
+    // the command exactly the same way its stdout already respects a
+    // `1>`/`>`/`>>` one just below — caught by a security/testing review
+    // as a real bug (not merely a gap): `eval "if" 2>/dev/null`'s own
+    // syntax-error diagnostic (written through `Eval`'s own `stderr`
+    // parameter, exactly as every builtin here is supposed to) was
+    // leaking to the real process stderr regardless, since this used to
+    // unconditionally flush `stderr_buf` there with no redirect check at
+    // all -- a general gap in this function affecting *every* builtin's
+    // stderr, not anything specific to `eval`.
+    if let Some(err_redirect) = redirects.iter().rev().find(|r| {
+        r.fd == 2
+            && matches!(
+                r.operator,
+                RedirectOperator::Output | RedirectOperator::Append
+            )
+    }) {
+        if let Err(err) = write_redirect(err_redirect, &stderr_buf, shell.noclobber) {
+            eprintln!("conch: {}: {err}", err_redirect.target);
+            return (1, None);
+        }
+    } else if !stderr_buf.is_empty() {
         let _ = std::io::stderr().write_all(&stderr_buf);
     }
 
@@ -2008,6 +2222,57 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
     }
 
+    // ---- a builtin's stderr respects a `2>` redirect on its own command -----
+    //
+    // Real bug, caught by a testing/security review: `eval "if"
+    // 2>/dev/null`'s own syntax-error diagnostic (written through
+    // `Eval`'s own `stderr` parameter, exactly as every builtin here is
+    // supposed to) was leaking to the real process stderr regardless --
+    // `exec_builtin` unconditionally flushed a builtin's captured
+    // `stderr_buf` to the real stderr with no redirect check at all, a
+    // general gap affecting *every* builtin's stderr, not anything
+    // `eval`-specific (its own stdout already correctly respected a
+    // `1>`/`>`/`>>` redirect; only the stderr half was missing the
+    // identical treatment).
+
+    struct StderrWriter;
+    impl crate::Builtin for StderrWriter {
+        fn run(
+            &self,
+            _shell: &mut Shell,
+            _args: &[String],
+            _stdin: &mut dyn std::io::Read,
+            _stdout: &mut dyn std::io::Write,
+            stderr: &mut dyn std::io::Write,
+        ) -> i32 {
+            let _ = writeln!(stderr, "oops");
+            0
+        }
+    }
+
+    #[test]
+    fn a_builtins_stderr_output_respects_a_2_redirect_on_its_own_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("err.txt");
+        let mut shell = Shell::new();
+        shell.register_builtin("stderrwriter", Box::new(StderrWriter));
+        let script = format!("stderrwriter 2> {}", path.display());
+        run(&script, &mut shell);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "oops\n");
+    }
+
+    #[test]
+    fn a_builtins_stderr_output_still_goes_to_real_stderr_with_no_redirect() {
+        // Not directly assertable (real stderr isn't capturable from
+        // inside a unit test), but confirms the redirect-absent path
+        // still runs to completion normally rather than erroring or
+        // panicking now that a redirect-present branch exists alongside
+        // it.
+        let mut shell = Shell::new();
+        shell.register_builtin("stderrwriter", Box::new(StderrWriter));
+        assert_eq!(run("stderrwriter", &mut shell), 0);
+    }
+
     // ---- subshell / brace group isolation -----------------------------------
     //
     // Subshell *execution* (isolation of cwd/variables/exit, exit-status
@@ -2026,6 +2291,112 @@ mod tests {
         shell.shell_vars.insert("X".into(), "outer".into());
         run("{ X=inner; }", &mut shell);
         assert_eq!(shell.get_var("X"), Some("inner"));
+    }
+
+    // ---- exec_async's bare-`"$0" -c <script>` unwrapping ---------------------
+    //
+    // `exec_async` itself is deliberately not unit-tested end-to-end here,
+    // for the identical reason `exec_subshell` isn't (see the section
+    // above): `spawn_background_job` re-execs `env::current_exe()`, which
+    // during `cargo test` is this test binary, not the real `conch`
+    // executable. `bare_self_reexec_script`/`is_self_invocation` are pure,
+    // side-effect-free AST/string checks with no process of their own to
+    // spawn, though, so *those* are fully testable directly — this is
+    // exactly the shape the real bug lived in (see `exec_async`'s own
+    // docs), and the differential suite's `phase5/kill.toml` covers the
+    // real, end-to-end process behavior this exists to fix.
+
+    fn one_and_or(input: &str) -> AndOrList {
+        let mut list = parse(input).unwrap();
+        assert_eq!(list.items.len(), 1);
+        list.items.remove(0).and_or
+    }
+
+    #[test]
+    fn recognizes_bare_and_double_quoted_dollar_zero_as_self() {
+        let shell = Shell::new();
+        assert!(is_self_invocation(&parse_word("$0"), &shell));
+        assert!(is_self_invocation(&parse_word("\"$0\""), &shell));
+    }
+
+    #[test]
+    fn does_not_recognize_an_unrelated_variable_as_self() {
+        let shell = Shell::new();
+        assert!(!is_self_invocation(&parse_word("$OTHER"), &shell));
+        assert!(!is_self_invocation(&parse_word("some_prog"), &shell));
+    }
+
+    #[test]
+    fn recognizes_a_literal_path_matching_arg0_as_self() {
+        let mut shell = Shell::new();
+        shell.arg0 = "/path/to/myshell".to_string();
+        assert!(is_self_invocation(&parse_word("/path/to/myshell"), &shell));
+        assert!(!is_self_invocation(&parse_word("/some/other/bin"), &shell));
+    }
+
+    #[test]
+    fn bare_self_reexec_script_matches_dollar_zero_dash_c_script() {
+        let shell = Shell::new();
+        let and_or = one_and_or("\"$0\" -c \"trap '' TERM; sleep 5\"");
+        let script = bare_self_reexec_script(&and_or, &shell).expect("shape should match");
+        // The script word round-trips (quote removal only, no variables
+        // here) to exactly the text that would become the nested `-c`
+        // argument.
+        let mut shell = shell;
+        assert_eq!(
+            expand_word_single(script, &mut shell).unwrap(),
+            "trap '' TERM; sleep 5"
+        );
+    }
+
+    #[test]
+    fn bare_self_reexec_script_rejects_an_ordinary_external_command() {
+        let shell = Shell::new();
+        let and_or = one_and_or("sleep 5");
+        assert!(bare_self_reexec_script(&and_or, &shell).is_none());
+    }
+
+    #[test]
+    fn bare_self_reexec_script_rejects_trailing_args_past_the_script() {
+        let shell = Shell::new();
+        let and_or = one_and_or("\"$0\" -c \"echo hi\" extra");
+        assert!(bare_self_reexec_script(&and_or, &shell).is_none());
+    }
+
+    #[test]
+    fn bare_self_reexec_script_rejects_a_pipeline_or_and_or_chain() {
+        let shell = Shell::new();
+        assert!(
+            bare_self_reexec_script(&one_and_or("\"$0\" -c \"echo hi\" | cat"), &shell).is_none()
+        );
+        assert!(
+            bare_self_reexec_script(&one_and_or("\"$0\" -c \"echo hi\" && echo also"), &shell)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bare_self_reexec_script_rejects_a_prefix_assignment_or_redirect() {
+        let shell = Shell::new();
+        assert!(
+            bare_self_reexec_script(&one_and_or("FOO=bar \"$0\" -c \"echo hi\""), &shell).is_none()
+        );
+        assert!(
+            bare_self_reexec_script(&one_and_or("\"$0\" -c \"echo hi\" > out.txt"), &shell)
+                .is_none()
+        );
+    }
+
+    /// Parses `input` as a single word (via a one-argument `echo` command,
+    /// since the parser has no standalone "parse just a word" entry
+    /// point) — the private `is_self_invocation`/`bare_self_reexec_script`
+    /// helpers above only ever need a [`Word`], not a whole command.
+    fn parse_word(input: &str) -> Word {
+        let and_or = one_and_or(&format!("echo {input}"));
+        let [Command::Simple(simple)] = and_or.first.commands.as_slice() else {
+            panic!("expected a simple command");
+        };
+        simple.args[0].clone()
     }
 
     // ---- break/continue propagation mechanism --------------------------------

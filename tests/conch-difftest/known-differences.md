@@ -15,8 +15,9 @@ match bash/sh for this specific case, and here's why.
 
 ## Deliberate conch-vs-bash/sh divergences
 
-Two real, decided-on-purpose divergences exist so far, both from Phase 4
-(job control). The two sections after this one are a different,
+Five real, decided-on-purpose divergences exist so far: KD-0001 through
+KD-0003 from Phase 4 (job control), and KD-0004/KD-0005 from Phase 5
+(builtins completeness). The two sections after this one are a different,
 complementary kind of record: not conch decisions at all, but
 divergences *between the two oracle shells themselves* (bash and dash),
 found and verified while building the Phase 2 (`corpus/phase2/`)
@@ -202,6 +203,128 @@ that's only wired up in `conch`'s own `run_interactive`, not
 it's written. Found and confirmed via live `pty`-backed manual testing,
 not the differential suite.
 
+### KD-0004: `eval`'s syntax-error handling matches bash's leniency, not dash's abort-on-error
+
+**What diverges:** when the string passed to `eval` fails to parse (a
+syntax error), conch does not terminate the rest of the script -- the
+`eval` call itself fails with a nonzero status and execution continues
+normally afterward, even on the same physical source line.
+
+**bash/sh behavior:** bash matches conch's behavior exactly here: `eval`'s
+parse failure is an ordinary, non-fatal error, and the rest of the
+script -- including anything joined by `;` on the same line as the
+failing `eval` -- runs normally afterward. dash instead takes POSIX
+2.14's permitted stricter reading for `eval` (one of POSIX's fourteen
+"special built-in" utilities): a special built-in's error aborts the
+entire remaining non-interactive script outright, with no exemption for
+same-line-joined commands.
+
+**conch behavior:** matches bash's leniency, not dash's abort. This was a
+deliberate choice covering `eval` together with `readonly`/`unset`/`set
+-u`'s equivalent special-built-in error paths (see
+`known-differences.md`'s "Cross-shell quirks worth knowing" section for
+the consolidated bash-vs-dash writeup this decision was made in response
+to) -- `eval`'s piece of that decision is confirmed landed and pinned
+here; the others are tracked separately and may pick up their own KD
+entries as each lands.
+
+**Why:** this project has an established precedent of matching bash's
+behavior over strict-but-optional POSIX behavior when the two genuinely
+diverge and POSIX doesn't mandate the stricter reading (dash's
+special-built-in abort is *permitted*, not *required*, by POSIX 2.14).
+Aborting an entire non-interactive script on an `eval` parse error is
+also simply harsher than most real-world scripts expect or want --
+bash's "the failed thing fails, everything else keeps going" model is
+the more broadly useful default, and is what the overwhelming majority of
+`bash`-targeting (and `sh`-targeting-but-bash-tested) scripts in the wild
+already assume.
+
+**Case:** `corpus/phase5/source_and_eval.toml` ->
+`eval-syntax-error-matches-bashs-leniency-not-dashs-abort` (a
+`known_difference` case, pinning conch's own expected `exit:2\n` stdout
+and exit code `0` directly, rather than a live oracle comparison against
+dash -- a live comparison for this exact construct would now fail
+forever by design once this decision landed, which is precisely the
+scenario `known_difference` exists for). The sibling
+`eval-syntax-error-is-non-fatal-on-bash` case remains a live `oracles =
+["bash"]` comparison, since conch matching bash here means that
+comparison keeps being meaningful indefinitely.
+
+### KD-0005: `alias` definitions don't propagate across any re-exec boundary
+
+**What diverges:** an alias defined in the current shell is silently
+never expanded inside a subshell, a backgrounded (`&`) list, or a command
+substitution, even though all three otherwise run "in the current
+shell['s] environment" for every other purpose POSIX cares about here.
+No error, no warning -- the raw, unaliased command just runs instead.
+Concretely: `alias rm='rm -i'; (rm somefile)` silently runs the bare `rm`
+inside the subshell, quietly losing a user's own interactive safety-net
+alias.
+
+**bash/sh behavior:** aliases are a property of the shell's own parser
+state at the moment a command is read, and a subshell/background job/
+command substitution all read their commands using that same, still-live
+alias table -- an alias defined before entering any of the three is
+visible inside it.
+
+**conch behavior:** never visible inside any of the three, for two
+distinct underlying reasons that both land on the identical symptom:
+
+- A subshell (`Parser::parse_subshell`) and a backgrounded list
+  (`Parser::parse_optional_separator`'s `Separator::Async` case) both
+  capture their own re-exec source text by slicing the *original,
+  unmodified* input string by byte offset (`self.source[open.end..close_start]`
+  for a subshell, the equivalent `self.source[item_start..amp_start]` for
+  an async list) -- see [`conch_shell_parser::SubshellBody::source`]'s
+  own doc comment for why the *executor* needs this raw text at all,
+  rather than just walking the already-parsed body. `maybe_expand_alias`
+  (see [`conch_shell_parser::parse_with_aliases`]'s own docs) only ever
+  splices replacement tokens into the parser's *token stream*
+  (`self.tokens`) -- it has no reason to, and doesn't, rewrite
+  `self.source` itself. So the captured slice is always the literal,
+  pre-expansion source text regardless of what alias expansion did to the
+  token stream alongside it, and `conch-shell-core::exec`'s re-exec of
+  that slice (`conch -c <source>`) runs it through plain, non-alias-aware
+  `parse` in a fresh child `Shell` with an empty alias table to begin
+  with.
+- Command substitution has the same symptom for an even more fundamental,
+  Phase-2-vintage reason: its body (`conch_shell_lexer::CommandSubstitution::body`)
+  is captured as opaque, unparsed text by the *lexer*, before the parser
+  -- and therefore before `maybe_expand_alias`, which only runs during
+  parsing -- ever sees a single token of it.
+
+**Why:** not fixed, and not planned as a targeted fix, for the same
+category of reason KD-0001 already declined propagating `trap`'s command
+text the same way: every one of these three boundaries is a genuinely
+separate re-exec'd process (`conch -c <text>`), not an in-process fork of
+interpreter state (see
+`conch-shell-core::exec::exec_subshell`'s own doc comment for why that's
+a hard requirement, not a shortcut), and an alias's replacement text is
+exactly as arbitrary, attacker-shaped user data as a trap's command text
+is -- propagating it through an environment variable for a freshly
+started interpreter to automatically parse and act on at startup is the
+same general shape Shellshock's (CVE-2014-6271) post-mortem warns about,
+even though (as with KD-0001) the specific exploitability chain doesn't
+carry over one-for-one. This is a different category from the
+`__CONCH_IGNORED_SIGNALS`/`__CONCH_PID` propagation this same codebase
+already does safely: both of those carry a closed, fixed-shape payload
+(a signal name from a known enum, a decimal PID) with no room for
+arbitrary content, which an alias's replacement text -- ordinary shell
+source, by definition -- structurally cannot be narrowed to the same
+way. A script that actually needs an alias visible inside one of these
+three boundaries already has an exact, zero-propagation-machinery
+workaround available: define the alias *inside* the subshell/background
+list/command-substitution body directly, the same escape hatch KD-0001
+notes for trap text.
+
+**Case:** not currently represented in the differential corpus -- found
+via a security-review code trace (`Parser::parse_subshell`/
+`parse_optional_separator`'s source-slicing, `CommandSubstitution`'s
+lexer-time capture), not a failing test. A live-oracle case is
+straightforward to add (`alias rm='rm -i'; (rm --version 2>&1 | head
+-1)`-shaped, comparing whether the subshell's own resolved command
+reflects the alias) whenever the Phase 5 corpus is next touched.
+
 ## Bash extensions not in the POSIX baseline
 
 Every construct below is something bash supports that POSIX `sh` (and
@@ -331,15 +454,17 @@ just the target(s) that do agree.
   same-line-vs-next-line asymmetry already documented above for
   `${var:?message}` and arithmetic division by zero -- those are both
   instances of this exact same general rule, now confirmed to extend
-  well beyond parameter/arithmetic expansion errors). See
-  `corpus/phase5/declare_and_readonly.toml`'s and
-  `corpus/phase5/source_and_eval.toml`'s cases for `readonly`/`unset`/
-  `eval`, and `corpus/phase5/set_options.toml` for `set -u` -- each
-  either narrows `compare` to `["stdout"]` (when a same-line comparison
-  happens to still agree, differing only in the reported exit code) or
-  splits into a dedicated `oracles = ["bash"]` case plus, where useful, a
-  mirroring `oracles = ["sh"]` case, exactly like the `alias` divergence
-  below.
+  well beyond parameter/arithmetic expansion errors). conch's own
+  decision across this whole set is to match bash's leniency, not dash's
+  strictness -- `eval`'s piece of that decision has landed and is pinned
+  as **KD-0004** (see above); `readonly`/`unset`/`set -u`'s pieces are
+  still tracked here as live-oracle-comparison corpus cases
+  (`corpus/phase5/declare_and_readonly.toml`,
+  `corpus/phase5/set_options.toml`, narrowing `compare` to `["stdout"]`
+  where a same-line comparison still agrees except for the reported exit
+  code, or splitting into a dedicated `oracles = ["bash"]` case) pending
+  the same fix landing for each of them and picking up their own KD entry
+  in turn.
 
 - **`getopts`/`OPTIND` interaction across two independent, unrelated
   parses without an explicit `OPTIND=1` reset differs.** Reusing

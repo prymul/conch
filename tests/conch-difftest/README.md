@@ -351,6 +351,7 @@ behavior conch deliberately and permanently diverges on:
 [[case]]
 name = "some-deliberate-divergence"
 description = "..."
+oracles = []
 known_difference = { id = "KD-0001", expect_stdout = "...", expect_exit_code = 0 }
 script = '''
 ...
@@ -358,17 +359,35 @@ script = '''
 ```
 
 When set, the case is checked against conch's own pinned expectation
-instead of a live oracle run, and `oracles` may be omitted. Every such case
-must have a matching entry in `known-differences.md` explaining *why*.
-**There are no `known_difference` cases yet** -- no genuinely deliberate,
-permanent conch-vs-bash/sh divergence has actually been decided on. A
-conch output that merely doesn't match bash/sh yet (an unimplemented
-feature, or a regression) is not a known difference and does not belong
-here -- see `known-differences.md`'s own header for the distinction.
-`known-differences.md` does separately track divergences *between bash
-and POSIX sh themselves* (found while building the Phase 2 corpus) --
-that's a different, non-`known_difference`-schema section of the same
-file, for context rather than for a specific case's pinned expectation.
+instead of a live oracle run. `Case::validate` doesn't actually *require*
+`oracles` to be empty when `known_difference` is set (only that it isn't
+empty when `known_difference` is *not* set), but write `oracles = []`
+explicitly anyway rather than omitting the field: omitting it lets serde's
+ordinary default silently fill in `["bash"]` (the same default a case
+with no `known_difference` at all gets), which -- confirmed while adding
+this crate's first real `known_difference` case, `corpus/phase5/
+source_and_eval.toml`'s `eval-syntax-error-matches-bashs-leniency-not-
+dashs-abort` -- means `oracle_selfcheck.rs` would still run that oracle
+(trivially, bash vs. itself, so it can't ever actually fail) purely
+because the field was left absent rather than because it means anything.
+Every `known_difference` case must have a matching entry in
+`known-differences.md` explaining *why*. A conch output that merely
+doesn't match bash/sh yet (an unimplemented feature, or a regression) is
+not a known difference and does not belong here -- see
+`known-differences.md`'s own header for the distinction. As of this
+writing there are four real `known_difference`-backed entries (KD-0001
+through KD-0004, three from Phase 4's job control and one -- `eval`'s
+syntax-error handling -- from Phase 5), though only KD-0004 currently has
+a corresponding `known_difference`-schema corpus case pinning it directly
+(`corpus/phase5/source_and_eval.toml`); KD-0001 through KD-0003 are still
+tracked as prose-only entries with their corpus case (where one exists at
+all) left as an ordinary, currently-failing live oracle comparison --
+converting one to `known_difference` is a deliberate follow-up step, not
+automatic the moment an entry is written. `known-differences.md` does
+separately track divergences *between bash and POSIX sh themselves*
+(found while building the Phase 2 corpus) -- that's a different,
+non-`known_difference`-schema section of the same file, for context
+rather than for a specific case's pinned expectation.
 
 ## How the harness works mechanically
 

@@ -753,14 +753,23 @@ impl Shell {
     /// omits it from the reset list.
     ///
     /// # Safety-review note on `pre_exec`
-    /// The closure below runs in the forked child between `fork` and
-    /// `execve`, the exact same async-signal-safety-constrained window a
-    /// raw `fork()` call would have — `sigaction` is on the documented
-    /// async-signal-safe list (`signal-safety(7)`), and every signal to
-    /// reset is captured by value into the closure *before* the fork (no
-    /// `self`/`Shell` access, no allocation, after it starts running),
-    /// per the exact review guidance this function was written to
-    /// satisfy.
+    /// The closure below runs immediately before `execve` replaces the
+    /// calling process's image — for an ordinary spawn (`Command::spawn`),
+    /// that's in the freshly-`fork`ed child, the exact same
+    /// async-signal-safety-constrained window a raw `fork()` call would
+    /// have; for the `exec` builtin's own use of this same function (via
+    /// `Command::exec()`, which never forks at all — it replaces *this*
+    /// process directly), it's that same window with no fork boundary
+    /// even present, a strictly *less* constrained context, not a new or
+    /// different hazard (there's no address-space-sharing-with-the-parent
+    /// concern to reason about at all when there's no parent, only the
+    /// one process, right up until `execve` replaces it). Either way,
+    /// `sigaction` is on the documented async-signal-safe list
+    /// (`signal-safety(7)`), and every signal to reset is captured by
+    /// value into the closure *before* this function returns (no
+    /// `self`/`Shell` access, no allocation, once the closure itself
+    /// starts running), per the exact review guidance this function was
+    /// written to satisfy.
     pub fn prepare_child_for_job_control(
         &self,
         command: &mut std::process::Command,
