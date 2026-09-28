@@ -21,3 +21,21 @@ tempfile = "3"
 # instead locates `target/{release,debug}/conch` relative to the
 # workspace root directly -- see its doc comment and README.md ("Wiring
 # in real execution").
+
+[dev-dependencies]
+# Phase 6's `PS1`/`PS2` expansion and command-position tab completion are
+# the first (and, by design, only) pieces of conch's behavior this crate
+# calls *in-process* rather than by spawning the compiled `conch` binary --
+# see README.md's "Phase 6: what's differential and what isn't" for the
+# full "why" (prompt rendering/completion only happen inside conch's
+# interactive readline loop, which needs a real pty this harness never
+# allocates). `conch-shell-core` is a genuine `[lib]` target (unlike the
+# bin-only `conch-shell` package noted above), reachable as a normal path
+# dependency with no `bindeps` workaround -- and, per the same README
+# section, this only works *because* `expand_prompt`/`CompletionState`/
+# `command_candidates` were deliberately placed there rather than staying
+# in the bin-only `conch-shell` package they were first prototyped in.
+# A `[dev-dependencies]` entry, not `[dependencies]`: nothing in this
+# crate's own library code (`src/`) needs it, only
+# `tests/phase6_prompt_differential.rs`/`tests/phase6_completion_differential.rs`.
+conch-shell-core = { workspace = true }

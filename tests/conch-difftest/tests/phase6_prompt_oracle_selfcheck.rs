@@ -102,7 +102,7 @@ fn selfcheck_one(case: &PromptCase) -> Result<(), String> {
 
 #[test]
 fn phase6_prompt_oracle_agrees_with_itself() {
-    let phase6 = corpus::corpus_root().join("phase6");
+    let phase6 = corpus::corpus_root().join("phase6").join("prompt");
     let cases = corpus::load_prompt_dir(&phase6).expect("phase 6 prompt corpus failed to load");
 
     let mut failures = Vec::new();

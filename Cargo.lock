@@ -33,6 +33,7 @@ dependencies = [
 name = "conch-difftest"
 version = "0.2.0"
 dependencies = [
+ "conch-shell-core",
  "serde",
  "tempfile",
  "toml",

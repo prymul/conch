@@ -8,7 +8,7 @@ use conch_difftest::corpus;
 
 #[test]
 fn phase6_prompt_corpus_loads_and_validates() {
-    let phase6 = corpus::corpus_root().join("phase6");
+    let phase6 = corpus::corpus_root().join("phase6").join("prompt");
     let cases = corpus::load_prompt_dir(&phase6)
         .unwrap_or_else(|err| panic!("phase 6 prompt corpus failed to load: {err}"));
     assert!(

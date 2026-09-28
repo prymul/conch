@@ -9,6 +9,7 @@
 
 pub mod case;
 pub mod compare;
+pub mod completion_case;
 pub mod completion_oracle;
 pub mod corpus;
 pub mod invoke;

@@ -15,9 +15,10 @@ match bash/sh for this specific case, and here's why.
 
 ## Deliberate conch-vs-bash/sh divergences
 
-Five real, decided-on-purpose divergences exist so far: KD-0001 through
-KD-0003 from Phase 4 (job control), and KD-0004/KD-0005 from Phase 5
-(builtins completeness). The two sections after this one are a different,
+Six real, decided-on-purpose divergences exist so far: KD-0001 through
+KD-0003 from Phase 4 (job control), KD-0004/KD-0005 from Phase 5
+(builtins completeness), and KD-0006 from Phase 6 (interactive UX --
+`PS1`/`PS2` prompt expansion). The two sections after this one are a different,
 complementary kind of record: not conch decisions at all, but
 divergences *between the two oracle shells themselves* (bash and dash),
 found and verified while building the Phase 2 (`corpus/phase2/`)
@@ -324,6 +325,42 @@ lexer-time capture), not a failing test. A live-oracle case is
 straightforward to add (`alias rm='rm -i'; (rm --version 2>&1 | head
 -1)`-shaped, comparing whether the subshell's own resolved command
 reflects the alias) whenever the Phase 5 corpus is next touched.
+
+### KD-0006: `PS1`/`PS2`'s `\s`/`\v`/`\V` escapes report conch's own identity, not bash's
+
+**What diverges:** `\s` (shell name), `\v` (major.minor version), and `\V`
+(full version) in an expanded `PS1`/`PS2` report conch's own name and
+Cargo package version, not the string `"bash"` or bash's own version.
+
+**bash/sh behavior:** `\s` expands to `"bash"` (or whatever `$0`'s
+basename is, for a renamed/symlinked binary); `\v`/`\V` expand to bash's
+own compiled-in version (e.g. `5.3`/`5.3.20(1)-release`).
+
+**conch behavior:** `\s` expands to `$0`'s own basename with a leading
+`-` stripped (`conch_shell_core::prompt::shell_name`) -- `"conch"` for
+every ordinary invocation, since nothing in this project models a
+login-shell leading-`-` convention of its own. `\v`/`\V` expand to
+`env!("CARGO_PKG_VERSION_MAJOR").env!("CARGO_PKG_VERSION_MINOR")`/
+`env!("CARGO_PKG_VERSION")` respectively -- conch's own crate version at
+build time.
+
+**Why:** these three escapes exist specifically to answer "which shell,
+and which version of it, am I looking at" -- correctly reporting conch's
+own identity here isn't a shortcut or a gap, it's the entire point of the
+escape existing at all. Matching bash's literal `"bash"`/bash's own
+version string would be actively wrong (indistinguishable from actually
+running bash), not more "compatible."
+
+**Case:** `corpus/phase6/prompt/prompt_expansion.toml` ->
+`shell-name-escape-is-a-known-difference` (`\s`, pinned via
+`known_difference` against the fixed, permanent literal `"conch"`). `\v`/
+`\V` are deliberately **not** a corpus case: the expected string changes
+on every version bump (this project's release process re-versions
+automatically on every push to `main` -- see `CLAUDE.md`), and
+`known_difference.expect` is a static, hand-pinned TOML string with no
+mechanism to track that automatically -- documented here in prose
+instead, the same "not every divergence needs a corpus case" precedent
+KD-0002/KD-0003 already established.
 
 ## Bash extensions not in the POSIX baseline
 

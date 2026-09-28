@@ -58,10 +58,21 @@ jobs:
   # CONCH_DIFFTEST_STRICT=1 makes a failing corpus case fail the build.
   # Phase 1 execution has landed and the corpus is 100/100 against real
   # bash/sh, so this is now a hard gate rather than report-only.
+  #
+  # CONCH_DIFFTEST_STRICT_PHASE6=1: unlike Phase 2-5 (still report-only --
+  # their own conch-side execution is incomplete), Phase 6's two
+  # in-process differential suites (`phase6_prompt_differential.rs`,
+  # `phase6_completion_differential.rs` -- see tests/conch-difftest/README.md's
+  # "Phase 6" section for why those call `conch_shell_core::expand_prompt`/
+  # `command_candidates` directly rather than spawning a `conch` binary)
+  # are fully green against the real, complete implementation as of this
+  # writing, the same "green against a complete implementation, not a
+  # partial one" bar Phase 1's own hard gate was flipped on.
   difftest:
     runs-on: ubuntu-latest
     env:
       CONCH_DIFFTEST_STRICT: "1"
+      CONCH_DIFFTEST_STRICT_PHASE6: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

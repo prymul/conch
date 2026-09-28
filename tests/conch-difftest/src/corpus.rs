@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::case::{Case, CaseFile};
+use crate::completion_case::{CompletionCase, CompletionCaseFile};
 use crate::prompt_case::{PromptCase, PromptCaseFile};
 
 #[derive(Debug)]
@@ -96,6 +97,44 @@ pub fn load_prompt_dir(dir: &Path) -> Result<Vec<PromptCase>, CorpusError> {
                 return Err(CorpusError(format!(
                     "{}: duplicate prompt case name {:?} (case names must be unique across the \
                      whole prompt-case corpus, since they're used as test identifiers in reports)",
+                    file.display(),
+                    case.name
+                )));
+            }
+            cases.push(case);
+        }
+    }
+
+    Ok(cases)
+}
+
+/// Loads and validates every `*.toml` completion-case file under `dir` --
+/// the [`CompletionCase`] (Phase 6 command-position tab completion)
+/// sibling of [`load_dir`]/[`load_prompt_dir`]. See `completion_case.rs`'s
+/// module doc comment for why this is its own schema/loader.
+pub fn load_completion_dir(dir: &Path) -> Result<Vec<CompletionCase>, CorpusError> {
+    let mut files = Vec::new();
+    collect_toml_files(dir, &mut files)?;
+    files.sort();
+
+    let mut cases = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .map_err(|err| CorpusError(format!("{}: {err}", file.display())))?;
+        let parsed: CompletionCaseFile = toml::from_str(&text)
+            .map_err(|err| CorpusError(format!("{}: {err}", file.display())))?;
+
+        for mut case in parsed.cases {
+            case.source_file = file.clone();
+            case.validate()
+                .map_err(|msg| CorpusError(format!("{}: {msg}", file.display())))?;
+            if !seen_names.insert(case.name.clone()) {
+                return Err(CorpusError(format!(
+                    "{}: duplicate completion case name {:?} (case names must be unique across \
+                     the whole completion-case corpus, since they're used as test identifiers in \
+                     reports)",
                     file.display(),
                     case.name
                 )));
@@ -305,12 +344,108 @@ mod tests {
     #[test]
     fn real_phase6_prompt_corpus_loads_and_validates() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let phase6 = manifest_dir.join("corpus").join("phase6");
+        let phase6 = manifest_dir.join("corpus").join("phase6").join("prompt");
         if !phase6.exists() {
             // The scratch/validation sandbox doesn't ship the real corpus.
             return;
         }
         let cases = load_prompt_dir(&phase6).unwrap();
+        assert!(!cases.is_empty());
+    }
+
+    #[test]
+    fn loads_completion_cases_from_nested_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        write_case_file(
+            dir.path(),
+            "a.toml",
+            r#"
+            [[case]]
+            name = "top-level-completion-case"
+            description = "d"
+            prefix = "a"
+            functions = ["afn"]
+            "#,
+        );
+        write_case_file(
+            &dir.path().join("sub"),
+            "b.toml",
+            r#"
+            [[case]]
+            name = "nested-completion-case"
+            description = "d"
+            prefix = "b"
+            functions = ["bfn"]
+            "#,
+        );
+
+        let cases = load_completion_dir(dir.path()).unwrap();
+        let mut names: Vec<_> = cases.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["nested-completion-case", "top-level-completion-case"]
+        );
+    }
+
+    #[test]
+    fn duplicate_completion_case_names_across_files_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_case_file(
+            dir.path(),
+            "a.toml",
+            r#"
+            [[case]]
+            name = "dup"
+            description = "d"
+            functions = ["f"]
+            "#,
+        );
+        write_case_file(
+            dir.path(),
+            "b.toml",
+            r#"
+            [[case]]
+            name = "dup"
+            description = "d"
+            functions = ["f"]
+            "#,
+        );
+
+        let err = load_completion_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("duplicate completion case name"));
+    }
+
+    #[test]
+    fn invalid_completion_case_is_rejected_with_file_context() {
+        let dir = tempfile::tempdir().unwrap();
+        write_case_file(
+            dir.path(),
+            "a.toml",
+            r#"
+            [[case]]
+            name = "bad"
+            description = "d"
+            "#,
+        );
+
+        let err = load_completion_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("a.toml"));
+        assert!(err.to_string().contains("must define at least one of"));
+    }
+
+    #[test]
+    fn real_phase6_completion_corpus_loads_and_validates() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let phase6 = manifest_dir
+            .join("corpus")
+            .join("phase6")
+            .join("completion");
+        if !phase6.exists() {
+            return;
+        }
+        let cases = load_completion_dir(&phase6).unwrap();
         assert!(!cases.is_empty());
     }
 }
