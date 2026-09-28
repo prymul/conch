@@ -1,9 +1,19 @@
-use std::process::ExitCode;
+mod completion;
+mod helper;
+mod highlight;
+mod history;
+mod quoting;
 
-use conch_shell_core::{JobState, Shell, exec_program};
+use std::cell::RefCell;
+use std::process::ExitCode;
+use std::rc::Rc;
+
+use conch_shell_core::{CompletionState, JobState, Shell, exec_program};
 use conch_shell_parser::{parse, parse_with_aliases};
-use rustyline::DefaultEditor;
+use helper::ConchHelper;
 use rustyline::error::ReadlineError;
+use rustyline::history::{DefaultHistory, History as _};
+use rustyline::{CompletionType, Config, Editor};
 
 fn main() -> ExitCode {
     let mut shell = Shell::new();
@@ -86,6 +96,39 @@ fn run_source(source: &str, shell: &mut Shell) -> i32 {
     status
 }
 
+/// Builds this session's own `rustyline::Config` — see each option's own
+/// inline comment for the specific real-bash behavior it's matching
+/// (and, for `history_ignore_dups`, the one place rustyline's own
+/// default would otherwise silently diverge from bash's).
+fn build_editor_config(shell: &Shell) -> Config {
+    Config::builder()
+        // Real bash/readline UX: complete to the longest common prefix
+        // and list ambiguous matches on a second Tab. Confirmed by
+        // reading rustyline 18.0.1's own `complete_line`:
+        // `CompletionType::List` is what implements exactly that;
+        // the crate's own *default*, `Circular`, instead cycles through
+        // candidates one at a time on repeated Tab presses (closer to
+        // zsh/emacs `M-/` than to bash's own default Tab behavior) and
+        // would be a real, visible UX divergence from bash if left
+        // alone.
+        .completion_type(CompletionType::List)
+        // Real bash's own default (`$HISTCONTROL` unset): every line is
+        // saved to history, including immediate duplicates. rustyline's
+        // own default is the opposite (`IgnoreConsecutive`), which would
+        // silently diverge from bash if left alone. `$HISTCONTROL` isn't
+        // implemented this phase at all (not scoped) — this is simply
+        // bash's own unconfigured default, not a partial implementation
+        // of the variable.
+        .history_ignore_dups(false)
+        .expect("a bool is always a valid history_ignore_dups setting")
+        // `$HISTSIZE` — see `conch_shell_core::history_size`'s own docs
+        // for why "unset" means effectively unbounded here, matching
+        // bash, not rustyline's own unrelated built-in default of 100.
+        .max_history_size(conch_shell_core::history_size(shell))
+        .expect("conch_shell_core::history_size() never returns a value rustyline itself rejects")
+        .build()
+}
+
 fn run_interactive(shell: &mut Shell) -> i32 {
     // A POSIX-mandated *fatal* expansion error (`${var:?word}` on an
     // unset parameter) exits the whole process in non-interactive mode
@@ -113,7 +156,25 @@ fn run_interactive(shell: &mut Shell) -> i32 {
     // erroring, matching real bash's own job-control-disabled fallback.
     let _ = shell.init_job_control();
 
-    let mut editor = match DefaultEditor::new() {
+    // Interactive-only, single-file startup sourcing — see
+    // `conch_shell_core::source_startup_file`'s own docs for exactly
+    // which of real bash's several startup files this collapses into
+    // one, why, and the `Shell::is_interactive` gate it enforces itself
+    // (rather than trusting every call site to remember to check first).
+    // Deliberately runs *after* job control's own terminal-ownership
+    // setup above (matching bash's own ordering: an interactive shell
+    // claims the terminal before it starts running any of the user's own
+    // startup commands, which may themselves spawn foreground jobs) but
+    // *before* the line editor itself is constructed below, so
+    // `~/.conchrc` can freely set `$PS1`/`$HISTFILE`/aliases/functions/
+    // etc. and have every one of them already in effect for the very
+    // first prompt.
+    conch_shell_core::source_startup_file(shell);
+
+    let history_path = conch_shell_core::history_file_path(shell);
+    let config = build_editor_config(shell);
+
+    let mut editor: Editor<ConchHelper, DefaultHistory> = match Editor::with_config(config) {
         Ok(editor) => editor,
         Err(err) => {
             eprintln!("conch: failed to start line editor: {err}");
@@ -121,30 +182,26 @@ fn run_interactive(shell: &mut Shell) -> i32 {
         }
     };
 
+    let completion_state = Rc::new(RefCell::new(CompletionState::default()));
+    editor.set_helper(Some(ConchHelper::new(Rc::clone(&completion_state))));
+
+    if let Some(path) = &history_path {
+        history::load_history(&mut editor, path);
+    }
+
     loop {
         report_finished_jobs(shell);
-        let prompt = format!("conch {} $ ", shell.cwd.display());
-        match editor.readline(&prompt) {
-            Ok(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let _ = editor.add_history_entry(line.as_str());
-                // Alias expansion is an interactive-shell-only bash
-                // extension (real bash's own default) — matching that
-                // here means the interactive prompt loop is the *one*
-                // entry point that uses `parse_with_aliases` at all;
-                // every other one (`-c`, a script file, `eval`,
-                // `.`/`source`) keeps using plain `parse`, which never
-                // consults `Shell::aliases` regardless of what's
-                // defined.
-                match parse_with_aliases(&line, &shell.aliases) {
-                    Ok(list) => {
-                        shell.last_status = exec_program(&list, shell);
-                    }
-                    Err(err) => eprintln!("conch: {err}"),
-                }
-            }
+        // See `conch_shell_core::CompletionState`'s own docs for why this
+        // is a once-per-prompt snapshot refresh rather than a live read
+        // from inside `Completer::complete` itself.
+        completion_state.borrow_mut().refresh(shell);
+
+        let ps1_template = conch_shell_core::ps1_template(shell);
+        let history_len = editor.history().len();
+        let ps1 = conch_shell_core::expand_prompt(shell, &ps1_template, history_len);
+
+        let mut buffer = match editor.readline(&ps1) {
+            Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
                 // Ctrl-C: real shells abandon the current line and reprompt.
                 continue;
@@ -157,7 +214,80 @@ fn run_interactive(shell: &mut Shell) -> i32 {
                 eprintln!("conch: {err}");
                 break;
             }
+        };
+
+        if buffer.trim().is_empty() {
+            continue;
         }
+
+        // Multi-line continuation (`PS2`) — see `helper`'s own module
+        // docs for why this is a hand-rolled loop rather than rustyline's
+        // own `Validator`/`ValidationResult::Incomplete` mechanism.
+        // Keeps reading and appending lines under `PS2` for as long as
+        // `conch_shell_parser::ParseError::is_incomplete_input` reports
+        // "ran out of input mid-construct," rather than a duplicate ad
+        // hoc "is this incomplete" check — see that method's own docs.
+        let list = 'continuation: loop {
+            match parse_with_aliases(&buffer, &shell.aliases) {
+                Ok(list) => break 'continuation Some(list),
+                Err(err) if err.is_incomplete_input() => {
+                    let ps2_template = conch_shell_core::ps2_template(shell);
+                    let history_len = editor.history().len();
+                    let ps2 = conch_shell_core::expand_prompt(shell, &ps2_template, history_len);
+                    match editor.readline(&ps2) {
+                        Ok(next_line) => {
+                            buffer.push('\n');
+                            buffer.push_str(&next_line);
+                        }
+                        Err(ReadlineError::Interrupted) => {
+                            // Ctrl-C mid-continuation: abandon the whole
+                            // partially-typed command, same as Ctrl-C at
+                            // the primary prompt abandons a single line.
+                            break 'continuation None;
+                        }
+                        Err(ReadlineError::Eof) => {
+                            // Ctrl-D (or real EOF) while still inside an
+                            // unterminated construct — confirmed against
+                            // real bash: this reports the same "ran out
+                            // of input" error the construct's own
+                            // incompleteness already describes and
+                            // returns to the primary prompt, rather than
+                            // exiting the shell outright (a *second*,
+                            // genuine EOF at the now-fresh primary prompt
+                            // is what actually ends the session, on the
+                            // very next loop iteration).
+                            eprintln!("conch: {err}");
+                            break 'continuation None;
+                        }
+                        Err(err) => {
+                            eprintln!("conch: {err}");
+                            break 'continuation None;
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("conch: {err}");
+                    break 'continuation None;
+                }
+            }
+        };
+
+        let Some(list) = list else {
+            continue;
+        };
+
+        // Eager history persistence — see `history`'s own module docs
+        // for why this happens right here, *before* `exec_program` runs,
+        // rather than once at this loop's own end: `exit` and
+        // `exec <builtin-name>` both terminate the process from inside
+        // `exec_program` unconditionally, which would bypass a deferred
+        // save entirely.
+        let _ = editor.add_history_entry(buffer.as_str());
+        if let Some(path) = &history_path {
+            history::append_history(&mut editor, path);
+        }
+
+        shell.last_status = exec_program(&list, shell);
     }
 
     // See `run_source`'s own doc comment — same POSIX EXIT-trap

@@ -1,20 +1,32 @@
 //! Shell state, word expansion, and the command executor.
 
 mod brace;
+mod completion;
 mod exec;
 mod expand;
+mod highlight;
+mod history;
 mod job;
+mod prompt;
 mod signals;
+mod startup;
+mod word_scan;
 
 pub use brace::brace_expand;
+pub use completion::{CompletionState, command_candidates};
 pub use exec::{
-    CommandResolution, current_umask, exec_command_list, exec_program, find_in_path,
-    path_executable, path_readable, path_writable, resolve_command, resume_job_in_foreground,
-    set_umask,
+    CommandResolution, current_umask, exec_command_list, exec_program, find_in_path, hostname,
+    is_effective_root, list_path_executables, path_executable, path_readable, path_writable,
+    resolve_command, resume_job_in_foreground, set_umask,
 };
 pub use expand::{ExpandError, expand_word_fields, expand_word_single};
+pub use highlight::{Span, SpanKind, classify};
+pub use history::{history_file_path, history_size};
 pub use job::{Job, JobState, JobTable};
+pub use prompt::{DEFAULT_PS1, DEFAULT_PS2, expand_prompt, ps1_template, ps2_template};
 pub use signals::TrapAction;
+pub use startup::{conchrc_path, source_startup_file};
+pub use word_scan::{RESERVED_WORDS, is_break_char, is_command_position};
 
 /// A `break [n]`/`continue [n]` (POSIX special builtins) in progress,
 /// working its way back up through the executor to whichever enclosing
@@ -632,6 +644,17 @@ impl Shell {
     /// back with [`Shell::register_builtin`].
     pub fn take_builtin(&mut self, name: &str) -> Option<Box<dyn Builtin>> {
         self.builtins.remove(name)
+    }
+
+    /// Every currently-registered builtin's name (special and regular
+    /// alike — see [`Self::is_special_builtin`] to distinguish). Unlike
+    /// [`Self::builtin`]/[`Self::take_builtin`] (single-name lookup),
+    /// this exists purely so a caller can *enumerate* every builtin —
+    /// the interactive line editor's command-position tab completion
+    /// (`conch`'s own binary crate) is the one caller today; nothing
+    /// inside this crate needed to list builtins before Phase 6.
+    pub fn builtin_names(&self) -> impl Iterator<Item = &str> {
+        self.builtins.keys().map(String::as_str)
     }
 
     /// Captures `name`'s current binding, for a `local` declaration

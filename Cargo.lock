@@ -61,6 +61,7 @@ dependencies = [
 name = "conch-shell-core"
 version = "0.2.0"
 dependencies = [
+ "conch-shell-lexer",
  "conch-shell-parser",
  "nix",
  "tempfile",

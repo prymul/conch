@@ -12,6 +12,16 @@ authors.workspace = true
 name = "conch"
 path = "src/main.rs"
 
+# Everything Phase 6 needed beyond ordinary command execution (`PS1`/`PS2`
+# expansion, tab-completion candidate generation, syntax-highlighting
+# classification, `$HISTFILE`/`$HISTSIZE` resolution, `~/.conchrc`
+# sourcing) lives in `conch-shell-core` as pure, directly-callable
+# functions instead of here -- this crate (bin-only, no `[lib]` target)
+# only holds the thin `rustyline`-trait adapters that call into them, so
+# `tests/conch-difftest` can reach the pure logic in-process without a
+# pty. See `conch-shell-core`'s own `prompt`/`completion`/`highlight`/
+# `history`/`startup`/`word_scan` module docs for the full "why" and the
+# `conch-shell-lexer`/`nix` dependency edges that moved there with them.
 [dependencies]
 conch-shell-parser = { workspace = true }
 conch-shell-core = { workspace = true }

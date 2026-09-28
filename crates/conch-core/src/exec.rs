@@ -2008,6 +2008,65 @@ pub fn find_in_path(shell: &Shell, name: &str) -> Option<String> {
     None
 }
 
+/// Enumerates every executable name on `$PATH` (`path_var`, in the same
+/// colon-separated form [`Shell::get_var`]`("PATH")` returns) that starts
+/// with `prefix` — the tab-completion *candidate-listing* sibling of
+/// [`find_in_path`] (which only ever resolves one exact `name` to its
+/// first match, for `type`/`command -v`). Used by the interactive line
+/// editor's command-position completion (`conch`'s own binary crate),
+/// which needs every match, not just the one that would actually run.
+///
+/// Deliberately takes the raw `$PATH` string rather than `&Shell` (unlike
+/// [`find_in_path`]/[`resolve_command`]): the completer only ever has a
+/// point-in-time *snapshot* of the shell's completable state on hand
+/// while the line editor owns the terminal (see `conch`'s own
+/// `completion` module docs for why), not a live `&Shell` — a plain
+/// `&str` parameter is both what that snapshot can actually cheaply hold
+/// and easier to unit-test standalone.
+///
+/// Deliberately does **not** replicate [`find_in_path`]'s "a name
+/// containing `/` is never `PATH`-searched" rule: that POSIX 2.9.1.1 rule
+/// is about *resolving one exact command name* for execution, not about
+/// what's valid to type at command position — a `prefix` containing `/`
+/// simply won't match any bare executable *name* here (this only ever
+/// compares against a directory entry's own file name, never a full
+/// path), which in practice means it just returns nothing, correctly
+/// deferring that case to filename completion instead (`conch`'s own
+/// word-boundary scanner only ever calls this at command position, which
+/// by construction is checked separately from argument-position filename
+/// completion).
+///
+/// A name that exists in more than one `PATH` directory is only reported
+/// once — the *first* directory's copy is what `PATH`-search would
+/// actually run (see [`find_in_path`]), so listing the same name again
+/// for a shadowed copy further down `PATH` would be misleading. Results
+/// are returned in `PATH`-scan order, not sorted; callers that want a
+/// stable display order should sort themselves (`conch`'s own completer
+/// does, alongside function/builtin/alias names from other sources).
+#[must_use]
+pub fn list_path_executables(path_var: &str, prefix: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for dir in path_var.split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with(prefix) || !seen.insert(name.clone()) {
+                continue;
+            }
+            if is_executable_file(&entry.path()) {
+                results.push(name);
+            }
+        }
+    }
+    results
+}
+
 /// Whether `path` is a regular file with at least one executable bit
 /// set — POSIX's own definition of a `PATH`-search match (2.9.1.1: "the
 /// utility shall be searched for using the value of PATH ... an
@@ -2045,6 +2104,37 @@ pub fn current_umask() -> u32 {
 pub fn set_umask(mask: u32) {
     let bits = u16::try_from(mask & 0o777).unwrap_or(0o777);
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(bits));
+}
+
+// ---- system identity: `PS1`'s `\h`/`\H`/`\$` prompt escapes ---------------
+
+/// The local system's host name (POSIX `gethostname(2)`) — `PS1`'s `\h`/
+/// `\H` prompt escapes' own read (`conch`'s binary crate; see that
+/// crate's `prompt` module). Deliberately lives here, not in `conch`
+/// itself: this crate already depends on `nix` for job control/signals,
+/// while the binary crate has none of its own (matching
+/// `conch-shell-builtins`'s own "no direct `nix` dependency" precedent,
+/// for the same reason — see that crate's module docs), so wrapping the
+/// one syscall here avoids adding a second, `conch`-crate-only edge to it
+/// for what both crates would otherwise duplicate.
+///
+/// Returns `None` if `gethostname(2)` itself fails, or if the result
+/// isn't valid UTF-8 (a hostname is conventionally ASCII; a caller
+/// falling back to an empty string in that unlikely case, matching bash's
+/// own silent-empty fallback, is preferable to lossily mangling raw
+/// bytes).
+#[must_use]
+pub fn hostname() -> Option<String> {
+    nix::unistd::gethostname().ok()?.into_string().ok()
+}
+
+/// Whether this process's *effective* user ID is root (POSIX
+/// `geteuid(2)` == 0) — `PS1`'s `\$` prompt escape's own read (`#` for
+/// root, `$` otherwise, matching real bash). See [`hostname`]'s docs for
+/// why this lives here rather than in `conch`'s own binary crate.
+#[must_use]
+pub fn is_effective_root() -> bool {
+    nix::unistd::geteuid().is_root()
 }
 
 // ---- file-permission checks: shared by the `test`/`[` builtin -------------
