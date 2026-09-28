@@ -254,6 +254,13 @@ impl Builtin for Readonly {
     }
 }
 
+/// `export [-fn] [name[=value] ...]` / `export -p` (POSIX 2.9.1 special
+/// builtin; `-n` and `-f` are bash extensions — POSIX only specifies `-p`
+/// and the bare `name[=value]` form). Flag-scanning follows the same
+/// bundled-leading-short-flags convention as `Declare::run`
+/// (`declare_builtin.rs`) — stop at the first argument that isn't itself
+/// `-`-prefixed, treat everything from there on as `name`/`name=value`
+/// operands.
 struct Export;
 impl Builtin for Export {
     fn run(
@@ -261,10 +268,88 @@ impl Builtin for Export {
         shell: &mut Shell,
         args: &[String],
         _stdin: &mut dyn Read,
-        _stdout: &mut dyn Write,
-        _stderr: &mut dyn Write,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> i32 {
-        for arg in args {
+        let mut print_mode = false;
+        let mut remove_mode = false;
+        let mut status = 0;
+        let mut iter = args.iter().peekable();
+
+        while let Some(arg) = iter.peek() {
+            let Some(flags) = arg.strip_prefix('-').filter(|f| !f.is_empty()) else {
+                break;
+            };
+            for flag in flags.chars() {
+                match flag {
+                    'p' => print_mode = true,
+                    // `-n NAME`: remove the export attribute, keeping
+                    // the value as an ordinary shell variable (see the
+                    // dedicated handling below, once `names` is known).
+                    'n' => remove_mode = true,
+                    'f' => {
+                        // Real bash's `-f` means "treat NAME as a shell
+                        // *function*, not a variable" -- conch has no
+                        // exported-function concept at all (functions
+                        // are never propagated to a child process's
+                        // environment here in the first place), so
+                        // there's genuinely nothing this could do,
+                        // matching `Declare::run`'s own precedent of
+                        // reporting a real, unimplemented attribute
+                        // rather than silently accepting and ignoring
+                        // it.
+                        let _ = writeln!(
+                            stderr,
+                            "export: -f: not yet supported (conch has no exported-function concept)"
+                        );
+                        status = 1;
+                    }
+                    other => {
+                        let _ = writeln!(stderr, "export: -{other}: invalid option");
+                        return 2;
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        // `export -p`: list every currently exported variable in
+        // `declare -x NAME="value"` form (bash's own reparseable
+        // format for this — confirmed directly; dash's own `-p` uses a
+        // different shape, `export NAME='value'`, which is why the
+        // differential corpus for this only compares against bash).
+        // Confirmed against real bash that any further arguments after
+        // `-p` are simply not meaningful here (bash's own usage line is
+        // `export -p [-f]`, no `name` operands at all) -- so this
+        // returns immediately, the same short-circuit real bash's own
+        // observed behavior has, rather than also processing `iter`'s
+        // remaining items as if `-p` had never been given.
+        if print_mode {
+            let mut names: Vec<&String> = shell.env_vars.keys().collect();
+            names.sort();
+            for name in names {
+                declare_builtin::print_one(name, &shell.env_vars[name], true, stdout);
+            }
+            return status;
+        }
+
+        let names: Vec<&String> = iter.collect();
+
+        if remove_mode {
+            for name in names {
+                // Confirmed against real bash: `-n` on a name that was
+                // never exported (or doesn't exist at all) is simply a
+                // no-op, not an error -- matching `shell_vars.insert`
+                // only ever firing once something was actually removed
+                // from `env_vars` to begin with.
+                if let Some(value) = shell.env_vars.remove(name.as_str()) {
+                    shell.shell_vars.insert(name.to_string(), value);
+                }
+            }
+            return status;
+        }
+
+        for arg in names {
             match arg.split_once('=') {
                 Some((name, value)) => {
                     shell.env_vars.insert(name.to_string(), value.to_string());
@@ -272,7 +357,7 @@ impl Builtin for Export {
                 None => {
                     // Bare `export NAME` promotes an existing shell
                     // variable to an exported one.
-                    if let Some(value) = shell.shell_vars.remove(arg) {
+                    if let Some(value) = shell.shell_vars.remove(arg.as_str()) {
                         shell.env_vars.insert(arg.clone(), value);
                     } else {
                         shell.env_vars.entry(arg.clone()).or_default();
@@ -280,7 +365,7 @@ impl Builtin for Export {
                 }
             }
         }
-        0
+        status
     }
 }
 
@@ -1614,6 +1699,81 @@ mod tests {
         run(&Export, &mut shell, &["FOO".to_string()]);
         assert_eq!(shell.get_var("FOO"), Some("bar"));
         assert!(!shell.shell_vars.contains_key("FOO"));
+    }
+
+    #[test]
+    fn export_dash_p_lists_exported_variables_in_declare_x_form() {
+        // Confirmed against real bash: `export -p` prints each currently
+        // exported variable as `declare -x NAME="value"` -- the same
+        // reparseable shape `declare -p`'s own exported entries use.
+        let mut shell = Shell::new();
+        shell.env_vars.clear();
+        shell
+            .env_vars
+            .insert("MY_EXPORTED_VAR".to_string(), "hello".to_string());
+        let (status, stdout, _) = run(&Export, &mut shell, &["-p".to_string()]);
+        assert_eq!(status, 0);
+        assert_eq!(stdout, "declare -x MY_EXPORTED_VAR=\"hello\"\n");
+    }
+
+    #[test]
+    fn export_dash_p_never_lists_a_non_exported_shell_variable() {
+        // Confirmed against real bash: `export -p` shows *only* exported
+        // variables -- a plain shell-only variable never appears, unlike
+        // `declare -p`'s own no-name-given listing (which shows both).
+        let mut shell = Shell::new();
+        shell.env_vars.clear();
+        shell
+            .shell_vars
+            .insert("NOT_EXPORTED".to_string(), "x".to_string());
+        let (status, stdout, _) = run(&Export, &mut shell, &["-p".to_string()]);
+        assert_eq!(status, 0);
+        assert_eq!(stdout, "");
+    }
+
+    #[test]
+    fn export_dash_n_removes_the_export_attribute_keeping_the_value() {
+        // Confirmed against real bash: `export -n NAME` demotes an
+        // exported variable back to an ordinary shell variable, value
+        // intact, still readable, but no longer in a child's environment
+        // (this crate's own `Shell::env_vars` vs. `shell_vars` split is
+        // exactly that distinction).
+        let mut shell = Shell::new();
+        shell
+            .env_vars
+            .insert("MY_VAR2".to_string(), "world".to_string());
+        run(
+            &Export,
+            &mut shell,
+            &["-n".to_string(), "MY_VAR2".to_string()],
+        );
+        assert_eq!(shell.get_var("MY_VAR2"), Some("world"));
+        assert!(!shell.env_vars.contains_key("MY_VAR2"));
+        assert_eq!(shell.shell_vars.get("MY_VAR2"), Some(&"world".to_string()));
+    }
+
+    #[test]
+    fn export_dash_n_on_a_never_exported_name_is_a_silent_no_op() {
+        let mut shell = Shell::new();
+        let (status, _, stderr) = run(&Export, &mut shell, &["-n".to_string(), "NOPE".to_string()]);
+        assert_eq!(status, 0);
+        assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn export_dash_n_accepts_multiple_names() {
+        let mut shell = Shell::new();
+        shell.env_vars.insert("A".to_string(), "1".to_string());
+        shell.env_vars.insert("B".to_string(), "2".to_string());
+        run(
+            &Export,
+            &mut shell,
+            &["-n".to_string(), "A".to_string(), "B".to_string()],
+        );
+        assert!(!shell.env_vars.contains_key("A"));
+        assert!(!shell.env_vars.contains_key("B"));
+        assert_eq!(shell.shell_vars.get("A"), Some(&"1".to_string()));
+        assert_eq!(shell.shell_vars.get("B"), Some(&"2".to_string()));
     }
 
     #[test]

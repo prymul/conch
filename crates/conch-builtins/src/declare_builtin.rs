@@ -215,7 +215,14 @@ fn print_declared(
     status
 }
 
-fn print_one(name: &str, value: &str, exported: bool, stdout: &mut dyn Write) {
+/// `pub(crate)`, not `fn` — shared with `crate::lib`'s own `export -p`
+/// (`Export::run`), which needs the identical `declare -x NAME="value"`
+/// line shape for exported variables, filtered to *only* the exported
+/// ones (unlike this function's own `declare -p` caller, which shows
+/// shell-only variables too, with `--` instead of `-x`) — reusing this
+/// one formatter rather than duplicating its exact quoting convention
+/// keeps the two builtins' output from silently drifting apart.
+pub(crate) fn print_one(name: &str, value: &str, exported: bool, stdout: &mut dyn Write) {
     let flag = if exported { "-x" } else { "--" };
     let _ = writeln!(stdout, "declare {flag} {name}=\"{value}\"");
 }
