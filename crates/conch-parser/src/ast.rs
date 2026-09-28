@@ -344,11 +344,18 @@ pub struct SimpleCommand {
     pub redirects: Vec<Redirect>,
 }
 
-/// One `NAME=value` shell-variable assignment.
+/// One `NAME=value` shell-variable assignment, or — a bash extension,
+/// not POSIX baseline — a `NAME+=value` append-assignment (confirmed
+/// against real bash: `x=foo; x+=bar` leaves `x` as `foobar`; appending
+/// to an unset variable behaves like a plain assignment, `x`'s prior
+/// value treated as empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub name: String,
     pub value: Word,
+    /// `true` for `NAME+=value`, `false` for plain `NAME=value`. See
+    /// this struct's own docs.
+    pub is_append: bool,
 }
 
 /// One `io_redirect`. Phase 1 implements the `<`, `>`, and `>>` operators

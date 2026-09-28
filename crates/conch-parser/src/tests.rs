@@ -130,6 +130,7 @@ fn leading_assignment_is_recognized_and_split() {
         vec![Assignment {
             name: "FOO".to_string(),
             value: plain_word("bar"),
+            is_append: false,
         }]
     );
     assert_eq!(cmd.name, Some(plain_word("echo")));
@@ -145,10 +146,12 @@ fn multiple_leading_assignments_keep_original_order() {
             Assignment {
                 name: "A".to_string(),
                 value: plain_word("1"),
+                is_append: false,
             },
             Assignment {
                 name: "B".to_string(),
                 value: plain_word("2"),
+                is_append: false,
             },
         ]
     );
@@ -162,10 +165,53 @@ fn bare_assignment_with_no_command_name_is_valid() {
         vec![Assignment {
             name: "FOO".to_string(),
             value: plain_word("bar"),
+            is_append: false,
         }]
     );
     assert_eq!(cmd.name, None);
     assert!(cmd.args.is_empty());
+}
+
+#[test]
+fn append_assignment_is_recognized_and_split() {
+    // Bash extension, not POSIX baseline -- confirmed against real bash:
+    // `x=foo; x+=bar` leaves `x` as `foobar`, not `bar`. This test only
+    // pins down *parsing* (the `Assignment::is_append` flag); the actual
+    // append-to-existing-value *semantics* are conch-shell-core's job.
+    let cmd = parse_one_simple_command("FOO+=bar echo hi");
+    assert_eq!(
+        cmd.assignments,
+        vec![Assignment {
+            name: "FOO".to_string(),
+            value: plain_word("bar"),
+            is_append: true,
+        }]
+    );
+    assert_eq!(cmd.name, Some(plain_word("echo")));
+}
+
+#[test]
+fn bare_append_assignment_with_no_command_name_is_valid() {
+    let cmd = parse_one_simple_command("FOO+=bar");
+    assert_eq!(
+        cmd.assignments,
+        vec![Assignment {
+            name: "FOO".to_string(),
+            value: plain_word("bar"),
+            is_append: true,
+        }]
+    );
+    assert_eq!(cmd.name, None);
+}
+
+#[test]
+fn a_lone_plus_with_no_following_equals_is_not_an_assignment() {
+    // `x+bar` (no `=` at all after the `+`) must not be misrecognized as
+    // *any* kind of assignment -- confirmed against real bash: this runs
+    // (and fails to find) a command literally named `x+bar`.
+    let cmd = parse_one_simple_command("x+bar");
+    assert!(cmd.assignments.is_empty());
+    assert_eq!(cmd.name, Some(plain_word("x+bar")));
 }
 
 #[test]
@@ -178,6 +224,7 @@ fn assignment_value_can_contain_expansion_sites() {
             value: Word::new(vec![WordSegment::Parameter(Parameter::Name(
                 "bar".to_string()
             ))]),
+            is_append: false,
         }]
     );
 }
@@ -531,6 +578,7 @@ fn realistic_combined_input() {
         vec![Assignment {
             name: "FOO".to_string(),
             value: plain_word("bar"),
+            is_append: false,
         }]
     );
     assert_eq!(cmd1.name, Some(plain_word("cmd1")));
@@ -1164,6 +1212,156 @@ fn self_referential_alias_does_not_infinitely_expand() {
     };
     assert_eq!(cmd.name, Some(plain_word("ls")));
     assert_eq!(cmd.args, plain_words(&["-la"]));
+}
+
+#[test]
+fn self_referential_alias_containing_a_pipe_errors_cleanly_instead_of_exhausting_memory() {
+    // Regression test for a fuzzer-found unbounded-memory bug: unlike
+    // the plain `alias ls='ls -la'` case above, `expanding`'s per-call
+    // self-reference guard does *not* stop this shape, because the
+    // vulnerable re-expansion happens across *separate* calls to
+    // `maybe_expand_alias` -- one per `parse_pipeline` loop iteration,
+    // each with its own fresh, empty `expanding` set. Every round
+    // doubles the pending parse work (`c` -> `c|c` -> re-enter
+    // `parse_pipeline`'s loop for the second `c` -> `c|c` again -> ...),
+    // reaching multiple gigabytes of resident memory within a few
+    // seconds on the real binary with no OS backstop to rely on
+    // (confirmed empirically, not simulated, before this guard existed).
+    // `MAX_ALIAS_EXPANSIONS` must stop this quickly and cleanly.
+    let table = aliases(&[("c", "c|c")]);
+    let err = parse_with_aliases("c", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn self_referential_alias_containing_a_semicolon_also_errors_cleanly() {
+    // Same underlying bug, reached via `;` (parse_compound_list's list
+    // loop) instead of `|` (parse_pipeline's) -- confirmed by this
+    // project's own fuzzing pass to reproduce identically. Proves the
+    // guard is shared across every list-operator shape, not `|`-specific.
+    let table = aliases(&[("c", "c;c")]);
+    let err = parse_with_aliases("c", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn self_referential_alias_containing_and_if_also_errors_cleanly() {
+    // Same bug, reached via `&&` (parse_and_or's loop).
+    let table = aliases(&[("c", "c&&c")]);
+    let err = parse_with_aliases("c", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn async_separator_source_is_correct_when_the_command_was_alias_expanded() {
+    // Regression test for a fuzzer-found bug: `Separator::Async`'s
+    // verbatim-source capture used to slice `self.source` (the
+    // *original*, unexpanded input) using a token span that could
+    // actually be relative to the alias's own replacement text instead
+    // -- silently capturing the literal, pre-expansion alias name
+    // instead of what the backgrounded job actually runs. Confirmed
+    // against real bash: `alias a='echo hi'; a &` backgrounds a job that
+    // prints `hi`, not one that tries (and fails) to run a command
+    // literally named `a`.
+    let table = aliases(&[("a", "echo hi")]);
+    let list = parse_with_aliases("a &", &table).unwrap();
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "echo hi");
+}
+
+#[test]
+fn async_separator_source_is_correct_when_the_alias_replacement_itself_contains_an_ampersand() {
+    // The specific minimized shape the fuzzer's `parse_with_aliases`
+    // target found: the alias replacement text itself introduces the
+    // `&` operator token whose span gets read as `amp_start` -- this
+    // must still be `self.source`-relative once the replacement has
+    // been spliced in, not relative to the (2-byte) replacement string
+    // that token was originally lexed from.
+    let table = aliases(&[("a", "echo hi &")]);
+    let list = parse_with_aliases("a", &table).unwrap();
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "echo hi");
+}
+
+#[test]
+fn fuzz_minimized_repro_no_longer_panics_on_a_cross_string_slice() {
+    // Close relative of the exact minimized `Arbitrary`-encoded repro
+    // from this project's own fuzzing pass (`fuzz/artifacts/
+    // parse_with_aliases/crash-alias-splice-cross-string-offset-minimized`,
+    // `source: "\u{1} "`, `aliases: {"\u{1}": "\u{1}&\u{1}"}`) -- a short
+    // source consisting solely of the alias name, whose replacement text
+    // is a *different length* than the name itself *and* contains a
+    // literal `&`. This specific length mismatch is what previously
+    // produced a `byte range starts at 2 but ends at 1` panic (an
+    // inverted/out-of-range slice) rather than the merely-wrong-but-not-
+    // panicking output the same-length case above happens to produce.
+    //
+    // Deliberately *not* the fuzzer's own exact alias table here: that
+    // one's replacement also happens to reintroduce its own name
+    // (`"\u{1}"` inside `"\u{1}&\u{1}"`) combined with `&`, which is
+    // *also* exactly Bug #3's self-referential-alias-with-a-list-operator
+    // memory-bomb shape (confirmed separately elsewhere in this test
+    // module) -- now correctly caught by `MAX_ALIAS_EXPANSIONS` instead
+    // of ever reaching this function's own cross-string-offset fix at
+    // all, which would make this test a confound of *two* different
+    // fixes rather than isolating this one. Using a distinct
+    // non-self-referential replacement name here isolates the
+    // cross-string-offset fix specifically.
+    let table = aliases(&[("x", "yy&yy")]);
+    let list = parse_with_aliases("x ", &table).unwrap();
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "yy");
+}
+
+#[test]
+fn ampersand_shaped_self_referential_alias_is_caught_by_the_shared_expansion_budget() {
+    // The fuzzer's *exact* original minimized alias table (see the
+    // sibling test above for why it's not used to test the
+    // cross-string-offset fix specifically): confirms the interaction
+    // the team explicitly flagged -- `&` previously hit Bug #2's panic
+    // before Bug #3's memory-bomb pattern ever got a chance to manifest
+    // for this specific separator; now that the panic is fixed, this
+    // must be independently re-verified to still terminate cleanly via
+    // `MAX_ALIAS_EXPANSIONS` (Bug #3's shared guard) rather than newly
+    // exposing an unbounded `&`-flavored memory bomb.
+    let table = aliases(&[("\u{1}", "\u{1}&\u{1}")]);
+    let err = parse_with_aliases("\u{1} ", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn subshell_source_is_correct_when_the_open_paren_came_from_an_alias() {
+    // Sibling of the async-separator bug above, for
+    // `Self::parse_subshell`'s own verbatim-body capture -- flagged as
+    // "likely related, not independently confirmed" in the original
+    // fuzzing report; this pins it down directly. Confirmed against
+    // real bash: `alias sub='( echo hi'; sub )` runs the subshell body
+    // `echo hi`.
+    let table = aliases(&[("sub", "( echo hi")]);
+    let list = parse_with_aliases("sub )", &table).unwrap();
+    let Command::Compound(compound) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Compound")
+    };
+    let CompoundCommandKind::Subshell(subshell) = &compound.kind else {
+        unreachable!("expected a Subshell")
+    };
+    assert_eq!(subshell.source.trim(), "echo hi");
+}
+
+#[test]
+fn ordinary_non_cyclic_alias_use_well_under_the_budget_is_unaffected() {
+    // The shared, cumulative budget must not fire for realistic,
+    // non-adversarial input -- many independent (non-self-referential)
+    // alias uses across one parse should keep working exactly as before.
+    let table = aliases(&[("g", "grep"), ("ll", "ls -la")]);
+    let list = parse_with_aliases("g x; ll; g y; ll /tmp", &table).unwrap();
+    assert_eq!(list.items.len(), 4);
 }
 
 #[test]

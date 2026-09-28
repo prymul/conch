@@ -500,7 +500,7 @@ against two oracles.
 | Substring parameter expansion: `${var:offset}`, `${var:offset:length}`, including negative offsets | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
 | Pattern-substitution parameter expansion: `${var/pat/rep}`, `${var//pat/rep}`, `${var/#pat/rep}`, `${var/%pat/rep}` | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
 | Indirect parameter expansion: `${!var}` | `Bad substitution` error | `corpus/phase2/parameter_expansion.toml` |
-| Plain (non-arithmetic-context) `+=` assignment, e.g. `x+=3` as a standalone statement | `x+=3: not found` -- dash tries to run it as a command, since `+=` isn't assignment syntax to it at all | not currently in the corpus (arithmetic `$((x+=3))`, which *is* POSIX baseline, is; see `arithmetic_expansion.toml`) |
+| Plain (non-arithmetic-context) `+=` assignment, e.g. `x+=3` as a standalone statement | `x+=3: not found` -- dash tries to run it as a command, since `+=` isn't assignment syntax to it at all | `corpus/phase7/append_assignment_hardening.toml` (arithmetic `$((x+=3))`, which *is* POSIX baseline, has its own separate case in `arithmetic_expansion.toml`) |
 | Arithmetic `**` (exponentiation) | `expecting primary` parse error | `corpus/phase2/arithmetic_expansion.toml` |
 | Arithmetic `++`/`--` (pre/post increment/decrement) | `expecting primary` parse error | `corpus/phase2/arithmetic_expansion.toml` |
 | Arithmetic comma operator `(a,b,c)` | `expecting ')'` parse error | `corpus/phase2/arithmetic_expansion.toml` |

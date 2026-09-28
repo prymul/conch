@@ -557,6 +557,20 @@ mod tests {
 
     #[test]
     fn last_status_is_restored_after_command_substitution() {
+        // Harmless test-environment noise, not a failure: `$(true)`'s
+        // inner re-exec resolves `env::current_exe()` to *this test
+        // binary* (see `conch_shell_core::expand`'s own test module for
+        // the fuller explanation), which doesn't understand a bare `-c`
+        // flag and prints its own `error: Unrecognized option: 'c'` to
+        // stderr -- now visible here (rather than silently discarded)
+        // since `run_command_substitution` correctly inherits the inner
+        // process's stderr per POSIX 2.6.3. The assertion below still
+        // holds regardless of *why* the substitution failed: this test
+        // is specifically checking that `expand_prompt`'s own
+        // `saved_status`/restore wrapper isolates *any* internal `$?`
+        // mutation from a substitution attempted during prompt
+        // expansion, success or failure alike, from leaking into the
+        // real session's `$?`.
         let mut shell = Shell::new();
         shell.last_status = 42;
         let _ = expand_prompt(&mut shell, "$(true)", 0);

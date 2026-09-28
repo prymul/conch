@@ -70,15 +70,24 @@ pub fn parse_with_aliases(
 }
 
 struct Parser<'a> {
-    /// The original, un-tokenized input — kept only so a construct whose
-    /// *execution* needs its own verbatim source text (today: a
-    /// subshell's body — see [`Self::parse_subshell`] and
-    /// `conch-shell-core::exec`'s module docs for why a subshell must run
-    /// in a genuinely separate process, not by walking a parsed AST
-    /// in-process) can slice it out by byte offset, the same way
-    /// `conch-shell-lexer` already hands `conch-shell-core` the verbatim
-    /// body of a `$(...)`/`` `...` `` command substitution.
-    source: &'a str,
+    /// The input, kept only so a construct whose *execution* needs its
+    /// own verbatim source text (today: a subshell's body — see
+    /// [`Self::parse_subshell`] and `conch-shell-core::exec`'s module
+    /// docs for why a subshell must run in a genuinely separate process,
+    /// not by walking a parsed AST in-process — and
+    /// [`Self::parse_optional_separator`]'s `&`/async case) can slice it
+    /// out by byte offset, the same way `conch-shell-lexer` already
+    /// hands `conch-shell-core` the verbatim body of a
+    /// `$(...)`/`` `...` `` command substitution.
+    ///
+    /// Owned (`String`), not a borrow of the caller's original input,
+    /// specifically so [`Self::splice_alias_tokens`] can physically
+    /// rewrite it in place whenever an alias is expanded — see that
+    /// function's own docs for why every span-based slice of this field
+    /// would otherwise risk mixing two different strings' byte offsets
+    /// once alias expansion has spliced in tokens re-lexed from a wholly
+    /// separate replacement string.
+    source: String,
     /// A `Vec` + cursor index rather than the `Peekable<IntoIter<Token>>`
     /// this used to be — needed for [`Self::peek_nth`], which the POSIX
     /// `fname()` function-definition form requires: distinguishing
@@ -99,6 +108,10 @@ struct Parser<'a> {
     /// Current `command`-grammar recursion depth — see
     /// [`MAX_COMMAND_DEPTH`].
     depth: u32,
+    /// How many alias substitutions [`Self::maybe_expand_alias`] has
+    /// actually performed so far, across this *entire* parse (every
+    /// statement, not just the current one) — see [`MAX_ALIAS_EXPANSIONS`].
+    alias_expansions: u32,
 }
 
 /// A conservative bound on how many levels deep `command` can recurse
@@ -139,14 +152,71 @@ struct Parser<'a> {
 /// non-adversarial script would ever use.
 const MAX_COMMAND_DEPTH: u32 = 40;
 
+/// A conservative bound on the *total* number of alias substitutions
+/// [`Parser::maybe_expand_alias`] will perform across one whole parse
+/// (every statement in the input, not just one), guarding against an
+/// unbounded-memory denial-of-service a self-referential alias
+/// containing a list operator can trigger.
+///
+/// # Why this can't be `maybe_expand_alias`'s own existing per-call guard
+///
+/// That function already refuses to expand the *same name* twice within
+/// one of its own calls (`expanding: HashSet<String>`) — necessary, but
+/// not sufficient, because `maybe_expand_alias` runs once per
+/// [`Parser::parse_command`] call, and `parse_command` itself is called
+/// repeatedly by *five separate, structurally identical sibling loops*:
+/// [`Parser::parse_pipeline`]'s `|` loop, [`Parser::parse_and_or`]'s
+/// `&&`/`||` loop, [`Parser::parse_compound_list`]/[`Parser::parse_command_list`]'s
+/// `;`/newline-separated list loop, and [`Parser::parse_optional_separator`]'s
+/// `&` case. An alias whose replacement text reintroduces its own name
+/// *plus* a list operator (`alias c='c|c'`) survives its own call's
+/// self-reference check (the replacement is only two tokens deep, no
+/// immediate re-expansion within that one call) but hands the **next**
+/// sibling-loop iteration a fresh, empty `HashSet` that happily expands
+/// the exact same alias again, doubling the pending parse work each
+/// round — confirmed empirically (this project's own fuzzing pass): `(
+/// printf 'alias c="c|c"\nc\n'; sleep 5 ) | conch` reaches several
+/// gigabytes of resident memory within a few seconds, with no way for
+/// the OS to intervene on a system that doesn't enforce `ulimit -v`
+/// (confirmed: it doesn't on this project's own macOS development
+/// machine). Confirmed general, not `|`-specific: `;`, `&&`, and `||`
+/// all reproduce the identical unbounded-growth pattern; `&` reproduces
+/// a distinct pre-existing panic first (a separate, already-tracked
+/// bug) that happens to mask it, but shares the identical root cause and
+/// would need the exact same guard once that panic is fixed.
+///
+/// # Why the guard lives on `Parser` itself, not deeper in `maybe_expand_alias`
+///
+/// A counter reset once per [`Parser::new`] (i.e. once per whole parse —
+/// this crate's callers, notably the interactive REPL, already construct
+/// a fresh `Parser` per line/buffer, so this never accumulates across an
+/// entire session) rather than once per `maybe_expand_alias` call is
+/// exactly what closes the gap the per-call `HashSet` can't: it's
+/// shared, cumulative state that persists *across* every one of the five
+/// sibling loops above, so no matter which one (or which combination)
+/// keeps re-entering `parse_command`, the total substitution count is
+/// what eventually trips the bound — one guard at the one place every
+/// list-operator shape already funnels through
+/// ([`Parser::maybe_expand_alias`] itself), rather than five separate,
+/// easy-to-miss per-operator fixes.
+///
+/// 1,000 is chosen to be far beyond what any real, non-adversarial
+/// script would ever need (even a script that aliased *every single
+/// command* it ever runs, across a very long input) while still being
+/// low enough that a genuinely doubling-per-round pattern like
+/// `alias c='c|c'` is stopped within a handful of milliseconds, long
+/// before memory growth becomes observable at all.
+const MAX_ALIAS_EXPANSIONS: u32 = 1000;
+
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, tokens: Vec<Token>, aliases: &'a HashMap<String, String>) -> Self {
+    fn new(source: &str, tokens: Vec<Token>, aliases: &'a HashMap<String, String>) -> Self {
         Self {
-            source,
+            source: source.to_string(),
             tokens,
             pos: 0,
             aliases,
             depth: 0,
+            alias_expansions: 0,
         }
     }
 
@@ -913,6 +983,12 @@ impl<'a> Parser<'a> {
     /// more advanced one than plain single-word aliasing, and left as a
     /// documented gap given this phase's own scope/time constraints
     /// rather than attempted partially.
+    ///
+    /// Also enforces [`MAX_ALIAS_EXPANSIONS`] — see that constant's own
+    /// docs for why a per-*call* guard (the `expanding` set below) is
+    /// necessary but not sufficient on its own, and why the additional
+    /// bound has to live here rather than in any one of this function's
+    /// several callers.
     fn maybe_expand_alias(&mut self) -> Result<(), ParseError> {
         let mut expanding: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
@@ -930,9 +1006,97 @@ impl<'a> Parser<'a> {
             if !expanding.insert(name) {
                 return Ok(());
             }
+            self.alias_expansions += 1;
+            if self.alias_expansions > MAX_ALIAS_EXPANSIONS {
+                let span = self.peek().map_or_else(
+                    || Span::new(self.source.len(), self.source.len()),
+                    |tok| tok.span,
+                );
+                return Err(ParseError::TooManyAliasExpansions { span });
+            }
             let new_tokens = conch_shell_lexer::lex(&replacement)?;
-            self.tokens.splice(self.pos..self.pos + 1, new_tokens);
+            self.splice_alias_tokens(&replacement, new_tokens);
         }
+    }
+
+    /// Splices `new_tokens` (freshly re-lexed from `replacement`, so
+    /// every one's `Span` is 0-based — relative to `replacement` alone,
+    /// not `self.source`) in place of the single alias-name token
+    /// currently at `self.pos`, while also physically rewriting
+    /// `self.source` itself so that *every* token's `Span` — the
+    /// newly-spliced ones, and every token already positioned after
+    /// them — stays genuinely `self.source`-relative afterward, exactly
+    /// as if the user had originally typed the replacement text right
+    /// there instead of the alias name.
+    ///
+    /// # Why this exists
+    ///
+    /// Before this function existed, alias expansion only ever spliced
+    /// into [`Self::tokens`], never touching [`Self::source`] at all —
+    /// so a spliced-in token's `Span` stayed relative to `replacement`'s
+    /// own coordinate space (starting at byte 0 of *that* string), while
+    /// [`Self::source`] remained the original, unexpanded input. Any
+    /// later code that slices `self.source` using such a span —
+    /// [`Self::parse_optional_separator`]'s `&`/async case,
+    /// [`Self::parse_subshell`]'s verbatim-body capture — was mixing two
+    /// completely different strings' byte offsets. Confirmed two
+    /// distinct, real symptoms from this (this project's own fuzzing
+    /// pass): a panic (`byte range starts at 2 but ends at 1`, or an
+    /// out-of-bounds start index, depending on the exact replacement
+    /// text's length relative to the alias name it replaced) when the
+    /// mismatched offsets happened to be invalid for `self.source`'s
+    /// actual length, and — more insidiously — *silent, wrong* captured
+    /// text when they happened to both be in-bounds by coincidence: a
+    /// backgrounded aliased command (`alias a='echo hi'; a &`) captured
+    /// `Separator::Async`'s re-exec source text as the literal
+    /// pre-expansion name `"a"` instead of anything describing what
+    /// actually runs (`echo hi`) — directly observable wrong behavior,
+    /// not just a theoretical panic risk, since that captured text is
+    /// what the backgrounded job's own child process actually executes.
+    ///
+    /// # Why rewriting `self.source` (rather than tagging each token
+    /// with its own provenance) is the right fix here
+    ///
+    /// The alternative — giving every [`Token`]/[`Span`] a marker for
+    /// *which* string it was lexed from, and having every span-based
+    /// slice site check it before trusting `self.source[a..b]` — would
+    /// work too, but touches a foundational, widely-shared type
+    /// (`conch_shell_lexer::Span`) used throughout this crate and
+    /// `conch-shell-lexer`'s own public API, and still leaves every
+    /// *future* span-based slice site needing to remember to check that
+    /// marker itself. Rewriting `self.source` in place instead restores
+    /// the simpler, original invariant ("every token's span is genuinely
+    /// `self.source`-relative") globally, for free, for every existing
+    /// *and* future slice site — no marker, no per-call-site check, and
+    /// no risk of a future addition forgetting one.
+    fn splice_alias_tokens(&mut self, replacement: &str, new_tokens: Vec<Token>) {
+        let old_span = self.tokens[self.pos].span;
+        self.source
+            .replace_range(old_span.start..old_span.end, replacement);
+        // How much longer (positive) or shorter (negative) `replacement`
+        // is than the alias-name text it's replacing -- every existing
+        // token positioned after the replaced region shifts by exactly
+        // this many bytes now that `self.source` has been rewritten.
+        let delta = replacement.len() as isize - (old_span.end - old_span.start) as isize;
+        let offset_new_tokens: Vec<Token> = new_tokens
+            .into_iter()
+            .map(|mut tok| {
+                // `new_tokens` was lexed from `replacement` in isolation,
+                // so its spans start at 0; `replacement` itself now
+                // begins at `old_span.start` within the rewritten
+                // `self.source`, so simple, unsigned offsetting (never
+                // negative) is all that's needed here.
+                tok.span.start += old_span.start;
+                tok.span.end += old_span.start;
+                tok
+            })
+            .collect();
+        for tok in &mut self.tokens[self.pos + 1..] {
+            tok.span.start = tok.span.start.wrapping_add_signed(delta);
+            tok.span.end = tok.span.end.wrapping_add_signed(delta);
+        }
+        self.tokens
+            .splice(self.pos..self.pos + 1, offset_new_tokens);
     }
 
     /// Consumes the current token, requiring [`Self::peek_reserved`] to
@@ -969,11 +1133,11 @@ impl<'a> Parser<'a> {
             let Some(TokenKind::Word(word)) = self.peek_kind() else {
                 break;
             };
-            let Some(eq_end) = assignment_name_end(word) else {
+            let Some((name_end, value_start, is_append)) = assignment_name_end(word) else {
                 break;
             };
             let word = self.next_word();
-            assignments.push(split_assignment(word, eq_end));
+            assignments.push(split_assignment(word, name_end, value_start, is_append));
         }
 
         // cmd_name / cmd_word: the command name, if any. Its absence is
@@ -1262,16 +1426,22 @@ fn operator_text(op: Operator) -> &'static str {
 /// If `word` has the `ASSIGNMENT_WORD` shape (POSIX 2.10.1: an unquoted,
 /// literal `Name` immediately followed by an unquoted, literal `=`, as
 /// the word's *actual typed characters* — not merely after quote
-/// removal), returns the byte offset within the word's first segment's
-/// text of the character right after that `=`.
+/// removal) **or** the bash-extension `Name+=` append-assignment shape
+/// (confirmed against real bash: `x=foo; x+=bar` leaves `x` as
+/// `foobar`, not `bar` — see [`Assignment::is_append`]'s own docs),
+/// returns `(name_end, value_start, is_append)`: `name_end` is the byte
+/// offset within the word's first segment's text right where `Name`
+/// ends (i.e. where the `=`/`+=` operator itself begins), `value_start`
+/// is the byte offset right after that operator, and `is_append`
+/// distinguishes which of the two operators was found.
 ///
-/// Requires the `Name` and `=` to fall entirely within a single leading
-/// [`WordSegment::Literal`] — i.e. genuinely unquoted — which is why
-/// `'FOO'=bar` is correctly rejected (confirmed against real bash:
+/// Requires the `Name` and operator to fall entirely within a single
+/// leading [`WordSegment::Literal`] — i.e. genuinely unquoted — which is
+/// why `'FOO'=bar` is correctly rejected (confirmed against real bash:
 /// `'FOO'=bar` runs a command literally named `FOO=bar` rather than
 /// assigning `FOO`): its first segment is a `SingleQuoted`, not a
 /// `Literal`.
-fn assignment_name_end(word: &Word) -> Option<usize> {
+fn assignment_name_end(word: &Word) -> Option<(usize, usize, bool)> {
     let Some(WordSegment::Literal(text)) = word.segments.first() else {
         return None;
     };
@@ -1282,7 +1452,10 @@ fn assignment_name_end(word: &Word) -> Option<usize> {
     }
     for (idx, c) in chars {
         if c == '=' {
-            return Some(idx + 1);
+            return Some((idx, idx + 1, false));
+        }
+        if c == '+' && text.as_bytes().get(idx + 1) == Some(&b'=') {
+            return Some((idx, idx + 2, true));
         }
         if c != '_' && !c.is_ascii_alphanumeric() {
             return None;
@@ -1291,19 +1464,28 @@ fn assignment_name_end(word: &Word) -> Option<usize> {
     None
 }
 
-/// Splits `word` at `eq_end` (a byte offset produced by
-/// [`assignment_name_end`]) into an [`Assignment`].
-fn split_assignment(mut word: Word, eq_end: usize) -> Assignment {
+/// Splits `word` at the `(name_end, value_start, is_append)` produced by
+/// [`assignment_name_end`] into an [`Assignment`].
+fn split_assignment(
+    mut word: Word,
+    name_end: usize,
+    value_start: usize,
+    is_append: bool,
+) -> Assignment {
     let first_text = match &word.segments[0] {
         WordSegment::Literal(text) => text.clone(),
         _ => unreachable!("assignment_name_end only returns Some for a leading Literal segment"),
     };
-    let name = first_text[..eq_end - 1].to_string();
-    let remainder = first_text[eq_end..].to_string();
+    let name = first_text[..name_end].to_string();
+    let remainder = first_text[value_start..].to_string();
     if remainder.is_empty() {
         word.segments.remove(0);
     } else {
         word.segments[0] = WordSegment::Literal(remainder);
     }
-    Assignment { name, value: word }
+    Assignment {
+        name,
+        value: word,
+        is_append,
+    }
 }

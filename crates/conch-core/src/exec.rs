@@ -910,8 +910,13 @@ fn exec_subshell(source: &str, shell: &Shell) -> i32 {
 /// 128+n" behavior (`conch-shell-builtins`) depends on
 /// [`spawn_background_job`]'s re-exec'd wrapper child correctly
 /// propagating *its own* signal-death status this same way) goes through
-/// this instead.
-fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+/// this instead. `pub(crate)` (not `fn`) so `crate::expand`'s own command
+/// substitution (`run_command_substitution`) can reuse the identical
+/// convention for `$(...)`/`` `...` ``'s own exit status — needed for
+/// POSIX 2.9.1.3's own "no command name" rule (see
+/// `crate::expand::run_command_substitution`'s own docs for the exact
+/// text and how it's implemented).
+pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     match status.code() {
         Some(code) => code,
@@ -1222,6 +1227,24 @@ fn exec_simple(
     capture_output: bool,
     standalone: bool,
 ) -> (i32, Option<Vec<u8>>) {
+    // POSIX 2.9.1.3: "if there is no command name but the command
+    // contains a command substitution, the command shall complete with
+    // the exit status of the command substitution whose exit status was
+    // the last to be obtained" -- captured *before* any expansion below
+    // runs, so both of this function's own "nothing actually ran"
+    // branches (a bare assignment; a command name that expanded to zero
+    // fields) can tell "a substitution ran during this command's own
+    // expansion and updated `shell.last_status` as a direct side effect
+    // (see `expand::run_command_substitution`'s own docs)" apart from
+    // "nothing touched it, so the POSIX-mandated plain default of `0`
+    // applies" -- simply reading `shell.last_status` directly, with no
+    // baseline to compare against, could otherwise leak an entirely
+    // unrelated *prior* command's status into a substitution-free bare
+    // assignment (confirmed against real bash: `false; x=5; echo $?` is
+    // `0`, not `1`, even though the shell's `$?` was `1` immediately
+    // before `x=5` ran).
+    let status_before_expansion = shell.last_status;
+
     let assignments = match expand_assignments(cmd, shell) {
         Ok(assignments) => assignments,
         Err(err) => {
@@ -1233,8 +1256,14 @@ fn exec_simple(
     let Some(name_word) = &cmd.name else {
         // A bare assignment-only simple command (`FOO=bar`, no command
         // name) assigns persistently to the shell rather than just the
-        // one command's environment.
-        let mut status = 0;
+        // one command's environment. See this function's own
+        // `status_before_expansion` docs above for the POSIX 2.9.1.3
+        // exit-status rule this implements.
+        let mut status = if shell.last_status == status_before_expansion {
+            0
+        } else {
+            shell.last_status
+        };
         for (name, value) in assignments {
             if shell.readonly_vars.contains(&name) {
                 eprintln!("conch: {name}: readonly variable");
@@ -1261,9 +1290,19 @@ fn exec_simple(
         }
     };
     let Some(name) = all_fields.next() else {
-        // Expanded to zero fields (e.g. an unset, unquoted parameter) —
-        // nothing to run, matching real shells treating this as a no-op.
-        return (0, None);
+        // Expanded to zero fields (e.g. an unset, unquoted parameter, or
+        // a command substitution with no output) -- nothing to run,
+        // matching real shells treating this as a no-op *unless* a
+        // command substitution ran somewhere in this command's own
+        // expansion (assignments or the name word itself), per the same
+        // POSIX 2.9.1.3 rule and `status_before_expansion` docs as the
+        // bare-assignment branch above.
+        let status = if shell.last_status == status_before_expansion {
+            0
+        } else {
+            shell.last_status
+        };
+        return (status, None);
     };
 
     let mut args: Vec<String> = all_fields.collect();
@@ -1413,6 +1452,29 @@ fn exec_function(
 /// Assignment values never undergo field splitting or pathname expansion
 /// (POSIX 2.6) — `expand_word_single` is the correct mode here, not
 /// `expand_word_fields`.
+/// Expands each of `cmd`'s assignments to its final `(name, value)` pair
+/// — resolving [`Assignment::is_append`]'s bash-extension `NAME+=value`
+/// semantics here (concatenating onto the name's *current* value, an
+/// unset name treated as empty, exactly like a plain assignment — see
+/// that field's own docs) so every consumer of this function's return
+/// value (a bare assignment persisting to the shell; a prefix assignment
+/// temporarily set for one command) only ever has to deal with an
+/// already-fully-resolved value to *set*, never `+=`'s own
+/// read-then-concatenate step.
+///
+/// Known simplification, not currently reachable by anything in this
+/// project's own differential corpus: two `+=` assignments to the *same*
+/// name within one single command line (`x=a; x+=b x+=c` as one prefix
+/// list, as opposed to separate statements) would each read `name`'s
+/// value from *before* this whole batch started, rather than seeing the
+/// earlier one's own effect — every assignment in `cmd.assignments` is
+/// expanded from the same starting `shell` state before any of them are
+/// actually applied (that application happens in this function's own
+/// callers, afterward). Accumulating across *separate statements*
+/// (`x=a; x+=b; x+=c`, the common, real-world idiom this bash extension
+/// exists for) is unaffected, since each statement is its own separate
+/// `expand_assignments` call against the shell state the *previous*
+/// statement already updated.
 fn expand_assignments(
     cmd: &SimpleCommand,
     shell: &mut Shell,
@@ -1420,8 +1482,15 @@ fn expand_assignments(
     cmd.assignments
         .iter()
         .map(|assignment| {
-            expand_word_single(&assignment.value, shell)
-                .map(|value| (assignment.name.clone(), value))
+            let expanded = expand_word_single(&assignment.value, shell)?;
+            let value = if assignment.is_append {
+                let mut combined = shell.get_var(&assignment.name).unwrap_or("").to_string();
+                combined.push_str(&expanded);
+                combined
+            } else {
+                expanded
+            };
+            Ok((assignment.name.clone(), value))
         })
         .collect()
 }
@@ -2208,6 +2277,45 @@ mod tests {
         // `FOO=bar true` should not leave FOO set afterward.
         run("FOO=temp true", &mut shell);
         assert_eq!(shell.get_var("FOO"), None);
+    }
+
+    // ---- POSIX 2.9.1.3 "no command name" exit-status rule -------------------
+    //
+    // `run_command_substitution` itself is deliberately not unit-tested
+    // here (see `crate::expand`'s own test module's pre-existing note on
+    // why: `env::current_exe()` resolves to *this test binary* during
+    // `cargo test`, not the real `conch` executable, so any command
+    // substitution genuinely exercised through this crate's own test
+    // suite would spawn nonsense) -- the differential suite
+    // (`tests/conch-difftest/corpus/phase7/command_substitution_exit_status_hardening.toml`)
+    // covers that against the real, compiled binary instead, and was
+    // directly confirmed passing (all five cases, including the stderr
+    // one) while implementing this fix. What *is* unit-testable here,
+    // and what these two tests pin down, is `exec_simple`'s own
+    // `status_before_expansion` comparison logic in isolation: a
+    // substitution-free bare assignment (or zero-fields command name)
+    // must reset to the POSIX-mandated default of `0`, never leak an
+    // entirely unrelated *prior* command's own exit status just because
+    // nothing touched `shell.last_status` during this command's own
+    // expansion.
+
+    #[test]
+    fn bare_assignment_with_no_substitution_resets_status_to_zero() {
+        // Confirmed against real bash: `false; x=5; echo $?` is `0`, not
+        // `1`, even though `$?` was `1` immediately before `x=5` ran.
+        let mut shell = Shell::new();
+        assert_eq!(run("false; x=5", &mut shell), 0);
+        assert_eq!(shell.get_var("x"), Some("5"));
+    }
+
+    #[test]
+    fn command_name_expanding_to_zero_fields_with_no_substitution_resets_status_to_zero() {
+        // Same rule, reached via the sibling "nothing to run" branch
+        // (an unset, unquoted parameter as the command name, rather than
+        // a bare assignment) -- confirmed against real bash:
+        // `false; $UNSET_CONCH_TEST_VAR; echo $?` is `0`.
+        let mut shell = Shell::new();
+        assert_eq!(run("false; $UNSET_CONCH_TEST_VAR", &mut shell), 0);
     }
 
     #[test]

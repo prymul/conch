@@ -1165,7 +1165,55 @@ fn eval_arith_variable(name: &str, shell: &mut Shell, depth: u32) -> Result<i64,
 /// cwd a real subshell would see — without conch's `Shell` needing to be
 /// cloneable or the executor needing a separate "isolated" execution path
 /// that could drift from top-level behavior.
-fn run_command_substitution(body: &str, shell: &Shell) -> Result<String, ExpandError> {
+///
+/// # `$?` propagation (POSIX 2.9.1.3)
+///
+/// Sets `shell.last_status` to this substitution's own exit status as a
+/// direct, immediate side effect, every time this function runs — this
+/// is what lets `exec_simple`'s two "nothing actually ran" branches (a
+/// bare assignment; a command name that expanded to zero fields) fall
+/// back to POSIX 2.9.1.3's "the command shall complete with the exit
+/// status of the command substitution whose exit status was the last to
+/// be obtained" instead of always hardcoding `0`, which used to silently
+/// break `output=$(cmd) || handle_error`-style error checking whenever
+/// nothing but the substitution itself made up the command.
+///
+/// Deliberately an unconditional side effect here, *not* threaded back
+/// as part of this function's own `Result` — confirmed against real
+/// bash this needs to be visible incrementally, mid-expansion, to any
+/// `$?` reference elsewhere in the very same command's own words, not
+/// just to callers checking it once expansion fully finishes:
+/// `true; echo $(false) $?` prints `1` (the second `$?`, expanded
+/// *after* `$(false)` already ran, sees its status) while
+/// `true; echo $? $(false)` prints `0` (the first `$?`, expanded
+/// *before* `$(false)` runs, still sees the prior command's status) —
+/// both confirmed directly. A command that actually ends up running
+/// (anything at all, even a no-op like `true`) still correctly gets
+/// *its own* final status as the command's `$?` regardless of any
+/// substitution's status along the way, since every real command-running
+/// path (`exec_simple`'s own return value, ultimately)
+/// unconditionally overwrites `shell.last_status` again once it finishes
+/// — this function's own write only ever "shows through" as the
+/// command's final status in the specific case nothing else overwrites
+/// it afterward, exactly POSIX 2.9.1.3's own scope.
+///
+/// # stderr
+///
+/// The inner re-exec'd process's stderr is explicitly inherited (passed
+/// straight through to conch's own real stderr), not captured — POSIX
+/// 2.6.3/confirmed against real bash and dash: only a command
+/// substitution's *stdout* is captured into its result; any diagnostic
+/// its inner command writes to stderr must still reach the outer
+/// shell's real stderr unconditionally (`x=$(cat /nonexistent)` still
+/// prints `cat`'s own "No such file or directory" on both oracle
+/// shells). Before this, `.output()`'s own default (piping stderr into
+/// the same captured-but-discarded bucket as every other unused field of
+/// `output`) silently swallowed it instead — confirmed against real bash
+/// to be a genuine, user-visible gap, not a cosmetic one, since losing an
+/// inner command's own error output is exactly the kind of thing a
+/// script author relies on seeing even when they only meant to capture
+/// stdout.
+fn run_command_substitution(body: &str, shell: &mut Shell) -> Result<String, ExpandError> {
     let exe = std::env::current_exe()
         .map_err(|err| ExpandError::CommandSubstitutionFailed(err.to_string()))?;
     let output = std::process::Command::new(exe)
@@ -1184,8 +1232,14 @@ fn run_command_substitution(body: &str, shell: &Shell) -> Result<String, ExpandE
         // `exec_subshell`/`spawn_background_job` -- see
         // `Shell::ignored_trap_names`'s own docs.
         .env("__CONCH_IGNORED_SIGNALS", shell.ignored_trap_names())
+        // See this function's own "stderr" docs above -- inherited, not
+        // captured, so `.output()` below still captures stdout (its own
+        // default) while leaving stderr alone entirely.
+        .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|err| ExpandError::CommandSubstitutionFailed(err.to_string()))?;
+
+    shell.last_status = crate::exec::exit_code_of(output.status);
 
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     while text.ends_with('\n') {

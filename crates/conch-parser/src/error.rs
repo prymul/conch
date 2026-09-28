@@ -42,6 +42,19 @@ pub enum ParseError {
     /// will follow.
     #[error("input nested too deeply (at byte {})", .span.start)]
     NestingTooDeep { span: Span },
+
+    /// `Parser::maybe_expand_alias` performed more than
+    /// `conch_shell_parser::parser`'s (private) `MAX_ALIAS_EXPANSIONS`
+    /// substitutions across this one parse — see that constant's own
+    /// docs. A self-referential alias whose replacement reintroduces a
+    /// list operator (`alias c='c|c'`) can otherwise double the pending
+    /// parse work on every one of `parse_pipeline`/`parse_and_or`/the
+    /// `;`/`&`-list loops' repeated re-entries into `parse_command`,
+    /// reaching multiple gigabytes of memory within seconds with no OS
+    /// backstop to rely on — this bound turns that into a clean, reported
+    /// error instead.
+    #[error("too many alias expansions (at byte {})", .span.start)]
+    TooManyAliasExpansions { span: Span },
 }
 
 impl ParseError {
@@ -73,7 +86,10 @@ impl ParseError {
     /// Also `false` for [`ParseError::NestingTooDeep`]: reading more
     /// input cannot make already-too-deep nesting shallower again, so
     /// there's nothing a continuation prompt could productively wait for
-    /// here either.
+    /// here either. Also `false` for
+    /// [`ParseError::TooManyAliasExpansions`], for the identical reason —
+    /// the bound was already exceeded, and more input only risks making
+    /// it worse, never resolves it.
     #[must_use]
     pub fn is_incomplete_input(&self) -> bool {
         matches!(
