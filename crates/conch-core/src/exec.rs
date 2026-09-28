@@ -86,7 +86,7 @@ fn expand_words_fields<'a>(
 ) -> Result<Vec<String>, ExpandError> {
     let mut fields = Vec::new();
     for word in words {
-        for variant in brace_expand(word) {
+        for variant in brace_expand(word)? {
             fields.extend(expand_word_fields(&variant, shell)?);
         }
     }

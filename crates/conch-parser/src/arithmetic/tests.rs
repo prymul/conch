@@ -433,6 +433,24 @@ fn unbalanced_parens_error() {
 }
 
 #[test]
+fn deeply_nested_parens_error_cleanly_instead_of_overflowing_the_stack() {
+    // See MAX_PAREN_DEPTH's own docs: `parse_primary`'s `Tok::LParen`
+    // case recurses back into `parse_comma` (the top of the whole
+    // precedence chain) with no depth tracking before this guard
+    // existed, so enough nesting overflowed the stack -- confirmed
+    // against real bash 5.3, which SIGSEGVs on equivalent input rather
+    // than reporting any error. 10,000 is comfortably past
+    // MAX_PAREN_DEPTH (50) -- the guard fires almost immediately, so
+    // this input's raw size has no bearing on this test's own stack
+    // usage regardless of how deep it goes.
+    let source = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
+    assert_eq!(
+        parse_arithmetic_expr(&source),
+        Err(ArithError::NestingTooDeep { pos: 50 })
+    );
+}
+
+#[test]
 fn invalid_character_errors() {
     // A bare single-quote is never valid arithmetic syntax (see the
     // module docs' quoting grounding).

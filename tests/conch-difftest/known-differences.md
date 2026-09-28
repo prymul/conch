@@ -15,11 +15,14 @@ match bash/sh for this specific case, and here's why.
 
 ## Deliberate conch-vs-bash/sh divergences
 
-Six real, decided-on-purpose divergences exist so far: KD-0001 through
+Eight real, decided-on-purpose divergences exist so far: KD-0001 through
 KD-0003 from Phase 4 (job control), KD-0004/KD-0005 from Phase 5
-(builtins completeness), and KD-0006 from Phase 6 (interactive UX --
-`PS1`/`PS2` prompt expansion). The two sections after this one are a different,
-complementary kind of record: not conch decisions at all, but
+(builtins completeness), KD-0006 from Phase 6 (interactive UX --
+`PS1`/`PS2` prompt expansion), and KD-0007/KD-0008 from Phase 7
+(recursion-depth hardening for two hand-rolled recursive-descent
+components that previously had no depth guard at all). The two sections
+after this one are a different, complementary kind of record: not conch
+decisions at all, but
 divergences *between the two oracle shells themselves* (bash and dash),
 found and verified while building the Phase 2 (`corpus/phase2/`)
 word-expansion corpus. They exist so a case's `oracles = ["bash"]`
@@ -362,6 +365,121 @@ mechanism to track that automatically -- documented here in prose
 instead, the same "not every divergence needs a corpus case" precedent
 KD-0002/KD-0003 already established.
 
+### KD-0007: deeply nested `$((...))` parenthesization reports a clean parse error, where bash crashes
+
+**What diverges:** an arithmetic expansion whose `(...)` nesting is deep
+enough (empirically, somewhere between 5,000 and 10,000 levels on this
+project's development machine -- the exact threshold depends on the
+platform's stack size and is not a value either shell promises) now
+fails with an ordinary, reported `ArithmeticSyntax` error
+(`arithmetic expression nested too deeply`) instead of continuing to
+parse.
+
+**bash/sh behavior:** confirmed empirically against real bash 5.3 (not
+assumed): a script consisting of `echo $((`, then several thousand `(`
+characters, then `1`, then a matching run of `)` characters, then `))`
+crashes the entire bash process with `SIGSEGV` (confirmed exit code
+139) once the nesting is deep enough, reporting no error message at all
+-- bash's own recursive-descent arithmetic-expression parser (`expr.c`)
+has no depth guard of its own here any more than conch's did before this
+phase, so a sufficiently adversarial expression simply overflows bash's
+C stack too.
+
+**conch behavior:** `conch_shell_parser::arithmetic`'s (module-private)
+`MAX_PAREN_DEPTH` bounds `(`-nesting inside a single `$((...))`
+expression's *parser* (a distinct recursion from
+`conch-shell-core::expand`'s pre-existing `MAX_ARITH_RECURSION`, which
+only guards a self-referential *variable's* re-evaluation, not raw
+paren nesting in the source text itself) to 50 levels, chosen with a
+large empirically-verified safety margin below where this specific
+recursion shape (which re-enters the parser's entire ~17-function
+precedence-climbing chain per nesting level, not one shallow self-call)
+was separately confirmed to overflow conch's own stack under a debug
+build's default per-thread stack size -- see that constant's own doc
+comment for the full empirical methodology. Past that bound, conch
+reports a clean, catchable error and the rest of the script continues
+running exactly as it would after any other expansion error, rather
+than taking down the whole process.
+
+**Why:** this is the one genuine case among this phase's three
+recursion-depth fixes where bash's own behavior is *itself* the crash
+(confirmed by direct reproduction, not inferred) -- there is no
+"matching bash" option available here at all, only "crash the same way"
+or "fail cleanly instead," and this project already has an established
+precedent (`MAX_ARITH_RECURSION`, `MAX_EVAL_RECURSION`) of choosing the
+latter for exactly this reason: a bounded, reported error is strictly
+better shell-engineering behavior than an unbounded native-stack
+recursion a hostile or merely-malformed input can trigger, and nothing
+about matching bash's own SIGSEGV here would be a meaningful
+compatibility win for any real script. A prior security review had
+already flagged this exact code path's unguarded recursion as a
+"safe abort matching bash's own SIGSEGV crash" non-regression before
+this phase -- true as far as it went, but that framing was never
+actually written down anywhere, so this entry also closes that specific
+documentation gap now that the *observable* behavior has changed (clean
+error, not a mirrored crash).
+
+**Case:** not represented in the differential corpus and not planned to
+be -- the oracle side of any such case would need to deliberately crash
+a real bash subprocess with `SIGSEGV` to compare against, which this
+project's differential-test harness has no support for (and shouldn't
+grow purely to cover this one case) -- confirmed instead via a dedicated
+unit test, `conch_shell_parser::arithmetic::tests::deeply_nested_parens_error_cleanly_instead_of_overflowing_the_stack`,
+and via the live manual reproduction against real bash 5.3 described
+above.
+
+### KD-0008: deeply nested `{a,{b,{c,...}}}` brace expansion reports a clean error, where bash crashes
+
+**What diverges:** a word whose brace-expansion groups nest deeply
+enough (empirically, somewhere between 10,000 and 20,000 levels on this
+project's development machine -- again platform- and stack-size-
+dependent, not a value either shell promises) now fails with an
+ordinary, reported `ExpandError::BraceExpansionTooDeep` error instead of
+continuing to expand.
+
+**bash/sh behavior:** confirmed empirically against real bash 5.3:
+`echo {a,{a,{a,...z...}}}` with enough nesting levels crashes the whole
+bash process with `SIGSEGV` (confirmed exit code 139), same as
+KD-0007's arithmetic case and for the same underlying reason -- bash's
+own brace-expansion implementation (`braces.c`) recurses once per
+nesting level with no depth guard of its own either. Note this is
+distinct from bash's *own* graceful behavior on a deeply nested
+*compound command* (`( ( ( ... ) ) )` or `{ { { ... } } }` as shell
+syntax, not a brace-expansion word) -- confirmed separately that bash
+reports an ordinary `syntax error near unexpected token` for that shape
+well before crashing, which is why the equivalent conch-side hardening
+for its own compound-command grammar (`conch_shell_parser::parser`'s
+`MAX_COMMAND_DEPTH`, added in this same phase) does *not* get its own KD
+entry here: both shells already failed cleanly there, before and after,
+just with different specific wording -- an ordinary cross-shell wording
+difference (see "Cross-shell quirks worth knowing" below), not a new
+substantive divergence the way this entry and KD-0007 are.
+
+**conch behavior:** `conch_shell_core::brace::MAX_BRACE_DEPTH` bounds
+how many `{...}` groups (nested, chained, or a mix -- the recursion
+doesn't distinguish the two shapes; see that constant's own docs) a
+single word's brace expansion will consume before giving up, to 100
+levels. Past that bound, conch reports a clean, catchable error and the
+rest of the script continues running, rather than taking down the whole
+process.
+
+**Why:** identical reasoning to KD-0007 -- this is a case where bash's
+own behavior is the crash (confirmed by direct reproduction), so there
+is no "match bash" option, and this project already has an established
+precedent of choosing a bounded, reported error over an unbounded
+native-stack recursion. Unlike KD-0007's arithmetic parser (which had at
+least been previously flagged, if never actually written down, as an
+accepted non-regression), this one is newly discovered in this same
+hardening pass with no prior review or framing at all -- `brace_expand`
+had no depth tracking whatsoever before this phase.
+
+**Case:** not represented in the differential corpus, for the same
+reason as KD-0007 (the oracle side would need to deliberately crash a
+real bash subprocess). Confirmed instead via a dedicated unit test,
+`conch_shell_core::brace::tests::deeply_nested_groups_error_cleanly_instead_of_overflowing_the_stack`,
+and via the live manual reproduction against real bash 5.3 described
+above.
+
 ## Bash extensions not in the POSIX baseline
 
 Every construct below is something bash supports that POSIX `sh` (and
@@ -544,6 +662,27 @@ just the target(s) that do agree.
   same-line rule, an `oracles = ["bash"]` case showing the opt-in
   requirement, and an `oracles = ["sh"]` case showing dash's default-on
   behavior for the identical script.
+
+- **Deeply nested compound commands (`( ( ( ... ) ) )` subshells, or
+  `{ { { ... } } }` brace groups) are rejected by both shells, with
+  different specific wording.** Confirmed empirically against real bash
+  5.3: unlike the arithmetic-expansion (KD-0007) and brace-expansion
+  (KD-0008) cases, bash does *not* crash on deeply nested compound-command
+  syntax -- it reports an ordinary `syntax error near unexpected token`
+  and exits nonzero well before nesting deep enough to threaten its own
+  stack. `conch_shell_parser::parser`'s own new `MAX_COMMAND_DEPTH` guard
+  (added in the same Phase 7 hardening pass as KD-0007/KD-0008, guarding
+  the fully mutually-recursive `parse_command` ->
+  `parse_subshell`/`parse_brace_group`/... -> `parse_compound_list` ->
+  ... -> `parse_command` chain, which previously had no depth tracking at
+  all) means conch now also fails cleanly here rather than overflowing
+  its own stack -- but since both shells already agreed on "cleanly
+  reject, don't crash" as the right *class* of outcome even before this
+  fix landed, this is an ordinary wording/exit-code-only mismatch (conch
+  reports `ParseError::NestingTooDeep`; bash reports its own
+  parser's message), not a new substantive divergence -- which is why,
+  unlike its two siblings, this fix did not get its own numbered `KD-`
+  entry.
 
 ## Entry format
 

@@ -368,6 +368,10 @@ pub enum ArithError {
     /// see [`LexError`].
     #[error(transparent)]
     Lex(#[from] LexError),
+    /// `(`-nesting inside a single `$((...))` expression went past
+    /// [`MAX_PAREN_DEPTH`]. See that constant's docs for why this exists.
+    #[error("arithmetic expression nested too deeply (byte {pos})")]
+    NestingTooDeep { pos: usize },
 }
 
 // ============================================================================
@@ -547,6 +551,7 @@ pub fn parse_arithmetic_expr(source: &str) -> Result<ArithExpr, ArithError> {
         tokens,
         idx: 0,
         source_len,
+        paren_depth: 0,
     };
     let expr = parser.parse_comma()?;
     if !parser.at_eof() {
@@ -936,10 +941,46 @@ fn digit_value(c: char, base: u32) -> Option<u32> {
 
 // ---- recursive-descent / precedence-climbing parser --------------------
 
+/// A conservative bound on how many levels of `(...)` nesting a single
+/// `$((...))` expression's *parser* (not its evaluator -- contrast
+/// [`crate`]'s sibling `MAX_ARITH_RECURSION` in
+/// `conch-shell-core::expand`, which guards a self-referential
+/// variable's re-evaluation, a completely different recursion) will
+/// follow before giving up, mirroring that same project-wide precedent
+/// (see also `conch-shell-builtins`' `MAX_EVAL_RECURSION`): turns
+/// unbounded recursion in [`Parser::parse_primary`]'s `Tok::LParen` case
+/// (which calls [`Parser::parse_comma`] -- the very top of this whole
+/// precedence chain -- with no depth tracking at all) into a clean,
+/// reported [`ArithError::NestingTooDeep`] instead of a stack overflow.
+/// Confirmed against real bash 5.3: enough `(`-nesting in a `$((...))`
+/// body (tens of thousands of parens) crashes bash itself with SIGSEGV
+/// rather than reporting any error -- so there's no bash behavior to
+/// match here; this bound exists purely so conch fails cleanly where
+/// bash doesn't.
+///
+/// Chosen lower than this project's other two recursion-guard constants
+/// (100/200) for a reason specific to *this* recursion: each level of
+/// `(...)` nesting here re-enters the entire ~17-function precedence
+/// chain (`parse_comma` down through `parse_primary`), not one shallow
+/// self-call the way `MAX_ARITH_RECURSION`/`MAX_EVAL_RECURSION`'s
+/// guarded recursions do -- so the same numeric bound costs roughly 17x
+/// the native stack depth here. Empirically probed against this crate's
+/// own `cargo test` default 2 MiB-per-thread stack (debug build, the
+/// same profile CI's `cargo test --all-features` uses): depths up to 95
+/// still parsed/errored cleanly, while 100+ overflowed the stack *even
+/// with this guard in place*, since the guard's own check only fires
+/// after already recursing one more full chain-pass deep than the
+/// previous level. 50 keeps a comfortable ~2x margin below that observed
+/// failure point while remaining far beyond any nesting depth a real,
+/// non-adversarial arithmetic expression would ever use.
+const MAX_PAREN_DEPTH: u32 = 50;
+
 struct Parser {
     tokens: Vec<(Tok, usize)>,
     idx: usize,
     source_len: usize,
+    /// Current `(...)` nesting depth -- see [`MAX_PAREN_DEPTH`].
+    paren_depth: u32,
 }
 
 impl Parser {
@@ -994,7 +1035,12 @@ impl Parser {
             }
             Some(Tok::LParen) => {
                 self.idx += 1;
+                self.paren_depth += 1;
+                if self.paren_depth > MAX_PAREN_DEPTH {
+                    return Err(ArithError::NestingTooDeep { pos });
+                }
                 let inner = self.parse_comma()?;
+                self.paren_depth -= 1;
                 self.expect(&Tok::RParen, "')'")?;
                 Ok(inner)
             }

@@ -96,7 +96,48 @@ struct Parser<'a> {
     /// ([`Self::parse_command`]) where a fresh simple command's first
     /// word is recognized.
     aliases: &'a HashMap<String, String>,
+    /// Current `command`-grammar recursion depth — see
+    /// [`MAX_COMMAND_DEPTH`].
+    depth: u32,
 }
+
+/// A conservative bound on how many levels deep `command` can recurse
+/// through the mutually-recursive compound-command chain
+/// (`parse_command` → `parse_subshell`/`parse_if_clause`/
+/// `parse_while_clause`/`parse_until_clause`/`parse_for_clause`/
+/// `parse_case_clause`/`parse_brace_group`/`parse_function_body` →
+/// `parse_compound_list` → `parse_command_list_item` → `parse_and_or` →
+/// `parse_pipeline` → `parse_command` again) before giving up, mirroring
+/// this project's established recursion-guard precedent
+/// (`conch-shell-core::expand`'s `MAX_ARITH_RECURSION`,
+/// `conch-shell-builtins`' `MAX_EVAL_RECURSION`, and this crate's own
+/// sibling `arithmetic::MAX_PAREN_DEPTH`): before this guard existed,
+/// nothing tracked this chain's depth at all, so deeply nested input —
+/// `((((((...))))))` (subshells, not arithmetic) or `{ { { ... } } }`
+/// groups, chief among the shapes this recursion actually sees — could
+/// overflow the stack instead of producing any [`ParseError`]. Every
+/// entry into [`Parser::parse_command`] costs exactly one level here,
+/// which is where the guard lives (see that function's own wrapper for
+/// why it — not any of the individual compound-command parsers — is the
+/// one right place to count from: it's the single, unavoidable
+/// re-entry point every one of them funnels back through).
+///
+/// Empirically probed the same way as this crate's own sibling
+/// `arithmetic::MAX_PAREN_DEPTH` (see that constant's docs for the
+/// method): against this crate's `cargo test` default 2 MiB-per-thread
+/// stack (debug build, the same profile CI's `cargo test --all-features`
+/// uses), both a `((((...))))`-subshell and a `{ { { ... } } }`-brace-group
+/// probe still parsed/errored cleanly at 120 levels deep, with no
+/// overflow observed at any depth tried up to that point — this chain is
+/// shorter per level (`parse_command` → one compound-command parser →
+/// `parse_compound_list` → `parse_command_list_item` → `parse_and_or` →
+/// `parse_pipeline` → `parse_command`, about 6 frames) than
+/// `MAX_PAREN_DEPTH`'s ~17-function precedence-ladder pass, so it has
+/// more headroom at the same numeric bound, not less. 40 is chosen well
+/// below even that already-comfortable 120-deep observed-safe point,
+/// since it's already far beyond any nesting depth a real,
+/// non-adversarial script would ever use.
+const MAX_COMMAND_DEPTH: u32 = 40;
 
 impl<'a> Parser<'a> {
     fn new(source: &'a str, tokens: Vec<Token>, aliases: &'a HashMap<String, String>) -> Self {
@@ -105,6 +146,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             aliases,
+            depth: 0,
         }
     }
 
@@ -291,8 +333,42 @@ impl<'a> Parser<'a> {
     /// a second argument rather than closing an enclosing `if` —
     /// confirmed against real bash for exactly this case.
     ///
+    /// Also where [`MAX_COMMAND_DEPTH`]'s guard lives: every mutually
+    /// recursive compound-command production funnels back through this
+    /// exact function to parse its own nested body (directly, or via
+    /// [`Self::parse_compound_list`]/[`Self::parse_pipeline`]/
+    /// [`Self::parse_and_or`]), so incrementing/checking/decrementing
+    /// [`Self::depth`] once here — rather than separately in each of
+    /// [`Self::parse_subshell`], [`Self::parse_if_clause`], etc. — bounds
+    /// the whole chain's total nesting with one counter. Deliberately a
+    /// thin wrapper around [`Self::parse_command_inner`] (rather than
+    /// folding the check directly into that function's body) so the
+    /// depth counter is reliably decremented on every return path —
+    /// including the many early `?`-propagated errors inside
+    /// `parse_command_inner` — without needing a `Drop`-based guard that
+    /// would otherwise have to hold `self` borrowed for that whole
+    /// function body.
+    ///
     /// [`Command`]: crate::ast::Command
     fn parse_command(&mut self) -> Result<Command, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_COMMAND_DEPTH {
+            let span = self.peek().map_or_else(
+                || Span::new(self.source.len(), self.source.len()),
+                |tok| tok.span,
+            );
+            self.depth -= 1;
+            return Err(ParseError::NestingTooDeep { span });
+        }
+        let result = self.parse_command_inner();
+        self.depth -= 1;
+        result
+    }
+
+    /// The actual `command` grammar production — see [`Self::parse_command`]
+    /// for why the depth guard lives in a thin wrapper around this rather
+    /// than inline here.
+    fn parse_command_inner(&mut self) -> Result<Command, ParseError> {
         // Alias expansion (see `crate::parse_with_aliases`'s own docs)
         // happens *before* even the function-definition/subshell/
         // reserved-word checks just below: bash's own model expands

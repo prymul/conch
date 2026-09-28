@@ -945,6 +945,33 @@ fn nested_compound_commands() {
 }
 
 #[test]
+fn deeply_nested_subshells_error_cleanly_instead_of_overflowing_the_stack() {
+    // See `parser::MAX_COMMAND_DEPTH`'s own docs: `parse_command` ->
+    // `parse_subshell` -> `parse_compound_list` -> ... -> `parse_command`
+    // is fully mutually recursive with no depth tracking before this
+    // guard existed, so enough subshell nesting overflowed the stack
+    // instead of producing any `ParseError`. 1,000 is comfortably past
+    // `MAX_COMMAND_DEPTH` (40) -- the guard fires well before the input
+    // is exhausted, so this input's raw size has no bearing on this
+    // test's own stack usage regardless of how deep it goes.
+    let source = format!("{}echo hi{}", "(".repeat(1_000), ")".repeat(1_000));
+    let err = parse(&source).unwrap_err();
+    assert!(matches!(err, ParseError::NestingTooDeep { .. }));
+}
+
+#[test]
+fn deeply_nested_brace_groups_error_cleanly_instead_of_overflowing_the_stack() {
+    // Same guard, reached via the *other* named recursion shape called
+    // out in the Phase 7 hardening pass -- `{ { { ... } } }` groups
+    // rather than subshells -- confirming the single counter in
+    // `parse_command` bounds both, not just whichever shape happened to
+    // be probed first.
+    let source = format!("{}echo hi;{}", "{ ".repeat(1_000), " }".repeat(1_000));
+    let err = parse(&source).unwrap_err();
+    assert!(matches!(err, ParseError::NestingTooDeep { .. }));
+}
+
+#[test]
 fn for_loop_with_no_in_clause_and_nested_if() {
     let cmd = parse_one_compound_command("for x; do if true; then echo $x; fi; done");
     let CompoundCommandKind::For(clause) = cmd.kind else {

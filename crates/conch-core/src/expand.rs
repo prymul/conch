@@ -125,6 +125,11 @@ pub enum ExpandError {
     /// See [`MAX_ARITH_RECURSION`].
     #[error("expression recursion level exceeded")]
     ArithmeticRecursionLimit,
+    /// A word's brace-expansion groups (nested, chained, or both) recursed
+    /// past `crate::brace`'s (private) `MAX_BRACE_DEPTH` — see that
+    /// constant's own docs.
+    #[error("brace expansion nested too deeply")]
+    BraceExpansionTooDeep,
 }
 
 /// One piece of an expanded word, tagged with its splitting/globbing

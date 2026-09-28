@@ -30,6 +30,18 @@ pub enum ParseError {
     /// "this is valid shell syntax conch doesn't support yet".
     #[error("{message} (at byte {})", .span.start)]
     UnsupportedConstruct { message: String, span: Span },
+
+    /// The `command` grammar's compound-command chain (`parse_command` →
+    /// `parse_subshell`/`parse_if_clause`/`parse_while_clause`/.../
+    /// `parse_compound_list` → ... → `parse_command` again) recursed past
+    /// `conch_shell_parser::parser`'s (private) depth bound — see that
+    /// module's `MAX_COMMAND_DEPTH` for the full reasoning. Distinguished
+    /// from [`ParseError::UnexpectedToken`] since no single token is
+    /// invalid here; the input is simply nested deeper (`((((...))))`
+    /// subshells, `{ { { ... } } }` groups, or any mix) than this parser
+    /// will follow.
+    #[error("input nested too deeply (at byte {})", .span.start)]
+    NestingTooDeep { span: Span },
 }
 
 impl ParseError {
@@ -58,6 +70,10 @@ impl ParseError {
     /// either way. Also `false` for [`ParseError::UnexpectedToken`]: that
     /// variant only ever fires when a *real* token was found somewhere
     /// the grammar didn't allow it, which more input could never fix.
+    /// Also `false` for [`ParseError::NestingTooDeep`]: reading more
+    /// input cannot make already-too-deep nesting shallower again, so
+    /// there's nothing a continuation prompt could productively wait for
+    /// here either.
     #[must_use]
     pub fn is_incomplete_input(&self) -> bool {
         matches!(
@@ -114,6 +130,14 @@ mod tests {
             found: "`;`".to_string(),
             span: Span::new(0, 1),
             expected: "a command".to_string(),
+        };
+        assert!(!err.is_incomplete_input());
+    }
+
+    #[test]
+    fn nesting_too_deep_is_not_incomplete() {
+        let err = ParseError::NestingTooDeep {
+            span: Span::new(4, 5),
         };
         assert!(!err.is_incomplete_input());
     }
