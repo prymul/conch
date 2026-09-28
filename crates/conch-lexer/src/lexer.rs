@@ -454,6 +454,44 @@ impl<'a> Lexer<'a> {
                         Some('\n') => {
                             self.bump();
                         }
+                        // A backslash escaping a character that's ever
+                        // glob-pattern-syntactically significant (POSIX
+                        // 2.13.1's pattern-matching notation: `*`/`?`/`[`
+                        // at any position, or `]`/`-`/`!` specifically
+                        // inside a `[...]` bracket expression — this
+                        // lexer has no bracket-expression awareness of
+                        // its own to know *which* of those apply here,
+                        // so it preserves the backslash for all six
+                        // uniformly and leaves the distinction to
+                        // whichever later stage actually interprets the
+                        // text as a pattern) is kept **verbatim** —
+                        // both the backslash and the character — rather
+                        // than having ordinary POSIX 2.2.1 quote removal
+                        // resolve it immediately the way every other
+                        // escaped character gets resolved right here.
+                        // This is a deliberate, narrow exception matching
+                        // POSIX 2.6's real expansion order: quote removal
+                        // is always the *last* step, strictly after
+                        // pathname expansion, so an unquoted backslash
+                        // protecting a glob metacharacter must still be
+                        // visible when pathname expansion runs — collapsing
+                        // it this early would make the character
+                        // indistinguishable from an ordinary, unescaped
+                        // occurrence of itself, silently turning `\*`
+                        // into a real wildcard instead of a literal `*`
+                        // (confirmed against real bash: `echo \*` prints
+                        // a literal `*`, never triggering pathname
+                        // expansion, and `[C\-D]*` matches literal `C`,
+                        // `-`, and `D`, not the range `C`-`D`). See
+                        // `conch_shell_core::expand`'s `resolve_glob_escapes`
+                        // for where this deferred escape finally gets
+                        // resolved once expansion knows whether pathname
+                        // expansion actually ran or not.
+                        Some(special @ ('*' | '?' | '[' | ']' | '-' | '!')) => {
+                            literal.push('\\');
+                            literal.push(special);
+                            self.bump();
+                        }
                         Some(other) => {
                             literal.push(other);
                             self.bump();
@@ -621,15 +659,62 @@ impl<'a> Lexer<'a> {
                 self.bump(); // consume '{'
                 self.scan_braced_parameter(dollar_pos)
             }
+            // POSIX 2.6.4's own documented ambiguity: "the syntax of the
+            // shell command language has an ambiguity for expansions
+            // beginning with '$((', which can introduce an arithmetic
+            // expansion or a command substitution that starts with a
+            // subshell. Arithmetic expansion has precedence; that is, the
+            // shell shall first determine whether it can parse the
+            // expansion as an arithmetic expansion and shall only parse
+            // the expansion as a command substitution if it determines
+            // that it cannot." See [`Self::try_skip_arithmetic_parens`]
+            // for exactly what "can parse... as an arithmetic expansion"
+            // means mechanically (confirmed empirically against real bash
+            // 5.3 and dash, since POSIX's own prose doesn't spell out the
+            // byte-level rule) and for why falling back to an ordinary
+            // command substitution here is a real POSIX-mandated
+            // fallback, not a bash-only extension.
             Some('(') if self.peek2() == Some('(') => {
-                self.bump();
-                self.bump(); // consume "(("
+                self.bump(); // consume the outer, real '('
+                // Where a plain `$(...)` command substitution's body
+                // would start if this construct turns out not to be
+                // genuine arithmetic after all -- i.e. right after the
+                // single '(' `$(...)` itself always opens with. Kept
+                // separate from `body_start` below (which additionally
+                // assumes the *second* '(' is arithmetic-opening syntax,
+                // not body content) so falling back can resume scanning
+                // from exactly the right place without needing to guess
+                // or re-derive it afterward.
+                let fallback_body_start = self.pos;
+                self.bump(); // tentatively consume the second '(' as arithmetic-opening syntax
                 let body_start = self.pos;
-                self.skip_balanced_parens(2, BalanceContext::Arithmetic, dollar_pos)?;
-                let body_end = self.pos - 2;
-                Ok(WordSegment::ArithmeticExpansion(
-                    self.input[body_start..body_end].to_string(),
-                ))
+                match self.try_skip_arithmetic_parens(dollar_pos)? {
+                    Some(body_end) => Ok(WordSegment::ArithmeticExpansion(
+                        self.input[body_start..body_end].to_string(),
+                    )),
+                    None => {
+                        // Not genuine arithmetic -- POSIX's documented
+                        // fallback. Re-scan from `fallback_body_start`
+                        // (before the tentative "second open" was
+                        // consumed) as an ordinary command substitution;
+                        // that second '(' is now correctly re-processed
+                        // as the start of this command substitution's own
+                        // body (typically a nested subshell), exactly the
+                        // same way `Self::rest`'s `Some('(')` arm below
+                        // handles a plain `$(...)`.
+                        self.pos = fallback_body_start;
+                        self.skip_balanced_parens(
+                            1,
+                            BalanceContext::CommandSubstitution,
+                            dollar_pos,
+                        )?;
+                        let body_end = self.pos - 1;
+                        Ok(WordSegment::CommandSubstitution(CommandSubstitution {
+                            style: SubstitutionStyle::DollarParen,
+                            body: self.input[fallback_body_start..body_end].to_string(),
+                        }))
+                    }
+                }
             }
             Some('(') => {
                 self.bump(); // consume '('
@@ -791,6 +876,118 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Scans a candidate `$((...))` arithmetic-expansion body, called
+    /// with `self.pos` immediately after the two already-(tentatively)
+    /// consumed opening parens. Distinct from the general
+    /// [`Self::skip_balanced_parens`] (used for this exact same `depth =
+    /// 2` case too, but *without* this function's extra bookkeeping) —
+    /// this one additionally tracks whether the specific `)` that brings
+    /// the count to zero is itself immediately preceded (zero bytes
+    /// apart) by another bare, depth-decrementing `)`, which is exactly
+    /// what determines whether this is genuine arithmetic at all, per
+    /// POSIX 2.6.4's own documented ambiguity between `$((expr))` and
+    /// `$( (subshell) ... )` (see [`Self::scan_dollar`]'s own doc comment
+    /// for the exact POSIX text). Confirmed empirically against real bash
+    /// 5.3 and dash to be exactly this rule, not merely "depth reaches
+    /// zero somewhere" — worked examples:
+    ///
+    /// - `$((1+2))`: the loop reaches depth zero via two adjacent `)`s
+    ///   (`1+2` then `))`) — genuine arithmetic, confirmed against real
+    ///   bash (prints `3`).
+    /// - `$((echo hi))`: same shape (`echo hi` then `))`, still two
+    ///   adjacent closers) — also recognized as an arithmetic *attempt*
+    ///   (confirmed against real bash: `arithmetic syntax error in
+    ///   expression (error token is "hi")`, a semantic error from trying
+    ///   to evaluate non-numeric text, not a "this wasn't arithmetic at
+    ///   all" rejection — this function only decides the *syntactic*
+    ///   question of which construct this is, never whether the resulting
+    ///   text is valid arithmetic).
+    /// - `$(()ݠ)`: depth reaches zero via a *lone* `)` (preceded by `ݠ`,
+    ///   not another `)`) — not genuine arithmetic. Confirmed against
+    ///   real bash: falls back to command substitution, reporting a
+    ///   syntax error *inside* one (bash's own message literally shows
+    ///   the reconstructed fallback body, `` `()ݠ' ``).
+    /// - `$((1+2) )` (a space between the two closing parens): not
+    ///   adjacent, so not genuine arithmetic either — confirmed against
+    ///   real bash (`1+2: command not found`, i.e. it ran the nested
+    ///   `(1+2)` as an ordinary subshell attempting to execute the
+    ///   command named `1+2`).
+    ///
+    /// Returns `Ok(Some(body_end))` — a byte offset immediately before
+    /// the *first* of the two adjacent closing parens, always a valid
+    /// char boundary since both of those bytes are, by construction,
+    /// literal single-byte ASCII `)` characters — when the adjacency
+    /// holds. Returns `Ok(None)` when depth reaches zero some other way
+    /// (not arithmetic; the caller falls back to an ordinary command
+    /// substitution scan from one byte earlier — see [`Self::scan_dollar`]).
+    /// Returns `Err` only when depth never reaches zero at all (a genuine
+    /// unterminated `$((...`) — confirmed against real bash and dash that
+    /// this case is simply unterminated on both, with no fallback
+    /// attempted (and none would help: falling back to a depth-1 scan
+    /// from one byte earlier hits the exact same end-of-input, by the
+    /// same paren-counting arithmetic that makes the two scans always
+    /// agree on *where* they'd stop when they do stop at all).
+    fn try_skip_arithmetic_parens(&mut self, open_pos: usize) -> Result<Option<usize>, LexError> {
+        let mut depth: i32 = 2;
+        // Whether the immediately preceding loop iteration was a bare,
+        // depth-decrementing ')' with nothing else processed since —
+        // i.e. whether the *next* ')' this loop sees (if any) would be
+        // truly adjacent to it. Reset to `false` on every other kind of
+        // step (an open paren, an ordinary character, or an atomically-
+        // skipped quote/backquote/nested-dollar-construct), since any of
+        // those means real content sits between the two closers.
+        let mut prev_was_close = false;
+        loop {
+            if self.skip_nested_dollar_construct()? {
+                prev_was_close = false;
+                continue;
+            }
+            match self.peek() {
+                None => return Err(BalanceContext::Arithmetic.unterminated_error(open_pos)),
+                Some('\\') => {
+                    self.bump();
+                    if self.peek().is_none() {
+                        return Err(LexError::TrailingBackslash {
+                            pos: self.pos.saturating_sub(1),
+                        });
+                    }
+                    self.bump();
+                    prev_was_close = false;
+                }
+                Some('\'') => {
+                    self.skip_single_quoted_raw()?;
+                    prev_was_close = false;
+                }
+                Some('"') => {
+                    self.skip_double_quoted_raw()?;
+                    prev_was_close = false;
+                }
+                Some('`') => {
+                    self.skip_backquote_raw()?;
+                    prev_was_close = false;
+                }
+                Some('(') => {
+                    self.bump();
+                    depth += 1;
+                    prev_was_close = false;
+                }
+                Some(')') => {
+                    let adjacent = prev_was_close;
+                    self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(adjacent.then(|| self.pos - 2));
+                    }
+                    prev_was_close = true;
+                }
+                Some(_) => {
+                    self.bump();
+                    prev_was_close = false;
+                }
+            }
+        }
     }
 
     /// Finds the matching `}` for a `${`-opened parameter expansion.

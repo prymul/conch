@@ -256,16 +256,41 @@ fn expand_segment(
     match segment {
         WordSegment::Literal(text) => {
             // Literal source text: the lexer has already resolved word
-            // boundaries (and backslash-escapes) for it, so any
+            // boundaries (and ordinary backslash-escapes) for it, so any
             // whitespace still present here was necessarily escaped and
             // must never be re-split — but it's still eligible for
             // pathname expansion (`echo *.txt`).
-            out.push(Segment {
-                text: text.clone(),
-                glob_eligible: true,
-                split_eligible: false,
-                force_field_break_after: false,
-            });
+            //
+            // `in_double_quotes` matters here specifically:
+            // `conch_shell_lexer::Lexer::scan_word_until` (unquoted text)
+            // and `scan_double_quoted_style_until` (double-quoted text)
+            // are two *different* lexer functions that can each produce
+            // an *identical-looking* `WordSegment::Literal("\\X")` for
+            // completely different reasons — the former deliberately
+            // preserves `\X` verbatim for later glob-escape resolution
+            // (see [`push_literal_with_glob_escapes`]'s own docs), while
+            // the latter's `\X` (for an `X` outside its fixed `$ \` " \`
+            // <newline>` escape set) is just POSIX 2.2.3's ordinary
+            // "backslash has no special meaning here, keep both
+            // characters" fallback — never a deliberate escape-pair, and
+            // never glob-eligible at all regardless (quoted content never
+            // globs). Treating the latter as the former would silently
+            // strip a backslash a double-quoted assignment was supposed
+            // to keep verbatim (confirmed against real bash: `x="\*"`
+            // stores the literal two characters `\*`, not `*`) — so this
+            // resolution only ever runs for genuinely unquoted text; a
+            // quoted literal always takes the plain, unconditional-push
+            // path every other quoted segment here already uses.
+            if in_double_quotes {
+                out.push(Segment {
+                    text: text.clone(),
+                    glob_eligible: true,
+                    split_eligible: false,
+                    force_field_break_after: false,
+                });
+            } else {
+                push_literal_with_glob_escapes(text, out);
+            }
             Ok(())
         }
         WordSegment::SingleQuoted(text) => {
@@ -454,6 +479,79 @@ fn expand_segment(
 /// fields, the second empty) while an *unquoted* empty one instead
 /// vanishes entirely when `IFS` is non-empty (a completely different
 /// mechanism — [`push_unquoted_at_or_star_fields`]'s docs).
+/// Splits `text` (a [`WordSegment::Literal`]'s raw text) into one or more
+/// [`Segment`]s, resolving `conch_shell_lexer::Lexer::scan_word_until`'s
+/// own deliberately-preserved `\X` glob-escape pairs (`X` being one of
+/// `* ? [ ] - !` — see that function's own docs for why it defers exactly
+/// these six characters' quote removal rather than resolving them
+/// immediately the way every other escaped character is) by carving each
+/// escaped `X` out into its own `glob_eligible: false` [`Segment`] —
+/// exactly the same per-character quoted-vs-unquoted tagging this whole
+/// module already uses for genuinely quoted text (see the module's own
+/// docs) — while every run of ordinary (unescaped) text on either side
+/// stays one ordinary `glob_eligible: true` `Segment`. This is what makes
+/// an escaped metacharacter behave *exactly* like a quoted one from here
+/// on: `has_unquoted_meta`/[`build_glob_pattern`] never need their own
+/// separate escape-awareness at all, since by the time they run, the
+/// escape has already been resolved into the same "not glob-eligible"
+/// representation quoting already produces.
+///
+/// Deliberately scoped to *only* this one call site — an expansion's own
+/// result text (parameter/command/arithmetic substitution, or tilde
+/// expansion) is never scanned this way, matching confirmed-against-
+/// real-bash behavior that a backslash appearing *within an expanded
+/// value* has no escaping meaning at all for pathname expansion:
+/// `x='\*'; echo $x` prints the literal two characters `\*` verbatim —
+/// unglobbed (no real wildcard was ever present to trigger pathname
+/// expansion; `x`'s value is single-quoted, so the backslash reaches the
+/// variable's stored value completely unprocessed to begin with) but
+/// also *not* quote-removed, unlike a literal, unquoted `\*` directly in
+/// source text (which *does* get its backslash quote-removed even when
+/// nothing ends up matching — confirmed: `echo \*` with no file literally
+/// named `*` prints a bare `*`). POSIX quote removal is a source-text
+/// concept; a plain expansion result was never subject to it, so this
+/// function must never run on one.
+fn push_literal_with_glob_escapes(text: &str, out: &mut Vec<Segment>) {
+    let mut ordinary = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(escaped) = chars.next()
+        {
+            if !ordinary.is_empty() {
+                out.push(Segment {
+                    text: std::mem::take(&mut ordinary),
+                    glob_eligible: true,
+                    split_eligible: false,
+                    force_field_break_after: false,
+                });
+            }
+            out.push(Segment {
+                text: escaped.to_string(),
+                glob_eligible: false,
+                split_eligible: false,
+                force_field_break_after: false,
+            });
+        } else {
+            ordinary.push(c);
+        }
+    }
+    // The `out.is_empty()` half of this condition preserves the
+    // pre-existing invariant that a `WordSegment::Literal` always
+    // produces at least one `Segment`, even a genuinely empty one (the
+    // lexer never constructs an empty `Literal` itself, but nothing
+    // downstream should rely on that -- matching what a single
+    // unconditional push always did here before this function existed).
+    if !ordinary.is_empty() || out.is_empty() {
+        out.push(Segment {
+            text: ordinary,
+            glob_eligible: true,
+            split_eligible: false,
+            force_field_break_after: false,
+        });
+    }
+}
+
 fn push_positional_params_as_independent_fields(
     shell: &Shell,
     glob_eligible: bool,
@@ -699,6 +797,27 @@ fn evaluate_parameter_expansion(
             Ok(shell.positional_params.len().to_string())
         }
         ParameterOperator::Length => Ok(current.chars().count().to_string()),
+        // Known pre-existing gap (found while grounding a Phase 7 glob-
+        // escaping fix, not introduced by it — confirmed present on a
+        // build predating that fix too): `expand_word_single` collapses
+        // `word`'s own quoted-vs-unquoted `Segment` structure into a
+        // single flat `String` before this operator's caller
+        // (`expand_segment`'s `ComplexParameterExpansion` arm) wraps the
+        // result back up as one fresh, unconditionally `glob_eligible`
+        // segment — so a default value's own quoting (`${y:-'*'}`) *or*
+        // an escaped glob metacharacter within it (`${y:-\*}`) both lose
+        // their protection against pathname expansion entirely once
+        // substituted in unquoted, even though the exact same quoting/
+        // escaping is correctly honored everywhere else in this module.
+        // Confirmed against real bash: `unset y; echo ${y:-'*'}` prints a
+        // literal `*`, never globbing — conch instead globs the current
+        // directory. Fixing this properly needs `word`'s own segment
+        // structure (not just its flattened text) to survive into the
+        // outer word's own segment list, which changes this whole
+        // operator's (and `AssignDefault`'s, `UseAlternative`'s) return
+        // shape — a real design question, not a mechanical fix, so
+        // left as a documented, separate known gap rather than
+        // attempted here.
         ParameterOperator::UseDefault { null_mode, word } => {
             if effectively_empty(*null_mode) {
                 expand_word_single(word, shell)
@@ -1088,6 +1207,47 @@ fn run_command_substitution(body: &str, shell: &Shell) -> Result<String, ExpandE
 /// empty) — implemented here by treating ' '/'\t'/'\n' as the
 /// whitespace class and everything else in `ifs` as the delimiter class,
 /// matching POSIX's own default-vs-custom-IFS distinction.
+///
+/// # Mixed whitespace-and-delimiter runs
+///
+/// The interaction between the two classes is more than "handle each
+/// independently": confirmed against real bash across many `IFS`-mixing
+/// shapes (see this function's own test module for the full matrix),
+/// **a non-whitespace `IFS` delimiter always delimits a field on its
+/// own, unconditionally, every single time it occurs** — even directly
+/// adjacent to another one (`IFS=","; "a,,b"` is 3 fields, `a`/``/`b`)
+/// and even at the very start of the input (`IFS=","; ",a"` is 2 fields,
+/// ``/`a`) — while **`IFS` whitespace only delimits a field if there was
+/// already real content pending, and even then only once it's followed
+/// by something other than more whitespace or an immediately-following
+/// delimiter** (a delimiter's own unconditional delimiting already
+/// covers that case, so whitespace must not *also* independently delimit
+/// right before it, or the boundary gets double-counted into a spurious
+/// extra empty field): `IFS=" ,"; "a ,,b"` is 3 fields (`a`/``/`b`, the
+/// leading space merges into the first comma's own delimiting, only the
+/// second comma produces the empty field), not 4 — this was exactly the
+/// double-counting bug this comment's presence is here to prevent from
+/// being reintroduced. A trailing delimiter, by contrast with a leading
+/// one, does *not* leave a trailing empty field once nothing follows it
+/// at all (`IFS=","; "a,"` is 1 field, `a`, not 2) — POSIX 2.6.5's own
+/// field-splitting algorithm describes this as: a field is delimited by
+/// reaching the end of input only if the pending candidate is non-empty,
+/// whereas a mid-stream non-whitespace delimiter delimits unconditionally
+/// regardless of emptiness.
+///
+/// Implemented via one extra piece of state, `pending_ws_break`: IFS
+/// whitespace seen while real content is already pending sets it rather
+/// than delimiting immediately, deferring the actual decision until
+/// either more real content arrives (delimit then, right before
+/// attaching the new content — whether that's an ordinary character
+/// within the same split-eligible segment, or an entirely different,
+/// possibly non-split-eligible, following segment: confirmed against
+/// real bash that this must persist *across* a segment boundary too,
+/// e.g. `IFS=" "; x="a b "; for f in ${x}literal; do ...; done` is 3
+/// fields `a`/`b`/`literal`, not `a`/`bliteral`) or a non-whitespace
+/// delimiter fires its own unconditional delimit (which already
+/// resolves the deferred whitespace break as a side effect, since both
+/// would have produced the same single boundary).
 fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
     // No early `ifs.is_empty()` shortcut here (an earlier version of this
     // function had one, unconditionally returning every segment combined
@@ -1109,9 +1269,15 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
     let mut fields: Vec<Vec<Segment>> = Vec::new();
     let mut current: Vec<Segment> = Vec::new();
     let mut current_has_content = false;
+    // See this function's own "Mixed whitespace-and-delimiter runs" docs.
+    let mut pending_ws_break = false;
 
     for segment in segments {
         if !segment.split_eligible {
+            if pending_ws_break {
+                fields.push(std::mem::take(&mut current));
+                pending_ws_break = false;
+            }
             let force_break = segment.force_field_break_after;
             current.push(segment);
             current_has_content = true;
@@ -1135,9 +1301,11 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
                     });
                     current_has_content = true;
                 }
+                // Defer: don't delimit yet, since an immediately-following
+                // delimiter must not *also* independently delimit here —
+                // see the "Mixed whitespace-and-delimiter runs" docs above.
                 if current_has_content {
-                    fields.push(std::mem::take(&mut current));
-                    current_has_content = false;
+                    pending_ws_break = true;
                 }
             } else if is_ifs_delim(c) {
                 if !piece.is_empty() {
@@ -1148,9 +1316,19 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
                         force_field_break_after: false,
                     });
                 }
+                // Unconditional -- a non-whitespace delimiter always
+                // delimits, even producing an empty field, and even if a
+                // deferred whitespace break was already pending (which
+                // this single delimit already fully resolves).
                 fields.push(std::mem::take(&mut current));
                 current_has_content = false;
+                pending_ws_break = false;
             } else {
+                if pending_ws_break {
+                    fields.push(std::mem::take(&mut current));
+                    current_has_content = false;
+                    pending_ws_break = false;
+                }
                 piece.push(c);
             }
         }
@@ -1174,8 +1352,14 @@ fn split_fields(segments: Vec<Segment>, ifs: &str) -> Vec<Vec<Segment>> {
         if segment.force_field_break_after && current_has_content {
             fields.push(std::mem::take(&mut current));
             current_has_content = false;
+            pending_ws_break = false;
         }
     }
+    // A dangling `pending_ws_break` needs no special handling here: it
+    // only ever affects whether *later* real content starts a fresh
+    // field, and there is none left by definition once the loop above
+    // ends -- trailing `IFS` whitespace (deferred or not) is simply
+    // dropped, matching POSIX 2.6.5 and real bash alike.
     if current_has_content {
         fields.push(current);
     }
@@ -1204,6 +1388,14 @@ fn glob_field(field: Vec<Segment>, cwd: &Path, noglob: bool) -> Result<Vec<Strin
     // the kind of round-trip that's easy to get subtly wrong (a literal
     // backslash in the text would need escaping-then-unescaping too, not
     // just the glob metacharacters).
+    //
+    // Confirmed against real bash: it's specifically only this module's
+    // own escape-splitting at segment-construction time
+    // ([`push_literal_with_glob_escapes`]) that already keeps a
+    // backslash-escaped glob metacharacter out of `has_unquoted_meta`'s
+    // count here — an escaped character was carved into its own
+    // `glob_eligible: false` `Segment` before this function ever runs,
+    // so this check never needs its own escape-awareness at all.
     if !has_unquoted_meta {
         return Ok(vec![field.into_iter().map(|s| s.text).collect()]);
     }
@@ -1225,20 +1417,45 @@ fn glob_field(field: Vec<Segment>, cwd: &Path, noglob: bool) -> Result<Vec<Strin
     Ok(matches)
 }
 
-/// Builds a POSIX 2.13 pattern string from `segments`, escaping any glob
-/// metacharacter (and literal backslash) that came from a
-/// non-glob-eligible (i.e. quoted) segment so it matches itself rather
-/// than acting as a wildcard. Shared by pathname expansion ([`glob_field`])
-/// and parameter-expansion pattern operands ([`expand_word_as_pattern`]),
-/// which both need the same quoted-vs-unquoted distinction for pattern
-/// metacharacters.
+/// Builds a POSIX 2.13 pattern string from `segments`, escaping any
+/// bracket-expression-relevant character (`*`, `?`, `[`, `]`, `-`, `!`,
+/// and a literal backslash) that came from a non-glob-eligible (i.e.
+/// quoted, or backslash-escaped per [`push_literal_with_glob_escapes`])
+/// segment, so it matches itself rather than acting as a wildcard or
+/// bracket-expression operator. Shared by pathname expansion
+/// ([`glob_field`]) and parameter-expansion pattern operands
+/// ([`expand_word_as_pattern`]), which both need the same
+/// quoted-vs-unquoted distinction for pattern metacharacters.
+///
+/// Escaping `]`/`-`/`!` here (not just `*`/`?`/`[`) is what makes a
+/// quoted or backslash-escaped bracket-special character inside an
+/// otherwise-unquoted `[...]` actually take effect once
+/// [`match_bracket`] interprets the resulting pattern — confirmed
+/// against real bash that this matters even for a *quoted* character
+/// with no backslash involved at all: `echo [C"-"D]*` (files `C`, `-`,
+/// `D`, `A` present) matches `- C D`, not the range `C`-`D`, the exact
+/// same outcome as the backslash-escaped `[C\-D]*` — both are just
+/// different spellings of "this character is not glob-pattern syntax
+/// here," and this function is what gives both spellings the identical
+/// treatment.
+///
+/// Deliberately scoped to *only* non-`glob_eligible` segments for
+/// `]`/`-`/`!` specifically (unlike `*`/`?`/`[`/`\`, which are always
+/// checked regardless of `glob_eligible` — see the loop body below): a
+/// **glob-eligible** `-`/`]`/`!` must stay unescaped, since that's
+/// exactly what an ordinary, unquoted `[a-z]` range or `[!abc]`
+/// negation's own operators look like — escaping them unconditionally
+/// here would silently break every ordinary bracket expression instead
+/// of only protecting the deliberately-literal ones.
 fn build_glob_pattern(segments: &[Segment]) -> String {
     let mut pattern = String::new();
     for segment in segments {
         for c in segment.text.chars() {
             if segment.glob_eligible && matches!(c, '*' | '?' | '[') {
                 pattern.push(c);
-            } else if matches!(c, '*' | '?' | '[' | '\\') {
+            } else if matches!(c, '*' | '?' | '[' | '\\')
+                || (!segment.glob_eligible && matches!(c, ']' | '-' | '!'))
+            {
                 pattern.push('\\');
                 pattern.push(c);
             } else {
@@ -1304,8 +1521,48 @@ fn glob_match_at(pat: &[char], pi: usize, text: &[char], ti: usize) -> bool {
 /// (which must be `[`) against `c`. Returns the pattern index just past
 /// the closing `]` if `c` is present (and matched, accounting for `!`
 /// negation), `None` otherwise.
+///
+/// # Backslash escaping inside the bracket expression
+///
+/// A `\` immediately before any character makes that character a
+/// literal member of the set -- never a range endpoint's special
+/// meaning, never the bracket's own closing `]`, and (only at the very
+/// start) never the `!` negation marker either. Confirmed against real
+/// bash 5.3 (with files literally named `C`, `-`, `D`, `A` on disk, `A`
+/// deliberately *not* matched by any of these):
+///
+/// - `[C\-D]*` matches `C`, `-`, and `D` -- the escaped `-` is a literal
+///   hyphen member, not a range operator, so this is the 3-member set
+///   `{C, -, D}`, not the (nonsensical, since `D` < `C` in ASCII) range
+///   `C`-`D`.
+/// - `[\!a]*` matches `!` and `a` literally -- an escaped `!` at the
+///   start is *not* the negation marker (contrast the unescaped `[!a]*`,
+///   which matches everything *except* `a`).
+/// - `[a\]b]*` matches `a`, `]`, and `b` -- an escaped `]` is a literal
+///   member, not the expression's terminator (the *next*, unescaped `]`
+///   still closes it).
+/// - `[\a-c]*` and `[a-\c]*` both still form the ordinary range `a`-`c`
+///   (matching `a`, `b`, `c`) -- escaping a range endpoint doesn't
+///   suppress range-forming when the escaped character has no special
+///   meaning at that position anyway; the escape only matters for
+///   characters that otherwise *would* be interpreted specially there
+///   (`-`, `]`, a leading `!`).
+///
+/// This bracket-local escaping is a bash behavior confirmed directly
+/// against real bash as shown above, layered on top of this whole glob
+/// engine's existing top-level backslash handling ([`glob_match_at`]'s
+/// own `'\\'` arm) -- POSIX 2.13.1's bracket-expression grammar itself
+/// doesn't define backslash specially, but real shells' actual pattern
+/// matchers do, and getting this wrong silently drops matches for any
+/// filename containing one of a bracket expression's own special
+/// characters (`-`, `]`, a leading `!`) used *literally* — exactly the
+/// kind of "almost-right" glob bug this module's whole `glob_match_at`
+/// engine exists to avoid elsewhere.
 fn match_bracket(pat: &[char], pi: usize, c: Option<char>) -> Option<usize> {
     let mut i = pi + 1;
+    // An escaped `!` (`\!`) is a literal member, not negation -- checked
+    // against the *raw* character here (not [`bracket_member`]) since an
+    // escape at this exact position changes which branch even applies.
     let negate = pat.get(i) == Some(&'!');
     if negate {
         i += 1;
@@ -1313,19 +1570,35 @@ fn match_bracket(pat: &[char], pi: usize, c: Option<char>) -> Option<usize> {
     let start = i;
     let mut matched = false;
     while i < pat.len() && (pat[i] != ']' || i == start) {
-        if i + 2 < pat.len() && pat[i + 1] == '-' && pat[i + 2] != ']' {
+        let Some((member, consumed)) = bracket_member(pat, i) else {
+            break; // trailing lone backslash with nothing left to escape
+        };
+        // A range (`x-y`) needs an unescaped `-` right after this
+        // member, itself followed by another member that isn't the
+        // closing `]` -- checking the *raw* character at `i + consumed`
+        // (rather than going through `bracket_member` for the dash
+        // itself) is exactly what makes an *escaped* hyphen (`\-`) never
+        // register as a range operator: escaping a raw `-` always makes
+        // `pat[i + consumed]` a `\`, not a `-`, so this check simply
+        // never fires for it, and it falls through to the plain-member
+        // branch below instead (see this function's own doc comment for
+        // the worked `[C\-D]` example this produces).
+        if pat.get(i + consumed) == Some(&'-')
+            && pat.get(i + consumed + 1) != Some(&']')
+            && let Some((end_member, end_consumed)) = bracket_member(pat, i + consumed + 1)
+        {
             if let Some(c) = c
-                && pat[i] <= c
-                && c <= pat[i + 2]
+                && member <= c
+                && c <= end_member
             {
                 matched = true;
             }
-            i += 3;
+            i += consumed + 1 + end_consumed;
         } else {
-            if Some(pat[i]) == c {
+            if Some(member) == c {
                 matched = true;
             }
-            i += 1;
+            i += consumed;
         }
     }
     if i >= pat.len() {
@@ -1334,6 +1607,20 @@ fn match_bracket(pat: &[char], pi: usize, c: Option<char>) -> Option<usize> {
     let close = i + 1; // past the ']'
     let is_match = c.is_some() && (matched != negate);
     is_match.then_some(close)
+}
+
+/// Reads one bracket-expression member starting at `pat[j]`, honoring a
+/// leading backslash escape (see [`match_bracket`]'s own docs for why).
+/// Returns the literal character this position represents and how many
+/// raw pattern positions it consumed (1 normally, 2 for `\x`) -- callers
+/// use the latter to keep advancing correctly regardless of whether this
+/// particular member turned out to be escaped. Returns `None` only for a
+/// trailing lone backslash with no following character at all.
+fn bracket_member(pat: &[char], j: usize) -> Option<(char, usize)> {
+    match pat.get(j)? {
+        '\\' if j + 1 < pat.len() => Some((pat[j + 1], 2)),
+        &ch => Some((ch, 1)),
+    }
 }
 
 /// Removes the smallest (`greedy = false`, `${parameter#pattern}`) or
@@ -1458,6 +1745,126 @@ mod tests {
         assert_eq!(fields("$X", &mut shell), vec!["a", "", "b"]);
     }
 
+    // ---- mixed IFS whitespace + non-whitespace delimiter (regression) ----
+    //
+    // See `split_fields`'s own "Mixed whitespace-and-delimiter runs" docs
+    // for the full rule and reasoning -- every case here was confirmed
+    // directly against real bash before being pinned.
+
+    #[test]
+    fn leading_ifs_whitespace_before_a_lone_delimiter_produces_no_extra_field() {
+        // The original bug repro: a delimiter run that *starts* with IFS
+        // whitespace before its one non-whitespace character must not be
+        // double-counted into a spurious extra empty field. Confirmed
+        // against real bash: `IFS=" ,"; x="a ,,b"; for f in $x; ...` is
+        // `a`, ``, `b` (3 fields), not `a`, ``, ``, `b` (4).
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), " ,".into());
+        shell.env_vars.insert("X".into(), "a ,,b".into());
+        assert_eq!(fields("$X", &mut shell), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn ifs_whitespace_before_a_single_delimiter_merges_with_no_empty_field() {
+        // A run with only *one* non-whitespace IFS character -- however
+        // much whitespace precedes it -- is exactly one plain separator,
+        // matching an ordinary single delimiter with no adjacent
+        // whitespace at all. Confirmed against real bash: `IFS=" ,";
+        // x="a  ,b"; for f in $x; ...` is `a`, `b` (2 fields, no empty).
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), " ,".into());
+        shell.env_vars.insert("X".into(), "a  ,b".into());
+        assert_eq!(fields("$X", &mut shell), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn delimiter_then_ifs_whitespace_then_another_delimiter_still_produces_one_empty_field() {
+        // The same 2-non-whitespace-character run as the first test
+        // above, just reordered (delimiter first, then whitespace, then
+        // the second delimiter) -- must produce the identical result.
+        // Confirmed against real bash: `IFS=" ,"; x="a, ,b"; for f in
+        // $x; ...` is `a`, ``, `b`.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), " ,".into());
+        shell.env_vars.insert("X".into(), "a, ,b".into());
+        assert_eq!(fields("$X", &mut shell), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn trailing_delimiter_produces_no_trailing_empty_field() {
+        // Unlike a *leading* delimiter (which does produce a leading
+        // empty field -- see the test below), a delimiter at the very
+        // end of the input does not. Confirmed against real bash:
+        // `IFS=","; x="a,"; for f in $x; ...` is just `a`.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), ",".into());
+        shell.env_vars.insert("X".into(), "a,".into());
+        assert_eq!(fields("$X", &mut shell), vec!["a"]);
+    }
+
+    #[test]
+    fn leading_delimiter_produces_a_leading_empty_field() {
+        // Confirmed against real bash: `IFS=","; x=",a"; for f in $x;
+        // ...` is ``, `a` -- a leading delimiter behaves differently
+        // from leading IFS *whitespace* (which is fully ignored, no
+        // empty field at all -- see
+        // `ifs_whitespace_before_a_single_delimiter_merges_with_no_empty_field`'s
+        // sibling coverage of the analogous pure-whitespace case
+        // elsewhere in this module).
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), ",".into());
+        shell.env_vars.insert("X".into(), ",a".into());
+        assert_eq!(fields("$X", &mut shell), vec!["", "a"]);
+    }
+
+    #[test]
+    fn lone_delimiter_input_produces_exactly_one_empty_field() {
+        // Confirmed against real bash: `IFS=","; x=","; for f in $x;
+        // ...` prints exactly one empty field, not zero.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("IFS".into(), ",".into());
+        shell.env_vars.insert("X".into(), ",".into());
+        assert_eq!(fields("$X", &mut shell), vec![""]);
+    }
+
+    #[test]
+    fn pure_ifs_whitespace_input_produces_zero_fields() {
+        // Contrast with the lone-delimiter case above: pure IFS
+        // whitespace (no non-whitespace delimiter at all) collapses to
+        // *zero* fields, matching ordinary default-IFS behavior.
+        // Confirmed against real bash: `IFS=" "; x="   "; set -- $x;
+        // echo $#` is `0`.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("X".into(), "   ".into());
+        assert_eq!(fields("$X", &mut shell), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pending_whitespace_break_persists_across_a_segment_boundary() {
+        // A deferred whitespace-break must still apply even when what
+        // follows is a *different* (non-split-eligible) segment glued
+        // onto the same word, not just more text within the same
+        // expansion. Confirmed against real bash: `IFS=" "; x="a b ";
+        // for f in ${x}literal; ...` is `a`, `b`, `literal` (3 fields) --
+        // the trailing space in `$x` still ends the `b` field before
+        // `literal` attaches, rather than merging into `bliteral`.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("X".into(), "a b ".into());
+        assert_eq!(fields("${X}literal", &mut shell), vec!["a", "b", "literal"]);
+    }
+
+    #[test]
+    fn no_pending_whitespace_break_still_merges_across_a_segment_boundary() {
+        // Sibling of the test above with no trailing whitespace in the
+        // expansion at all -- confirms no *spurious* break is introduced
+        // merely by crossing a segment boundary. Confirmed against real
+        // bash: `IFS=" "; x="a b"; for f in ${x}literal; ...` is `a`,
+        // `bliteral` (2 fields).
+        let mut shell = Shell::new();
+        shell.env_vars.insert("X".into(), "a b".into());
+        assert_eq!(fields("${X}literal", &mut shell), vec!["a", "bliteral"]);
+    }
+
     #[test]
     fn quoted_glob_metacharacter_is_literal() {
         let mut shell = Shell::new();
@@ -1524,6 +1931,97 @@ mod tests {
         let mut result = fields("a[0-9]", &mut shell);
         result.sort();
         assert_eq!(result, vec!["a1", "a2"]);
+    }
+
+    // ---- backslash-escaped bracket-expression/glob characters (regression) --
+    //
+    // Every case here was confirmed directly against real bash before
+    // being pinned -- see `push_literal_with_glob_escapes`,
+    // `build_glob_pattern`, and `match_bracket`'s own doc comments for
+    // the full grounding and reasoning.
+
+    #[test]
+    fn escaped_hyphen_in_bracket_expression_is_a_literal_member_not_a_range() {
+        // The original reported bug: `[C\-D]` must match the literal set
+        // `{C, -, D}`, not the (nonsensical, since D < C) range C-D.
+        // Confirmed against real bash: `echo [C\-D]*` with files `C`,
+        // `-`, `D`, `A` present matches `- C D`.
+        let dir = tempfile_dir();
+        for name in ["A", "C", "-", "D"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        let mut result = fields(r"[C\-D]*", &mut shell);
+        result.sort();
+        assert_eq!(result, vec!["-", "C", "D"]);
+    }
+
+    #[test]
+    fn quoted_hyphen_in_bracket_expression_is_also_a_literal_member() {
+        // Same underlying fix, reached via quoting instead of a
+        // backslash -- confirmed against real bash: `echo [C"-"D]*`
+        // matches the identical `- C D` set.
+        let dir = tempfile_dir();
+        for name in ["A", "C", "-", "D"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        let mut result = fields(r#"[C"-"D]*"#, &mut shell);
+        result.sort();
+        assert_eq!(result, vec!["-", "C", "D"]);
+    }
+
+    #[test]
+    fn ordinary_unescaped_range_inside_brackets_still_works() {
+        // Regression guard for `build_glob_pattern`'s own fix: escaping
+        // `]`/`-`/`!` only for *non*-glob-eligible (quoted/escaped)
+        // segments must never affect an ordinary, unquoted `[a-z]`-style
+        // range's own `-` operator.
+        let dir = tempfile_dir();
+        for name in ["a1", "a2", "ax"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        let mut result = fields("a[0-9]", &mut shell);
+        result.sort();
+        assert_eq!(result, vec!["a1", "a2"]);
+    }
+
+    #[test]
+    fn escaped_asterisk_never_triggers_pathname_expansion() {
+        // The deeper, previously-undiscovered bug found while grounding
+        // the bracket fix: an escaped top-level glob metacharacter must
+        // never act as a wildcard at all. Confirmed against real bash:
+        // `echo \*` prints a literal `*`, even in a directory containing
+        // other files that an unescaped `*` would otherwise match.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("somefile"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        assert_eq!(fields(r"\*", &mut shell), vec!["*"]);
+    }
+
+    #[test]
+    fn escaped_glob_metacharacter_in_an_assignment_value_is_resolved() {
+        // Confirmed against real bash: `x=\*; echo "$x"` sets `x` to the
+        // literal single character `*` (quote removal still applies even
+        // though pathname expansion never ran for this word at all).
+        let mut shell = Shell::new();
+        assert_eq!(single(r"\*", &mut shell), "*");
+    }
+
+    #[test]
+    fn escaped_glob_metacharacter_inside_double_quotes_is_never_an_escape() {
+        // A backslash before a non-`$ \` " \`-class character has *no*
+        // special meaning inside double quotes (POSIX 2.2.3) -- both
+        // characters must survive completely unprocessed, the opposite
+        // of the unquoted case just above. Confirmed against real bash:
+        // `x="\*"; echo "$x"` prints the literal two characters `\*`.
+        let mut shell = Shell::new();
+        assert_eq!(single(r#""\*""#, &mut shell), r"\*");
     }
 
     fn tempfile_dir() -> tempfile::TempDir {

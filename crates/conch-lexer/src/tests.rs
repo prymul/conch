@@ -518,6 +518,92 @@ fn nested_parens_in_arithmetic_expansion_are_depth_balanced() {
     );
 }
 
+// ---- $((...)) arithmetic-vs-command-substitution ambiguity (POSIX 2.6.4) --
+
+#[test]
+fn malformed_double_paren_with_multibyte_char_falls_back_to_command_substitution_instead_of_panicking()
+ {
+    // Regression test for a fuzzer-found panic: `$pos - 2` (assuming the
+    // two closing parens are always the last two adjacent bytes) used to
+    // slice mid-character here, since the depth-2 counter reaches zero
+    // via a *lone* ')' (preceded by a 2-byte char, not another ')'), not
+    // a genuinely adjacent pair. Confirmed against real bash 5.3 and
+    // dash: this isn't arithmetic at all -- POSIX 2.6.4's own documented
+    // fallback applies, and the reconstructed command-substitution body
+    // bash itself reports in its own syntax-error message (`()ݠ`) matches
+    // exactly.
+    assert_eq!(
+        only_word_segments("$(()ݠ)"),
+        vec![WordSegment::CommandSubstitution(CommandSubstitution {
+            style: SubstitutionStyle::DollarParen,
+            body: "()ݠ".into(),
+        })]
+    );
+}
+
+#[test]
+fn non_adjacent_closing_parens_fall_back_to_command_substitution() {
+    // Same underlying rule as the multibyte case above, with an ordinary
+    // ASCII gap instead of a multibyte one -- confirmed against real bash
+    // 5.3 (`1+2: command not found`, i.e. it ran `(1+2)` as an ordinary
+    // subshell attempting the command named `1+2`) and dash (`Syntax
+    // error: Missing '))'`, since dash doesn't implement POSIX's
+    // documented fallback at all -- see this project's
+    // `tests/conch-difftest/known-differences.md` for that separate,
+    // already-decided bash-vs-dash divergence; this test only pins
+    // conch's own (bash-matching) fallback body reconstruction).
+    assert_eq!(
+        only_word_segments("$((1+2) )"),
+        vec![WordSegment::CommandSubstitution(CommandSubstitution {
+            style: SubstitutionStyle::DollarParen,
+            body: "(1+2) ".into(),
+        })]
+    );
+}
+
+#[test]
+fn an_earlier_non_terminal_adjacent_close_pair_is_not_mistaken_for_the_terminating_one() {
+    // An earlier adjacent `))` pair from balanced nesting inside the body
+    // (closing the nested `(2*3)` here) must not be mistaken for *the*
+    // terminating pair the ambiguity rule cares about -- only whether the
+    // close that actually brings the running depth to zero is itself
+    // adjacent to another close matters. Here it isn't (it's preceded by
+    // `ᵄ`), so this still correctly falls back to command substitution.
+    // Confirmed against real bash: exactly this fallback (a "command
+    // substitution" syntax error, not an "arithmetic syntax error").
+    assert_eq!(
+        only_word_segments("$((1+(2*3))ᵄ)"),
+        vec![WordSegment::CommandSubstitution(CommandSubstitution {
+            style: SubstitutionStyle::DollarParen,
+            body: "(1+(2*3))ᵄ".into(),
+        })]
+    );
+}
+
+#[test]
+fn empty_arithmetic_body_is_still_recognized_via_the_adjacency_rule() {
+    // `$(())`'s two closing parens are trivially adjacent (nothing but
+    // each other) -- confirmed against real bash: `echo $(())` -> `0`.
+    assert_eq!(
+        only_word_segments("$(())"),
+        vec![WordSegment::ArithmeticExpansion(String::new())]
+    );
+}
+
+#[test]
+fn malformed_arithmetic_fallback_never_panics_on_a_multibyte_char_at_the_boundary() {
+    // Broader sweep beyond the single minimized repro above: a
+    // multibyte character sitting at various positions relative to the
+    // (non-adjacent) closing parens must never panic, regardless of
+    // exactly where it lands.
+    for input in ["$(()ݠ)", "$((ݠ))", "$((ݠ)ݠ)", "$((1ݠ)2)", "$((🎉)a)"] {
+        assert!(
+            lex(input).is_ok(),
+            "expected {input:?} to lex without panicking or erroring"
+        );
+    }
+}
+
 // ---- assignment-shaped words stay plain words at the lexer level ---------
 
 #[test]

@@ -47,6 +47,7 @@ use test_builtin::{Bracket, Test};
 /// kind (confirmed against real bash's own default, non-`--posix`,
 /// behavior).
 pub fn register_all(shell: &mut Shell) {
+    shell.register_special_builtin(":", Box::new(Colon));
     shell.register_builtin("cd", Box::new(Cd));
     shell.register_special_builtin("exit", Box::new(Exit));
     shell.register_special_builtin("export", Box::new(Export));
@@ -82,6 +83,38 @@ pub fn register_all(shell: &mut Shell) {
     shell.register_special_builtin("exec", Box::new(Exec));
     shell.register_builtin("alias", Box::new(Alias));
     shell.register_builtin("unalias", Box::new(Unalias));
+}
+
+/// `:` — POSIX 2.9.1's special-builtin no-op: does nothing and always
+/// exits `0`, ignoring every argument (including a nonexistent one).
+/// Confirmed against real bash: `:` itself, `: anything at all`, and
+/// `: "${x:=default}"` (arguably its single most common real-world use —
+/// setting a default when `x` is unset/null, entirely as a side effect of
+/// ordinary argument expansion, since `:` never looks at its expanded
+/// arguments at all) all succeed identically. Registered as a *special*
+/// builtin per POSIX 2.9.1's own list — this has no observable effect
+/// today (see [`Shell::special_builtins`]'s own docs on what that
+/// classification is and isn't used for), but matches this crate's
+/// existing classification of every other POSIX special builtin here
+/// (`break`, `exit`, `export`, ...) regardless.
+///
+/// Without this registered at all, `while :; do ...; done` — one of the
+/// single most common shell idioms for an infinite loop — fails outright
+/// with a `: No such file or directory` command-not-found error, since
+/// nothing recognizes `:` as a builtin (or, on most real systems, as an
+/// external command either).
+struct Colon;
+impl Builtin for Colon {
+    fn run(
+        &self,
+        _shell: &mut Shell,
+        _args: &[String],
+        _stdin: &mut dyn Read,
+        _stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> i32 {
+        0
+    }
 }
 
 struct Cd;
@@ -1532,10 +1565,10 @@ mod tests {
         let mut shell = Shell::new();
         register_all(&mut shell);
         for name in [
-            "cd", "exit", "export", "echo", "pwd", "break", "continue", "local", "return", "set",
-            "shift", "jobs", "fg", "bg", "wait", "trap", "unset", "umask", "type", "command",
-            "eval", ".", "source", "test", "[", "read", "getopts", "printf", "kill", "declare",
-            "typeset", "exec", "alias", "unalias", "readonly",
+            ":", "cd", "exit", "export", "echo", "pwd", "break", "continue", "local", "return",
+            "set", "shift", "jobs", "fg", "bg", "wait", "trap", "unset", "umask", "type",
+            "command", "eval", ".", "source", "test", "[", "read", "getopts", "printf", "kill",
+            "declare", "typeset", "exec", "alias", "unalias", "readonly",
         ] {
             assert!(shell.builtin(name).is_some(), "missing builtin: {name}");
         }
@@ -1546,8 +1579,8 @@ mod tests {
         let mut shell = Shell::new();
         register_all(&mut shell);
         for name in [
-            "break", "continue", "exit", "export", "return", "set", "shift", "unset", "eval", ".",
-            "exec", "readonly",
+            ":", "break", "continue", "exit", "export", "return", "set", "shift", "unset", "eval",
+            ".", "exec", "readonly",
         ] {
             assert!(
                 shell.is_special_builtin(name),
@@ -1581,6 +1614,26 @@ mod tests {
         run(&Export, &mut shell, &["FOO".to_string()]);
         assert_eq!(shell.get_var("FOO"), Some("bar"));
         assert!(!shell.shell_vars.contains_key("FOO"));
+    }
+
+    #[test]
+    fn colon_ignores_its_arguments_and_always_succeeds() {
+        let mut shell = Shell::new();
+        let (status, stdout, stderr) = run(
+            &Colon,
+            &mut shell,
+            &["anything".to_string(), "at".to_string(), "all".to_string()],
+        );
+        assert_eq!(status, 0);
+        assert_eq!(stdout, "");
+        assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn colon_succeeds_with_no_arguments_too() {
+        let mut shell = Shell::new();
+        let (status, _, _) = run(&Colon, &mut shell, &[]);
+        assert_eq!(status, 0);
     }
 
     // ---- readonly ------------------------------------------------------------
