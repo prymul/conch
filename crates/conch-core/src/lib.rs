@@ -253,12 +253,24 @@ pub struct Shell {
     /// broader than what's implemented here. What *is* exempt, for free,
     /// by this checkpoint's own placement: a pipeline stage other than
     /// the last (only the last stage's status ever reaches this check at
-    /// all — matching bash's *default*, non-`pipefail` behavior), and
-    /// any command that's part of an `&&`/`||` chain other than the
-    /// chain's own final, fully-resolved result (`exec_and_or` only ever
-    /// returns *after* short-circuit evaluation finishes, so an
-    /// internal failure never reaches this checkpoint as its own
-    /// separate item). What needs the explicit
+    /// all — matching bash's *default*, non-`pipefail` behavior).
+    ///
+    /// An `&&`/`||` chain's own exemption ("...except the command
+    /// following the final `&&` or `||`" — POSIX 2.14 / bash manual
+    /// §4.3.1) is *not* free the same way: `exec_and_or` only ever
+    /// returns one final `i32` status after short-circuit evaluation
+    /// finishes, with nothing to distinguish "this came from the chain's
+    /// actual last command" from "this came from an earlier one that
+    /// short-circuited the rest" — a real, previously undocumented gap
+    /// found and confirmed directly against real bash/dash (`set -e;
+    /// false && echo hi` doesn't abort them, since `false` isn't the
+    /// chain's last command, but it *did* abort conch before this was
+    /// fixed) — see `exec_and_or`'s own docs (`conch-shell-core::exec`)
+    /// for the exact rule (including the `false && true || false`
+    /// still-aborts case) and how the eligibility bit is now threaded
+    /// through this checkpoint to fix it correctly.
+    ///
+    /// What needs the explicit
     /// `Self::errexit_suppressed` guard instead: a command whose status
     /// is being tested by `if`/`while`/`until` — without it, `set -e; if
     /// grep -q foo file; then ...; fi` would exit the whole shell the

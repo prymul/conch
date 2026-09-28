@@ -105,7 +105,8 @@ fn expand_words_fields<'a>(
 pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
     let mut status = shell.last_status;
     for item in &list.items {
-        status = exec_command_list_item(item, shell);
+        let (item_status, errexit_eligible) = exec_command_list_item(item, shell);
+        status = item_status;
         shell.last_status = status;
         // `set -e` (errexit) — see `Shell::errexit`'s own docs for
         // exactly what this checkpoint's placement does and doesn't
@@ -115,8 +116,18 @@ pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
         // being propagated, and letting *this* additionally trigger a
         // hard process exit on the same statement would race the two
         // rather than cleanly deferring to whichever the caller
-        // actually needs to see first.
-        if shell.errexit && status != 0 && shell.errexit_suppressed == 0 && !unwinding(shell) {
+        // actually needs to see first. Also skipped when
+        // `!errexit_eligible` — an `&&`/`||` chain's own final resolved
+        // status that came from a non-last member (short-circuiting the
+        // rest) is POSIX-exempt even though it's still what `$?` reports
+        // for the whole statement; see [`exec_and_or`]'s own docs for
+        // the exact rule and empirical grounding.
+        if shell.errexit
+            && status != 0
+            && errexit_eligible
+            && shell.errexit_suppressed == 0
+            && !unwinding(shell)
+        {
             shell.run_exit_trap();
             std::process::exit(status);
         }
@@ -158,9 +169,16 @@ pub fn exec_command_list(list: &CommandList, shell: &mut Shell) -> i32 {
 /// item backgrounds the *entire* `and_or` chain (see [`exec_async`] and
 /// [`Separator::Async`]'s own docs for why the whole chain, not just its
 /// first pipeline); every other item just runs synchronously as before.
-fn exec_command_list_item(item: &CommandListItem, shell: &mut Shell) -> i32 {
+///
+/// Returns the item's exit status plus whether that status is eligible
+/// to trigger `errexit` — see [`exec_and_or`]'s own docs for the real
+/// rule this threads through. An async item's status is always `0`
+/// (POSIX; see [`exec_async`]'s own docs), so its eligibility bit is
+/// unobservable either way — `true` here is an arbitrary but harmless
+/// placeholder, never one that could actually cause a spurious exit.
+fn exec_command_list_item(item: &CommandListItem, shell: &mut Shell) -> (i32, bool) {
     match &item.separator {
-        Separator::Async(source) => exec_async(&item.and_or, source, shell),
+        Separator::Async(source) => (exec_async(&item.and_or, source, shell), true),
         Separator::Sequential | Separator::None => exec_and_or(&item.and_or, shell),
     }
 }
@@ -237,24 +255,69 @@ fn unwinding(shell: &Shell) -> bool {
     shell.pending_control_flow.is_some() || shell.foreground_interrupt.is_some()
 }
 
-fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> i32 {
+/// Runs a full `&&`/`||`-joined pipeline chain, returning its final exit
+/// status plus whether that status is *eligible* to trigger `errexit`
+/// (POSIX 2.14 / bash manual §4.3.1's "...except the command following
+/// the final `&&` or `||`" exemption — see [`Shell::errexit`]'s own docs
+/// for the full rule this implements).
+///
+/// The exemption is broader than "an intermediate command's own failure
+/// is never separately visible to the errexit checkpoint" (trivially
+/// true by construction — only this function's own final, fully-resolved
+/// status ever reaches [`exec_command_list`]'s checkpoint at all): it
+/// also covers the *chain's own final resolved status*, whenever that
+/// status came from a member other than the chain's syntactically last
+/// one — i.e. an earlier command's failure short-circuited the rest, so
+/// the last member never even ran. Confirmed directly against real bash
+/// and dash: `set -e; false && echo hi` does **not** abort (`false` is
+/// not the chain's last command — `echo` is, and it never got a chance
+/// to run — so `false`'s failure is exempt even though it's also the
+/// whole chain's own final result, since nothing after it ran to
+/// override it).
+///
+/// Eligibility tracks whether the chain's syntactically *last* member
+/// actually ran — not merely "no short-circuit happened anywhere in the
+/// chain": a middle member can be skipped while a later one still runs
+/// and updates the status, if its own operator's short-circuit condition
+/// happens to already be satisfied by whatever status was left over.
+/// Confirmed against real bash: `set -e; false && true || false` *does*
+/// abort — the middle `true` is skipped (the preceding `&&` needs a
+/// zero status, but `false` left it nonzero), yet the final `false` still
+/// runs (its own preceding `||` needs a *nonzero* status, which the
+/// skipped-over failure conveniently still provides) — and since it *is*
+/// the chain's actual last member and it failed, errexit correctly
+/// applies.
+fn exec_and_or(and_or: &AndOrList, shell: &mut Shell) -> (i32, bool) {
     let mut status = exec_pipeline(&and_or.first, shell);
+    // `first` is trivially the chain's own "last member" whenever there
+    // are no further `&&`/`||`-joined pipelines at all.
+    let mut last_member_ran = and_or.rest.is_empty();
     if unwinding(shell) {
-        return status;
+        return (status, last_member_ran);
     }
-    for (op, pipeline) in &and_or.rest {
+    let last_index = and_or.rest.len().saturating_sub(1);
+    for (index, (op, pipeline)) in and_or.rest.iter().enumerate() {
         let should_run = match op {
             LogicalOp::And => status == 0,
             LogicalOp::Or => status != 0,
         };
         if should_run {
             status = exec_pipeline(pipeline, shell);
+            last_member_ran = index == last_index;
             if unwinding(shell) {
-                return status;
+                return (status, last_member_ran);
             }
+        } else {
+            // Skipped by short-circuiting: whatever status is currently
+            // held over is *not* this (skipped) member's own last-ness,
+            // even if a later member goes on to re-satisfy its own
+            // operator and actually run (see this function's own docs'
+            // `false && true || false` example) -- that later run's own
+            // branch above will correctly overwrite this if so.
+            last_member_ran = false;
         }
     }
-    status
+    (status, last_member_ran)
 }
 
 /// Backgrounds an entire `and_or` list (`&`) — POSIX 2.9.3.1: run in "a
@@ -2442,6 +2505,76 @@ mod tests {
         let mut shell = Shell::new();
         shell.errexit = true;
         assert_eq!(run("while false; do :; done", &mut shell), 0);
+    }
+
+    #[test]
+    fn errexit_does_not_trigger_on_a_non_last_member_of_an_and_or_chain() {
+        // Confirmed against real bash/dash: `set -e; false && FOO=ran`
+        // does not abort -- `false` is not the chain's last member
+        // (`FOO=ran` is, and it never got a chance to run, confirmed by
+        // `FOO` staying unset below), so its failure is exempt even
+        // though it's also the whole chain's own final resolved status.
+        // Before this fix, conch called `std::process::exit(1)` right
+        // here, which would abort this entire test binary -- so this
+        // test's own survival (reaching either assertion at all) is part
+        // of what it's confirming, exactly like this module's other
+        // errexit tests.
+        let mut shell = Shell::new();
+        shell.errexit = true;
+        assert_eq!(run("false && FOO=ran", &mut shell), 1);
+        assert_eq!(shell.get_var("FOO"), None);
+        // And the script must keep running afterward, exactly like real
+        // bash/dash's `echo "reached-after-and"` in the equivalent
+        // differential-suite case -- not just "didn't crash on this one
+        // line".
+        assert_eq!(run("false && FOO=ran; BAR=reached", &mut shell), 0);
+        assert_eq!(shell.get_var("BAR"), Some("reached"));
+    }
+
+    #[test]
+    fn exec_and_or_eligibility_tracks_whether_the_syntactic_last_member_ran() {
+        // Direct unit tests of `exec_and_or`'s own (status, eligible)
+        // pair -- deliberately bypassing `shell.errexit`/`exec_command_list`
+        // entirely (no risk of an accidental `std::process::exit` no
+        // matter what this function returns) so every case from its own
+        // doc comment, including the "still aborts" ones that can't
+        // safely be exercised end-to-end in this same process, gets
+        // direct coverage.
+        let mut shell = Shell::new();
+
+        // Single pipeline, no chain at all: trivially "the last member".
+        assert_eq!(exec_and_or(&one_and_or("false"), &mut shell), (1, true));
+
+        // The failing member is *not* the chain's last one (it short-
+        // circuits the real last member, which never runs) -- exempt.
+        assert_eq!(
+            exec_and_or(&one_and_or("false && true"), &mut shell),
+            (1, false)
+        );
+        assert_eq!(
+            exec_and_or(&one_and_or("true || false"), &mut shell),
+            (0, false)
+        );
+
+        // The chain's actual last member runs and fails -- not exempt,
+        // confirmed against real bash even though a middle member was
+        // itself skipped along the way (see this function's own docs).
+        assert_eq!(
+            exec_and_or(&one_and_or("false || false"), &mut shell),
+            (1, true)
+        );
+        assert_eq!(
+            exec_and_or(&one_and_or("true && false"), &mut shell),
+            (1, true)
+        );
+        assert_eq!(
+            exec_and_or(&one_and_or("false && true || false"), &mut shell),
+            (1, true)
+        );
+        assert_eq!(
+            exec_and_or(&one_and_or("true && true && false"), &mut shell),
+            (1, true)
+        );
     }
 
     #[test]

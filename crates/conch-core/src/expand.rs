@@ -441,12 +441,32 @@ fn expand_segment(
             Ok(())
         }
         WordSegment::ComplexParameterExpansion(body) => {
-            out.push(Segment {
-                text: expand_complex_parameter_expansion(body, in_double_quotes, shell)?,
-                glob_eligible: true,
-                split_eligible: true,
-                force_field_break_after: false,
-            });
+            match expand_complex_parameter_expansion(body, in_double_quotes, shell)? {
+                ParameterExpansionResult::Flat(text) => {
+                    out.push(Segment {
+                        text,
+                        glob_eligible: true,
+                        split_eligible: true,
+                        force_field_break_after: false,
+                    });
+                }
+                // A triggered `${parameter:-word}`/`${parameter:=word}`/
+                // `${parameter:+word}`: splice `word`'s own already-
+                // correctly-tagged segments directly, rather than
+                // collapsing them into one flat, unconditionally
+                // glob+split-eligible segment the way the `Flat` arm
+                // above does for every other operator -- see
+                // `ParameterExpansionResult::Structured`'s own docs for
+                // why this distinction is observable (a quoted or
+                // backslash-escaped portion of the default value must
+                // keep its own protection against pathname
+                // expansion/IFS splitting once substituted in, exactly
+                // as if that same quoted/escaped text had been written
+                // directly at the position `${...}` occupies).
+                ParameterExpansionResult::Structured(segments) => {
+                    out.extend(segments);
+                }
+            }
             Ok(())
         }
         WordSegment::ArithmeticExpansion(body) => {
@@ -757,23 +777,52 @@ fn assign_parameter(
 }
 
 /// Decodes and evaluates a [`WordSegment::ComplexParameterExpansion`]'s
-/// raw body, producing the final substituted text.
+/// raw body, producing the operator's result.
 fn expand_complex_parameter_expansion(
     body: &str,
     in_double_quotes: bool,
     shell: &mut Shell,
-) -> Result<String, ExpandError> {
+) -> Result<ParameterExpansionResult, ExpandError> {
     let expansion = parse_parameter_expansion(body, in_double_quotes)
         .map_err(|err| ExpandError::ParameterExpansionSyntax(err.to_string()))?;
-    evaluate_parameter_expansion(&expansion, shell)
+    evaluate_parameter_expansion(&expansion, in_double_quotes, shell)
+}
+
+/// The result of evaluating a `${...}` operator (POSIX 2.6.2) against
+/// shell state — see [`evaluate_parameter_expansion`].
+enum ParameterExpansionResult {
+    /// Every operator except a *triggered*
+    /// `UseDefault`/`AssignDefault`/`UseAlternative`: a plain string,
+    /// exactly as split/glob-eligible as any other unquoted parameter-
+    /// expansion result once its caller ([`expand_segment`]'s
+    /// `ComplexParameterExpansion` arm) wraps it into a `Segment`.
+    Flat(String),
+    /// A *triggered* `${parameter:-word}`/`${parameter:=word}`/
+    /// `${parameter:+word}`: `word`'s own quoted-vs-unquoted `Segment`
+    /// structure, preserved rather than collapsed to a flat string —
+    /// see [`expand_word_preserving_structure`]'s own docs for exactly
+    /// how and why. Confirmed against real bash this is genuinely
+    /// observable, not merely a theoretical distinction: `unset y; echo
+    /// ${y:-'*'}` prints a literal `*` (never globbing, since `'*'` is
+    /// quoted), and `unset y; for f in ${y:-a b}; do ...; done` is *two*
+    /// fields (the literal space in the default *does* split, since it's
+    /// unquoted) — while `unset y; for f in ${y:-"$x"}; do ...; done`
+    /// (`x="a b"`) is *one* field (the `"$x"` portion stays protected).
+    /// Collapsing straight to a flat string before wrapping it in one
+    /// uniformly glob+split-eligible `Segment` (this module's original
+    /// implementation) gets every one of these wrong.
+    Structured(Vec<Segment>),
 }
 
 /// Evaluates an already-decoded [`ParameterExpansion`] against `shell`'s
-/// state (POSIX 2.6.2).
+/// state (POSIX 2.6.2). `in_double_quotes` is threaded through to
+/// [`expand_word_preserving_structure`] for the same reason
+/// [`expand_segment`] itself needs it — see that function's own docs.
 fn evaluate_parameter_expansion(
     expansion: &ParameterExpansion,
+    in_double_quotes: bool,
     shell: &mut Shell,
-) -> Result<String, ExpandError> {
+) -> Result<ParameterExpansionResult, ExpandError> {
     let current = expand_parameter(&expansion.parameter, shell);
     let is_set = is_parameter_set(&expansion.parameter, shell);
     // POSIX 2.6.2: the colon form triggers on unset *or* null; the
@@ -794,44 +843,40 @@ fn evaluate_parameter_expansion(
                 Parameter::Special(SpecialParameter::At | SpecialParameter::Star)
             ) =>
         {
-            Ok(shell.positional_params.len().to_string())
+            Ok(ParameterExpansionResult::Flat(
+                shell.positional_params.len().to_string(),
+            ))
         }
-        ParameterOperator::Length => Ok(current.chars().count().to_string()),
-        // Known pre-existing gap (found while grounding a Phase 7 glob-
-        // escaping fix, not introduced by it — confirmed present on a
-        // build predating that fix too): `expand_word_single` collapses
-        // `word`'s own quoted-vs-unquoted `Segment` structure into a
-        // single flat `String` before this operator's caller
-        // (`expand_segment`'s `ComplexParameterExpansion` arm) wraps the
-        // result back up as one fresh, unconditionally `glob_eligible`
-        // segment — so a default value's own quoting (`${y:-'*'}`) *or*
-        // an escaped glob metacharacter within it (`${y:-\*}`) both lose
-        // their protection against pathname expansion entirely once
-        // substituted in unquoted, even though the exact same quoting/
-        // escaping is correctly honored everywhere else in this module.
-        // Confirmed against real bash: `unset y; echo ${y:-'*'}` prints a
-        // literal `*`, never globbing — conch instead globs the current
-        // directory. Fixing this properly needs `word`'s own segment
-        // structure (not just its flattened text) to survive into the
-        // outer word's own segment list, which changes this whole
-        // operator's (and `AssignDefault`'s, `UseAlternative`'s) return
-        // shape — a real design question, not a mechanical fix, so
-        // left as a documented, separate known gap rather than
-        // attempted here.
+        ParameterOperator::Length => Ok(ParameterExpansionResult::Flat(
+            current.chars().count().to_string(),
+        )),
         ParameterOperator::UseDefault { null_mode, word } => {
             if effectively_empty(*null_mode) {
-                expand_word_single(word, shell)
+                Ok(ParameterExpansionResult::Structured(
+                    expand_word_preserving_structure(word, in_double_quotes, shell)?,
+                ))
             } else {
-                Ok(current)
+                Ok(ParameterExpansionResult::Flat(current))
             }
         }
         ParameterOperator::AssignDefault { null_mode, word } => {
             if effectively_empty(*null_mode) {
-                let value = expand_word_single(word, shell)?;
+                let segments = expand_word_preserving_structure(word, in_double_quotes, shell)?;
+                // The *assigned* value is always just a plain string —
+                // quote/escape protection only ever matters for how this
+                // expansion's *result* interacts with pathname
+                // expansion/IFS splitting at the position `${...}`
+                // occupies, never for what ends up stored in the
+                // variable itself. Built from the same already-expanded
+                // `segments` (not a second, separate `expand_word_single`
+                // call) specifically so `word` is only ever evaluated
+                // once — critical if it contains a command substitution,
+                // which must never run twice.
+                let value: String = segments.iter().map(|s| s.text.as_str()).collect();
                 assign_parameter(&expansion.parameter, &value, shell)?;
-                Ok(value)
+                Ok(ParameterExpansionResult::Structured(segments))
             } else {
-                Ok(current)
+                Ok(ParameterExpansionResult::Flat(current))
             }
         }
         ParameterOperator::ErrorIfUnsetOrNull { null_mode, word } => {
@@ -854,25 +899,107 @@ fn evaluate_parameter_expansion(
                     describe_parameter(&expansion.parameter)
                 )))
             } else {
-                Ok(current)
+                Ok(ParameterExpansionResult::Flat(current))
             }
         }
         ParameterOperator::UseAlternative { null_mode, word } => {
             if effectively_empty(*null_mode) {
-                Ok(String::new())
+                Ok(ParameterExpansionResult::Flat(String::new()))
             } else {
-                expand_word_single(word, shell)
+                Ok(ParameterExpansionResult::Structured(
+                    expand_word_preserving_structure(word, in_double_quotes, shell)?,
+                ))
             }
         }
         ParameterOperator::RemovePrefix { greedy, pattern } => {
             let pattern_text = expand_word_as_pattern(pattern, shell)?;
-            Ok(remove_prefix(&current, &pattern_text, *greedy))
+            Ok(ParameterExpansionResult::Flat(remove_prefix(
+                &current,
+                &pattern_text,
+                *greedy,
+            )))
         }
         ParameterOperator::RemoveSuffix { greedy, pattern } => {
             let pattern_text = expand_word_as_pattern(pattern, shell)?;
-            Ok(remove_suffix(&current, &pattern_text, *greedy))
+            Ok(ParameterExpansionResult::Flat(remove_suffix(
+                &current,
+                &pattern_text,
+                *greedy,
+            )))
         }
     }
+}
+
+/// Expands `word` (a `${parameter:-word}`/`${parameter:=word}`/
+/// `${parameter:+word}` operand) to tagged [`Segment`]s, threading the
+/// *real* enclosing double-quote context through rather than
+/// [`expand_to_segments`]'s hardcoded `false` — needed because the
+/// operand's own backslash interpretation depends on it. Confirmed
+/// against real bash: `unset y; echo "${y:-\*}"` prints the literal two
+/// characters `\*` (double-quote backslash rules: `\*` isn't one of
+/// `$ \` " \` <newline>`, so the backslash survives quote removal
+/// unresolved), matching plain `echo "\*"`'s own `\*` output exactly —
+/// while the equivalent *unquoted* `echo ${y:-\*}` resolves the escape
+/// and prints a bare `*`. Deliberately omits [`expand_to_segments`]'s
+/// leading-`~`-expansion special case: a parameter-expansion default
+/// operand undergoing tilde expansion was never part of this fix's scope
+/// and is left as-is (pre-existing behavior, unaffected either way since
+/// that case wasn't reachable through this operator before this fix
+/// existed at all).
+fn expand_operand_word(
+    word: &Word,
+    in_double_quotes: bool,
+    shell: &mut Shell,
+) -> Result<Vec<Segment>, ExpandError> {
+    let mut segments = Vec::new();
+    for segment in &word.segments {
+        expand_segment(segment, shell, in_double_quotes, &mut segments)?;
+    }
+    Ok(segments)
+}
+
+/// Expands a `${parameter:-word}`/`${parameter:=word}`/`${parameter:+word}`
+/// operand the way its result needs to behave once spliced into the
+/// enclosing word at the position `${...}` occupies: a quoted or
+/// backslash-escaped portion of `word` must keep the same protection
+/// against pathname expansion/IFS splitting it would have if written
+/// directly there, while a literal (unquoted, unescaped) portion must
+/// become *both* glob- and split-eligible — not just glob-eligible the
+/// way ordinary literal source text always is (never split-eligible on
+/// its own).
+///
+/// That "literal portion becomes split-eligible too" step is what
+/// [`expand_operand_word`] alone doesn't do (it inherits
+/// [`expand_segment`]'s ordinary rule that a bare `WordSegment::Literal`
+/// is never split-eligible, correct for literal text appearing directly
+/// in a word but wrong for a default-value operand's result, which must
+/// behave like an ordinary substituted value instead). Confirmed against
+/// real bash this distinction is real, not incidental: `unset y; for f
+/// in ${y:-a b}; do echo "[$f]"; done` is *two* fields, `[a]` and `[b]`
+/// (the literal space in the unquoted default *does* split) — while
+/// `unset y; x='a b'; for f in ${y:-"$x"}; do echo "[$f]"; done` is *one*
+/// field, `[a b]` (the `"$x"` portion's own space stays protected, since
+/// it was quoted).
+///
+/// Implemented by flipping `split_eligible` to `true` on exactly the
+/// segments whose `(glob_eligible, split_eligible)` signature is
+/// `(true, false)` — the signature unique to plain unquoted literal text
+/// and a tilde-expansion result (see [`expand_to_segments`]), and
+/// distinct from both a genuinely quoted segment (`(false, false)`,
+/// left untouched) and an already-split-eligible nested expansion result
+/// (`(true, true)`, already correct and left untouched).
+fn expand_word_preserving_structure(
+    word: &Word,
+    in_double_quotes: bool,
+    shell: &mut Shell,
+) -> Result<Vec<Segment>, ExpandError> {
+    let mut segments = expand_operand_word(word, in_double_quotes, shell)?;
+    for segment in &mut segments {
+        if segment.glob_eligible && !segment.split_eligible {
+            segment.split_eligible = true;
+        }
+    }
+    Ok(segments)
 }
 
 /// Expands `word` into a POSIX 2.13 pattern string while preserving
@@ -2199,6 +2326,129 @@ mod tests {
         let mut shell = Shell::new();
         assert_eq!(single("${X:-'a b'}", &mut shell), "a b");
         assert_eq!(single("\"${X:-'a b'}\"", &mut shell), "'a b'");
+    }
+
+    // ---- default-value operand quote/escape protection (regression) --------
+    //
+    // `${parameter:-word}`/`${parameter:=word}`/`${parameter:+word}`'s
+    // `word` must, once substituted, behave exactly as if its own
+    // quoted/escaped text had been written directly at the `${...}`
+    // position -- see `ParameterExpansionResult::Structured`'s and
+    // `expand_word_preserving_structure`'s own docs for the full design.
+    // Every case here was confirmed directly against real bash before
+    // being encoded as a test.
+
+    #[test]
+    fn use_default_quoted_glob_metacharacter_does_not_glob() {
+        // Confirmed against real bash: unset y; cd <dir with a file
+        // literally named `x`>; echo ${y:-'*'} -> a literal `*`, never
+        // matching the file, since the `*` is quoted.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("x"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        assert_eq!(fields("${Y:-'*'}", &mut shell), vec!["*"]);
+    }
+
+    #[test]
+    fn use_default_unquoted_literal_space_splits() {
+        // Confirmed against real bash: unset y; for f in ${y:-a b}; do
+        // ...; done visits two fields -- the literal space in the
+        // unquoted default *does* split, unlike quoted whitespace.
+        let mut shell = Shell::new();
+        assert_eq!(fields("${Y:-a b}", &mut shell), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn use_default_double_quoted_parameter_operand_does_not_split() {
+        // Confirmed against real bash: unset y; x='a b'; for f in
+        // ${y:-"$x"}; do ...; done visits exactly one field -- the
+        // quoted "$x" stays protected even though it's nested inside an
+        // otherwise-unquoted default.
+        let mut shell = Shell::new();
+        shell.env_vars.insert("X".into(), "a b".into());
+        assert_eq!(fields(r#"${Y:-"$X"}"#, &mut shell), vec!["a b"]);
+    }
+
+    #[test]
+    fn use_default_single_quoted_operand_does_not_split() {
+        // Sibling of the above with a literal single-quoted default
+        // rather than a nested parameter -- confirmed against real bash:
+        // unset y; for f in ${y:-'a b'}; do ...; done visits one field.
+        let mut shell = Shell::new();
+        assert_eq!(fields("${Y:-'a b'}", &mut shell), vec!["a b"]);
+    }
+
+    #[test]
+    fn use_default_escaped_glob_metacharacter_is_resolved_and_protected() {
+        // Confirmed against real bash: unset y; cd <dir with a file
+        // literally named `x`>; echo ${y:-\*} -> a bare `*` (the escape
+        // is resolved -- both `\` and `*` collapse to one character --
+        // but the result still doesn't glob, exactly like a literal,
+        // unquoted `echo \*` at the top level).
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("x"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        assert_eq!(fields(r"${Y:-\*}", &mut shell), vec!["*"]);
+    }
+
+    #[test]
+    fn use_default_escaped_glob_metacharacter_in_double_quotes_stays_unresolved() {
+        // Confirmed against real bash: unset y; echo "${y:-\*}" prints
+        // the literal two characters `\*` -- double-quote backslash
+        // rules apply to the operand (only `$ \` " \` <newline>` are
+        // special), matching plain `echo "\*"`'s own `\*` output.
+        let mut shell = Shell::new();
+        assert_eq!(single(r#""${Y:-\*}""#, &mut shell), r"\*");
+    }
+
+    #[test]
+    fn assign_default_persists_flat_value_but_returns_structured_result() {
+        // The *assigned* value is always a plain flattened string (no
+        // shell variable can itself carry quoting metadata) even though
+        // the expansion's own *result*, spliced back into the word,
+        // keeps its quote protection -- confirmed against real bash:
+        // unset y; cd <dir with a file literally named `x`>; echo
+        // ${y:='*'}; echo "$y" -> first line a literal `*` (protected at
+        // the splice site), second line also a literal `*` (the stored
+        // value itself, `y`, is just the two-character string, and `"$y"`
+        // is unconditionally quoted regardless of `y`'s own history).
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("x"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        assert_eq!(fields("${Y:='*'}", &mut shell), vec!["*"]);
+        assert_eq!(shell.get_var("Y"), Some("*"));
+    }
+
+    #[test]
+    fn assign_default_only_evaluates_operand_once() {
+        // Guards against a regression where deriving the assigned value
+        // and the spliced-back result each separately re-expanded
+        // `word` -- which would silently run a command substitution
+        // inside it twice. `$((X = X + 1))` is a cheap, side-effecting
+        // stand-in that doesn't require spawning a real subprocess (see
+        // this module's own "Command substitution itself... deliberately
+        // not unit-tested here" note above for why).
+        let mut shell = Shell::new();
+        shell.shell_vars.insert("X".into(), "0".into());
+        assert_eq!(single("${Y:=$((X = X + 1))}", &mut shell), "1");
+        assert_eq!(shell.get_var("X"), Some("1"));
+    }
+
+    #[test]
+    fn use_alternative_quoted_glob_metacharacter_does_not_glob() {
+        // Sibling of use_default_quoted_glob_metacharacter_does_not_glob
+        // for the `:+` operator -- confirmed against real bash: x=set;
+        // cd <dir with a file literally named `y`>; echo ${x:+'*'} -> a
+        // literal `*`.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("y"), "").unwrap();
+        let mut shell = Shell::new();
+        shell.cwd = dir.path().to_path_buf();
+        shell.env_vars.insert("X".into(), "set".into());
+        assert_eq!(fields("${X:+'*'}", &mut shell), vec!["*"]);
     }
 
     // ---- arithmetic expansion (POSIX 2.6.4) ---------------------------------
