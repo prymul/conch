@@ -1,0 +1,102 @@
+# Phase 6 `PS1`/`PS2` prompt-expansion cases -- see `prompt_case.rs`'s
+# module doc comment for why this is a wholly separate schema from
+# `corpus/phase1-5/*.toml`'s `[[case]]` shape (no `script`/`invocation`/
+# `oracles`: the oracle is always real bash's `${VAR@P}` transform, driven
+# by `prompt_oracle.rs`, and the candidate is a direct, in-process call to
+# conch's own prompt-expansion entry point once it lands -- see the crate
+# README's "Phase 6 planning notes" for the exact wiring plan and why
+# `tests/phase6_prompt_differential.rs` doesn't exist yet).
+#
+# Every case here sticks to escapes/mechanisms confirmed deterministic and
+# safe for a live bash-oracle comparison (backslash escapes, `promptvars`
+# variable/command-substitution expansion, `$?` forced to a known value) --
+# see `prompt_oracle.rs`'s module doc comment's "Non-determinism this
+# module's callers must avoid" section for exactly what's deliberately
+# left out and why: wall-clock date/time escapes (`\d`/`\t`/`\T`/`\@`/`\A`/
+# `\D{fmt}`), interpreter-internal counters (`\j`/`\!`/`\#`), and `\s`
+# (shell name -- expected to permanently differ from bash's own "bash",
+# once that's actually decided; a `known_difference` case then, not a live
+# one).
+
+[[case]]
+name = "plain-text-with-no-escapes-expands-unchanged"
+description = "a template with no backslash escapes or $-expansions passes through byte-for-byte"
+tags = ["ps1", "baseline"]
+template = "just text> "
+
+[[case]]
+name = "dollar-escape-renders-a-plain-dollar-sign"
+description = "\\$ renders a literal $ (bash's escape for effective-UID-based $/# is moot for an ordinary, non-root user)"
+tags = ["ps1", "escapes"]
+template = "\\$ "
+
+[[case]]
+name = "literal-backslash-escape-renders-one-backslash"
+description = "\\\\ renders exactly one backslash, not two"
+tags = ["ps1", "escapes"]
+template = "a\\\\b"
+
+[[case]]
+name = "newline-escape-renders-a-real-newline"
+description = "\\n renders an actual newline byte, not the two characters backslash-n"
+tags = ["ps1", "escapes"]
+template = "a\\nb"
+
+[[case]]
+name = "working-directory-escape-reflects-the-current-directory"
+description = "\\w expands to the full current working directory"
+tags = ["ps1", "escapes", "cwd"]
+template = "\\w"
+normalize = ["workdir"]
+
+[[case]]
+name = "basename-working-directory-escape-shows-only-the-last-component"
+description = "\\W expands to only the current directory's basename, not the full path"
+tags = ["ps1", "escapes", "cwd"]
+template = "\\W"
+cwd_subdir = "myproject"
+
+[[case]]
+name = "exit-status-is-visible-via-plain-dollar-question-mark"
+description = "an unescaped $? in the template is expanded via promptvars against the forced last_status"
+tags = ["ps1", "promptvars", "exit-status"]
+template = "[$?]"
+last_status = 42
+
+[[case]]
+name = "zero-exit-status-is-the-default-and-is-still-visible"
+description = "last_status defaults to 0 and still participates in promptvars expansion (not merely 'absent')"
+tags = ["ps1", "promptvars", "exit-status"]
+template = "[$?]"
+
+[[case]]
+name = "env-var-is-visible-via-promptvars-parameter-expansion"
+description = "a template referencing $MY_VAR (not a backslash escape) is expanded via promptvars, same as an ordinary double-quoted string would be"
+tags = ["ps1", "promptvars"]
+template = "var:$MY_VAR"
+[[case.env]]
+name = "MY_VAR"
+value = "hello"
+
+[[case]]
+name = "command-substitution-in-the-template-is-expanded-via-promptvars"
+description = "promptvars' expansion pass includes command substitution, not just parameter expansion"
+tags = ["ps1", "promptvars"]
+template = "cmdsub:$(echo hi)"
+
+[[case]]
+name = "ps2-continuation-prompt-expands-through-the-same-pipeline-as-ps1"
+description = "PS2 goes through an identical escape/promptvars pipeline to PS1, just against a different source variable"
+tags = ["ps2"]
+prompt = "ps2"
+template = "> "
+
+[[case]]
+name = "ps2-with-an-escape-and-an-env-var"
+description = "PS2's own pipeline still applies both backslash escapes and promptvars expansion together"
+tags = ["ps2", "escapes", "promptvars"]
+prompt = "ps2"
+template = "\\$ $MY_VAR> "
+[[case.env]]
+name = "MY_VAR"
+value = "cont"

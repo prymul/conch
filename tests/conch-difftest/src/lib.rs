@@ -9,8 +9,11 @@
 
 pub mod case;
 pub mod compare;
+pub mod completion_oracle;
 pub mod corpus;
 pub mod invoke;
 pub mod normalize;
+pub mod prompt_case;
+pub mod prompt_oracle;
 pub mod report;
 pub mod runner;

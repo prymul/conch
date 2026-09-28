@@ -144,9 +144,59 @@ also runs in **report-only mode** via its own
 `CONCH_DIFFTEST_STRICT_PHASE5` gate -- see "Phase-specific strict gates"
 below.
 
+**Phase 6** (interactive UX: persistent history, tab completion, syntax
+highlighting, `PS1`/`PS2` prompt expansion, startup file sourcing) is
+being implemented concurrently in `crates/conch`/`crates/conch-core` at
+the time this section was written, and structurally breaks the pattern
+every earlier phase's corpus followed -- see "Phase 6: what's differential
+and what isn't" below for the full writeup, but the short version: this is
+the first phase where the *candidate* side of a comparison can't be "spawn
+the compiled `conch` binary via `-c`/script-file/stdin and diff its
+stdout" at all for most of its features, because prompt rendering, tab
+completion, and syntax highlighting only happen inside conch's
+interactive, rustyline-backed readline loop, which needs a real
+controlling terminal this harness deliberately never allocates (see
+"Interactive mode scoping" below -- unchanged from every earlier phase's
+version of this same constraint, just newly load-bearing here). Only two
+of Phase 6's five features turn out to be genuinely comparable against
+real bash at all (`PS1`/`PS2` expansion, via a bash mechanism that doesn't
+need a pty -- see below; tab completion candidate generation, likewise);
+the other three (persistent history, syntax highlighting, startup file
+sourcing) have no live-bash-oracle shape to compare against and are
+ordinary Rust unit/integration test territory in `crates/conch-core`/
+`crates/conch` instead, not this crate's corpus. As of this writing:
+`corpus/phase6/prompt_expansion.toml` (14 cases) plus its own
+`phase6_prompt_corpus_validation.rs`/`phase6_prompt_oracle_selfcheck.rs`
+are built, self-validated, and oracle-verified against real bash today
+(both are unconditional hard gates already, like every earlier phase's
+`corpus_validation`/`oracle_selfcheck` pair); `src/completion_oracle.rs`
+(a `compgen`-driving oracle mechanism, fully unit-tested against real
+bash) exists but has no corpus yet, pending a design decision on tab
+completion's exact scope (see below); and `phase6_prompt_differential.rs`
+/`phase6_completion_differential.rs` -- the actual conch-vs-oracle
+comparisons -- don't exist yet at all, deliberately: both need a Cargo
+dev-dependency on `conch-shell-core` plus a call to a specific,
+not-yet-landed pure-core function (`expand_prompt`/`complete_word` or
+whatever they end up being named), and adding that dependency before the
+function exists would break compilation of this entire crate for every
+contributor, not just report a failing test -- a materially different
+risk from every earlier phase's corpus, which could always be built and
+merged concurrently with its own execution-semantics work because a
+compiled `conch` binary (even one that doesn't implement the feature yet)
+is all `invoke::run(&ShellUnderTest::Conch(path), ...)` ever needed to
+exist. See "Phase 6: what's differential and what isn't" for exactly what
+unblocks each piece and how to wire it up once it does.
+
 Every phase's three-test pattern is the same (`{phase}_corpus_validation.rs`,
 `{phase}_oracle_selfcheck.rs`, `{phase}_differential.rs` -- Phase 1's
-happen to be un-prefixed since they were written first):
+happen to be un-prefixed since they were written first). Phase 6's
+prompt-expansion pair follows the same two-thirds-of-the-pattern shape
+(`phase6_prompt_corpus_validation.rs`, `phase6_prompt_oracle_selfcheck.rs`)
+against its own separate schema/loader (`prompt_case.rs`/
+`corpus::load_prompt_dir`, not `case.rs`/`corpus::load_dir` -- see
+`prompt_case.rs`'s module doc comment for why), with its `_differential.rs`
+third deliberately not yet added (see the Phase 6 status paragraph above).
+What each file in the pattern is for, generically:
 
 - `corpus_validation.rs` -- loads and structurally validates every corpus
   file. No shell subprocess involved.
@@ -210,7 +260,10 @@ tests/conch-difftest/
 │   ├── invoke.rs                <- spawns a shell, captures output as raw bytes
 │   ├── normalize.rs             <- per-case byte-level normalization rules
 │   ├── compare.rs                <- diffs a candidate run against an oracle run
-│   └── runner.rs                  <- orchestration + trackable pass/fail/skip summary
+│   ├── runner.rs                  <- orchestration + trackable pass/fail/skip summary
+│   ├── prompt_case.rs              <- Phase 6 PS1/PS2 case schema (separate from case.rs)
+│   ├── prompt_oracle.rs             <- drives bash's `${VAR@P}` prompt-expansion transform
+│   └── completion_oracle.rs          <- drives bash's `compgen` builtin (no corpus/schema yet)
 ├── corpus/
 │   ├── phase1/                      <- one *.toml file per category, several
 │   │   ├── simple_commands.toml        cases per file, oils-spec-test style
@@ -247,20 +300,22 @@ tests/conch-difftest/
 │   │   ├── background_and_wait.toml
 │   │   ├── jobs_status.toml             (kept minimal -- see its own header)
 │   │   └── trap.toml
-│   └── phase5/                      <- same style, builtins completeness
-│       ├── read.toml                    (first user of Case::stdin)
-│       ├── getopts.toml
-│       ├── test_and_bracket.toml        (POSIX's 0/1/2/3/4-argument disambiguation rules)
-│       ├── printf.toml
-│       ├── declare_and_readonly.toml    (declare is bash-only; no array support at all)
-│       ├── unset.toml
-│       ├── alias.toml
-│       ├── source_and_eval.toml
-│       ├── exec.toml
-│       ├── type_and_command.toml
-│       ├── umask.toml
-│       ├── kill.toml
-│       └── set_options.toml             (set's option-flag half; set -- is in phase3b)
+│   ├── phase5/                      <- same style, builtins completeness
+│   │   ├── read.toml                    (first user of Case::stdin)
+│   │   ├── getopts.toml
+│   │   ├── test_and_bracket.toml        (POSIX's 0/1/2/3/4-argument disambiguation rules)
+│   │   ├── printf.toml
+│   │   ├── declare_and_readonly.toml    (declare is bash-only; no array support at all)
+│   │   ├── unset.toml
+│   │   ├── alias.toml
+│   │   ├── source_and_eval.toml
+│   │   ├── exec.toml
+│   │   ├── type_and_command.toml
+│   │   ├── umask.toml
+│   │   ├── kill.toml
+│   │   └── set_options.toml             (set's option-flag half; set -- is in phase3b)
+│   └── phase6/                      <- separate PromptCase schema, not case.rs's Case -- see below
+│       └── prompt_expansion.toml        (no completion-candidate corpus yet -- see below)
 └── tests/
     ├── corpus_validation.rs
     ├── oracle_selfcheck.rs
@@ -279,7 +334,11 @@ tests/conch-difftest/
     ├── phase4_differential.rs
     ├── phase5_corpus_validation.rs
     ├── phase5_oracle_selfcheck.rs
-    └── phase5_differential.rs
+    ├── phase5_differential.rs
+    ├── phase6_prompt_corpus_validation.rs
+    └── phase6_prompt_oracle_selfcheck.rs
+    # phase6_prompt_differential.rs and phase6_completion_*.rs don't exist
+    # yet -- see "Phase 6: what's differential and what isn't" below.
 ```
 
 Why a workspace member under `tests/`, not a bare `tests/*.rs` at the
@@ -776,6 +835,269 @@ Phase 2's corpus, just not previously named as a general pattern -- see
 `known-differences.md`'s cross-shell-quirks section for the full
 writeup, and `declare_and_readonly.toml`/`source_and_eval.toml`/
 `set_options.toml` for the corpus cases.
+
+## Phase 6: what's differential and what isn't
+
+Phase 6 (interactive UX) is a genuine break from the pattern every earlier
+phase's corpus followed, and is written up here in more depth than a
+typical "scoping notes" section because the *shape* of the problem
+changed, not just the content. Read this before adding to
+`corpus/phase6/` or wiring up either `_differential.rs`.
+
+### Why this phase is structurally different
+
+Every Phase 1-5 corpus case works the same way regardless of whether
+conch's execution semantics exist yet: `invoke::run` spawns the compiled
+`conch` binary via `-c`/script-file/stdin and diffs its stdout/stderr/exit
+code against a real oracle shell spawned the identical way. That
+mechanism has **zero Rust-level coupling** to conch's internals -- a
+freshly-`cargo build`'d `conch` binary that panics or prints nothing for
+an unimplemented feature is still something `invoke::run` can spawn and
+capture output from; the corpus just reports it as failing until the
+feature lands. This is exactly what let `corpus/phase2/` through
+`corpus/phase5/` be built and merged *concurrently* with their own
+execution-semantics work with zero risk to the harness's own build.
+
+Prompt rendering (`PS1`/`PS2`), tab completion, and syntax highlighting
+don't have that property: they only happen inside conch's interactive,
+rustyline-backed readline loop (see `crates/conch/src/main.rs`'s
+`run_interactive`), which needs a real controlling terminal this harness
+deliberately never allocates (see "Interactive mode scoping" above --
+unchanged as a constraint, just newly load-bearing here, the same way
+Phase 4's job-control corpus had to carve out the terminal-owning half of
+`fg`/`bg`/Ctrl-Z as out of scope for the identical structural reason). The
+fix the project settled on (see the team's own Phase 6 kickoff notes) is
+to require each Phase 6 feature to be split into a pure, fully-testable
+core function plus a thin, not-independently-testable rustyline-trait
+adapter -- e.g. an `expand_prompt(shell: &Shell, template: &str) -> String`
+that the interactive loop calls, but that a test can also call directly,
+in-process, with no pty involved at all.
+
+That fix changes *this crate's* risk profile, though: comparing a
+directly-called Rust function against a live bash oracle means
+`conch-difftest` needs an actual Cargo dependency on `conch-shell-core`
+(and a call matching that function's real signature) for the differential
+test to even compile -- unlike every earlier phase, **the corpus's
+differential test can't be written and merged before the target function
+exists.** Getting this wrong doesn't just leave a test failing or
+skipped; it breaks `cargo test -p conch-difftest` (and therefore
+`cargo test --all-features`, the general `test` CI job) for every
+contributor, including whoever is mid-flight on an unrelated part of this
+same crate. So: the oracle-driving mechanism, its own unit tests, and (for
+the piece with a stable enough schema already) the corpus are all built
+and merged *now*, entirely bash-only and with no dependency on
+`conch-shell-core` at all; the `_differential.rs` files that actually call
+into conch's pure-core functions are deliberately held back until those
+functions exist, at which point wiring them up is the mechanical last
+step described under each feature below.
+
+### `PS1`/`PS2` prompt expansion -- genuinely differential, oracle ready
+
+**Status: corpus + oracle self-check built and green; differential test
+blocked on `expand_prompt`/`expand_prompt_for_ps2`-shaped functions
+landing in `conch-shell-core`.**
+
+The key discovery this crate made while scoping Phase 6 (see
+`prompt_oracle.rs`'s module doc comment for the full writeup): bash's
+backslash-escape prompt expansion (`\u`, `\h`, `\w`, `\$`, ...) plus its
+`promptvars` parameter/command-substitution pass normally only run when
+bash actually draws an interactive prompt -- `bash -c 'PS1="\u@\h "; echo
+"$PS1"'` prints the *raw*, unexpanded template, confirmed directly, since
+that code path never fires for a non-interactive `-c` invocation with no
+prompt ever drawn. But bash >= 4.4's `${parameter@P}` transform operator
+("the expansion is a string that is the result of expanding the value of
+parameter as if it were `PS1`," per the bash manual) runs *exactly* that
+same pipeline on demand, no pty required. `prompt_oracle.rs`'s
+`expand_ps1_via_bash`/`expand_ps2_via_bash` drive this directly, and their
+own test suite confirms empirically (against real bash 5.3) that
+backslash escapes, `promptvars` variable/command-substitution expansion,
+and a forced `$?` value are all reproduced faithfully this way. ubuntu-
+latest's bash (CI's oracle host) is well above the 4.4 floor.
+
+`corpus/phase6/prompt_expansion.toml` (14 cases, in `prompt_case.rs`'s own
+schema -- deliberately **not** `case.rs`'s `Case`, since there's no
+`script`/`invocation`/`oracles` here at all; see that module's doc comment
+for the full rationale) sticks to escapes and mechanisms confirmed
+deterministic for a live comparison: literal text, `\$`, `\\`, `\n`,
+`\w`/`\W` (both normalized via the existing `NormalizeRule::Workdir`, or
+via a `cwd_subdir` for a `\W`-only case), `$?` forced via `last_status`,
+`promptvars` variable and command-substitution expansion, and `PS2`
+through the identical pipeline. Deliberately excluded (see
+`prompt_oracle.rs`'s "Non-determinism this module's callers must avoid"
+for the full reasoning): `\d`/`\t`/`\T`/`\@`/`\A`/`\D{fmt}` (wall-clock
+date/time -- the candidate and oracle run microseconds apart, enough to
+occasionally disagree at a second/minute boundary; worth a plain unit
+test with a fixed/injected clock on the conch side instead, if the
+implementation supports one), `\j`/`\!`/`\#` (interpreter-internal
+counters a fresh oracle invocation and conch's own `Shell` have no reason
+to agree on numerically even if both implement the escape correctly), and
+`\s` (shell name -- expected to permanently, deliberately read `"conch"`
+rather than bash's `"bash"`, a `known_difference` case once that's
+actually decided rather than a live comparison; `prompt_case.rs`'s own
+`PromptKnownDifference` schema exists and is ready for exactly this).
+
+**A real risk worth flagging explicitly, caught mid-implementation while
+writing this section (this crate and Phase 6's own implementation are
+being built concurrently, in the same working tree -- see the top-level
+Phase 6 status paragraph):** `crates/conch/Cargo.toml` has already picked
+up a direct `conch-shell-lexer` dependency with a comment naming
+`src/prompt.rs` as its consumer, which reads as the actual `PS1`/`PS2`
+expansion logic landing **inside the bin-only `conch-shell` package**
+itself, not `conch-shell-core`. If that's where it stays, this crate
+genuinely **cannot** call it in-process the same way it does
+`conch-shell-core` -- `conch-shell` has no `[lib]` target, the exact same
+bindeps limitation `invoke::find_conch_binary`'s own doc comment already
+explains for why *that* function has to locate the compiled binary on
+disk instead of linking against it. Two ways this resolves, both worth
+checking for before assuming the plan below just works:
+
+- **Best case:** the pure expansion function itself ends up in
+  `conch-shell-core` (alongside `hostname`/`is_effective_root`/
+  `list_path_executables`, which have already landed there for exactly
+  this kind of Phase 6 primitive), with `crates/conch/src/prompt.rs` as
+  only the thin rustyline-facing adapter around it. The plan below applies
+  verbatim.
+- **If it stays in `crates/conch/src/prompt.rs` instead:** it's still
+  perfectly unit-testable in place (a binary crate's own `#[cfg(test)]`
+  modules run fine via `cargo test -p conch-shell`, no `[lib]` target
+  needed for *that*) -- but a cross-crate differential comparison from
+  *this* crate needs one more step first: add a `[lib]` target to
+  `crates/conch/Cargo.toml` alongside its existing `[[bin]]` (a package
+  can have both; `src/main.rs` would then reach its own crate's `prompt`
+  module via `use conch_shell::prompt` the same way any other consumer
+  would) so there's an actual `.rlib` for this crate to add a normal path
+  dependency on. This is a small, well-worn Cargo pattern, not a
+  workaround -- just a step nobody has needed yet in this repo because
+  every prior phase's testable logic already lived in a proper lib crate
+  from the start.
+
+**To wire up the real differential test once `expand_prompt` (or whatever
+it ends up being named) lands, assuming the best case above (a
+`conch-shell-core`-reachable function):**
+
+1. Add `conch-shell-core = { workspace = true }` (or, per the fallback
+   above, whatever crate/path it actually landed in) to this crate's
+   `[dev-dependencies]` in `Cargo.toml`.
+2. Add `tests/phase6_prompt_differential.rs`: for each non-`known_difference`
+   case, construct a `conch_shell_core::Shell` (via `Shell::new()`, then
+   override `cwd`/`env_vars`/`last_status` to match the case -- see
+   `phase6_prompt_oracle_selfcheck.rs`'s `resolve_workdir`/`expand` helpers
+   for the equivalent oracle-side setup to mirror), call
+   `expand_prompt(&shell, &case.template)` directly (no subprocess, no
+   timeout needed -- it's a plain in-process function call), and compare
+   the returned `String`'s bytes against `prompt_oracle::expand_ps1_via_bash`
+   (or `_ps2_`)'s output, both normalized per `case.normalize` against
+   their own respective `cwd`. For a `known_difference` case, compare
+   directly against `PromptKnownDifference::expect` instead, with no live
+   oracle run at all -- same shape as `compare::compare_known_difference`,
+   just against a single `String` rather than a `RunOutcome` triple.
+3. Add `CONCH_DIFFTEST_STRICT_PHASE6` handling to that new file (report-only
+   by default, matching every earlier phase's own strict-gate convention --
+   see "Phase-specific strict gates" above), and, once warranted, to
+   `.github/workflows/ci.yml`'s `difftest` job `env:` block.
+4. `phase6_prompt_corpus_validation.rs`/`phase6_prompt_oracle_selfcheck.rs`
+   need no changes at all -- they were deliberately written not to depend
+   on `expand_prompt` existing, and stay exactly as valuable afterward.
+
+### Tab completion -- differential in principle, blocked on a scope decision too
+
+**Status: oracle-driving mechanism (`completion_oracle.rs`) built, unit-
+tested against real bash, and unused by any corpus yet -- deliberately,
+pending a design decision on what `complete_word` is actually scoped to
+cover.**
+
+bash ships `compgen [options] [word]` specifically to query its own
+completion logic without a terminal (confirmed empirically -- see
+`completion_oracle.rs`'s module doc comment and test suite): `compgen -c`
+lists command-name candidates (builtins, functions, aliases, keywords, and
+every executable on `$PATH`), `compgen -f`/`-d` list filenames/directories
+relative to the current directory, `compgen -A function`/`-A alias`/
+`-A variable` list exactly those categories. `compgen_via_bash` drives
+this with `$PATH` fully replaced (not merely prepended) by a caller-
+supplied, controlled directory list, so results are exactly as
+deterministic as this crate's other oracle mechanisms rather than
+depending on whatever happens to be installed on the machine running the
+suite.
+
+What's still an open question, and why no corpus exists yet: the team's
+proposed signature, `fn complete_word(shell: &Shell, word: &str) ->
+Vec<String>`, takes no argument-position information (is `word` the first
+word of the command line, or a later one?) -- real bash's own *default*
+completion (no `bash-completion` package, no `complete -F` registered)
+dispatches on exactly that distinction: command-name completion
+(`compgen -c`-equivalent) at the first word, filename completion
+(`compgen -f`-equivalent) everywhere else. A single-argument
+`complete_word` most plausibly means one of: (a) it's always called with
+enough context already resolved that position doesn't need to be a
+parameter, (b) it dispatches on `word`'s own shape instead (e.g. "contains
+a `/`" => path completion, else => command completion -- a common
+simplified heuristic for a first completion implementation), or (c) it
+deliberately only covers one category for now (commands only, or files
+only) with the rest left for later. Building `corpus/phase6/
+completion_candidates.toml` against a guess here risks encoding the wrong
+one and having to redo it; whoever lands `complete_word` should confirm
+which of these (or something else) it actually is, at which point:
+
+1. Add the corpus (`PromptCase`-style schema likely isn't the right fit
+   here -- a completion case needs a `$PATH` directory list, defined
+   functions/aliases, a prefix word, and (if (a) or a hybrid of the above)
+   a position/context marker; a fresh `CompletionCase` schema, sibling to
+   `prompt_case.rs`, is the likely shape) with cases exercising each
+   `CompletionKind` `completion_oracle.rs` already supports
+   (`Command`/`Filename`/`Directory`/`Function`/`Alias`/`Variable`).
+2. Add the `conch-shell-core` dev-dependency (if not already added for
+   the prompt-expansion wiring above) and
+   `tests/phase6_completion_differential.rs`, calling `complete_word`
+   directly and comparing its result (sorted + deduplicated, matching
+   `compgen_via_bash`'s own return convention -- see that module's doc
+   comment for why raw `compgen` ordering isn't part of the contract
+   worth matching) against the corresponding `compgen_via_bash` call.
+3. Same `CONCH_DIFFTEST_STRICT_PHASE6` convention as the prompt-expansion
+   differential (a single shared Phase 6 strict-mode flag covering both
+   `_differential.rs` files is fine -- they're two halves of the same
+   phase, unlike two genuinely different phases -- but keep both files
+   themselves separate, mirroring `prompt_oracle`/`completion_oracle`
+   already being separate modules).
+
+### Syntax highlighting -- not differential
+
+bash has no built-in syntax highlighting to compare against at all (it's
+a rustyline/readline-side feature some shells add, not a POSIX/bash
+behavior), so a `classify(line: &str) -> Vec<Span>`-shaped function has no
+live-oracle shape to test against here. This belongs as a plain, ordinary
+Rust unit test suite in whichever crate `classify` lives in, asserting
+expected span classifications for representative input (keywords,
+strings, comments, ...) -- not this crate's corpus, and not a live
+comparison against anything.
+
+### Persistent history -- not differential
+
+The eager-append-to-a-history-file wiring is mostly glue around
+rustyline's own history mechanism, with very little pure "core" logic to
+differentially test even in principle (bash's own history file format and
+exact append timing are also implementation details, not a specified
+behavior worth chasing byte-for-byte). A plain integration test -- run a
+few commands through conch's history-recording path, then assert on the
+resulting history file's contents -- is the right bar here, in
+`crates/conch` or `crates/conch-core`'s own test suite, not this crate.
+
+### Startup file sourcing -- not differential, but not novel either
+
+Once a `source_startup_files`-shaped entry point exists, unit-testing it
+is straightforward and needs no new harness machinery: build a temp rc
+file, point a test `Shell` at it, run the sourcing function, and assert
+on the resulting `env_vars`/`aliases`/`functions` -- ordinary state
+assertions on a `Shell` the same way `conch-shell-core`'s own existing
+`#[cfg(test)]` modules already do (see e.g. `lib.rs`'s
+`register_and_look_up_builtin`/`env_var_takes_precedence_over_shell_var`).
+This isn't meaningfully comparable against real bash's own
+`~/.bashrc`-sourcing behavior for the same file content *as a live
+oracle* -- the interesting assertion is "did conch's own internal state
+end up right," not "does conch's stdout match bash's," and sourcing
+itself is just an ordinary `.`/`source` execution over a fixed path, which
+already has full differential coverage for its actual execution semantics
+in `corpus/phase5/source_and_eval.toml`. Belongs in `crates/conch-core`/
+`crates/conch`'s own test suite, not this crate's corpus.
 
 ## Wiring in real execution
 
