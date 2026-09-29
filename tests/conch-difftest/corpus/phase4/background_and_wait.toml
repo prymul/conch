@@ -1,0 +1,165 @@
+# Phase 4 -- backgrounding a command list with `&`, and `wait`.
+#
+# Job control is the first phase where a script can run more than one
+# process at a time, which means it's also the first phase where naive
+# stdout timing would be genuinely non-deterministic (whichever process
+# happens to get scheduled first). Every case below sidesteps that by
+# leaning on `wait`, exactly as recommended for this phase: `cmd & wait`
+# turns "did the background job's output show up yet" from a race into a
+# solved ordering problem, since `wait` (with or without a specific pid)
+# is defined to block until its target(s) have actually finished. None of
+# these cases depend on the *length* of any `sleep` used to simulate a
+# slow background job -- only on `wait` actually blocking for it, so
+# there's nothing timing-sensitive to be flaky about.
+#
+# The two cases with more than one background job (`wait-with-no-operands-
+# waits-for-every-background-job`) route each job's output to its own
+# file rather than writing directly to shared stdout, specifically
+# because *that* part -- which of two genuinely concurrent processes
+# happens to write to a shared stream first -- is not made deterministic
+# by `wait` (only "has it finished by the time wait returns" is); reading
+# the files back afterward in a fixed, script-chosen order sidesteps that
+# entirely.
+#
+# No `$!`/`$$` value is ever printed literally anywhere in this file --
+# every case that needs a background job's PID captures it into a
+# variable and uses it functionally (as an argument to `wait`), which
+# avoids needing any PID-normalization support in the harness at all.
+#
+# All POSIX baseline, so every case runs against both `bash` and `sh`.
+
+[[case]]
+name = "background-ampersand-does-not-block-the-script"
+description = "a command started with & returns control to the script immediately; wait afterward is what makes the script block until it's done"
+tags = ["job-control", "background", "wait"]
+oracles = ["bash", "sh"]
+script = '''
+sleep 0.2 &
+echo immediate
+wait
+echo after-wait
+'''
+
+[[case]]
+name = "wait-on-a-specific-pid-returns-that-jobs-successful-exit-status"
+description = "wait pid blocks until that specific background job finishes and reports its exit status via $?"
+tags = ["job-control", "wait"]
+oracles = ["bash", "sh"]
+script = '''
+sleep 0.05 &
+pid=$!
+wait "$pid"
+echo "waited:$?"
+'''
+
+[[case]]
+name = "wait-on-a-specific-pid-returns-that-jobs-failing-exit-status"
+description = "the same wait pid / $? rule applies when the background job fails"
+tags = ["job-control", "wait", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+false &
+pid=$!
+wait "$pid"
+echo "waited:$?"
+'''
+
+[[case]]
+name = "wait-on-a-specific-pid-returns-that-jobs-custom-exit-code"
+description = "wait reports the background job's exact exit code, not just success/failure"
+tags = ["job-control", "wait", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+(exit 7) &
+pid=$!
+wait "$pid"
+echo "waited:$?"
+'''
+
+[[case]]
+name = "wait-with-no-operands-waits-for-every-background-job"
+description = "a bare wait blocks until every currently-running background job has finished (regardless of which one finishes first) and itself exits 0 even if one of them failed -- each job's side effect is written to its own file specifically so the *order* two genuinely concurrent jobs happen to finish in can't affect this case's outcome, only whether wait truly waited for both"
+tags = ["job-control", "wait"]
+oracles = ["bash", "sh"]
+script = '''
+(sleep 0.05; echo one > out1.txt) &
+(false; echo two > out2.txt) &
+wait
+echo "wait-status:$?"
+cat out1.txt out2.txt
+'''
+
+[[case]]
+name = "wait-on-an-already-finished-pid-still-succeeds"
+description = "waiting a second time on a pid that was already waited for (and has already exited) is not an error on either shell -- it just reports the same result again"
+tags = ["job-control", "wait"]
+oracles = ["bash", "sh"]
+script = '''
+true &
+pid=$!
+wait "$pid"
+wait "$pid"
+echo "second-wait:$?"
+'''
+
+[[case]]
+name = "dollar-bang-tracks-the-most-recently-started-job-but-can-be-saved-per-job"
+description = "$! is overwritten by each new & command, but saving it into a variable right after backgrounding lets a script unambiguously wait for that specific earlier job later, regardless of which one actually finishes first"
+tags = ["job-control", "wait", "dollar-bang"]
+oracles = ["bash", "sh"]
+script = '''
+sleep 0.05 &
+first=$!
+sleep 0.02 &
+second=$!
+wait "$first"
+echo "first:$?"
+wait "$second"
+echo "second:$?"
+'''
+
+[[case]]
+name = "background-a-whole-pipeline-with-ampersand"
+description = "& can background an entire pipeline, not just a single simple command; wait (with no operand) still blocks until it finishes"
+tags = ["job-control", "background", "pipelines"]
+oracles = ["bash", "sh"]
+script = '''
+{ echo piped; } | cat &
+wait
+echo after
+'''
+
+[[case]]
+name = "wait-on-a-backgrounded-pipeline-returns-its-last-stages-exit-status"
+description = "waiting on a backgrounded pipeline's $! reports the same last-stage exit status a foreground pipeline's $? would"
+tags = ["job-control", "wait", "pipelines", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+{ false; } | true &
+pid=$!
+wait "$pid"
+echo "waited:$?"
+'''
+
+[[case]]
+name = "background-a-compound-command-with-ampersand"
+description = "& can background an entire compound command (an if statement here), not just a simple command"
+tags = ["job-control", "background"]
+oracles = ["bash", "sh"]
+script = '''
+if true; then sleep 0.02; echo yes; fi &
+wait
+echo after
+'''
+
+[[case]]
+name = "wait-reports-a-background-jobs-death-by-uncaught-signal-as-128-plus-signal-number"
+description = "when a background job is killed by an uncaught signal rather than exiting normally, wait/$? still reports it using the standard 128+signum convention -- verified with a genuinely separate nested shell process (rather than a subshell) precisely because $$ keeps the top-level shell's original value even inside a subshell, so a subshell can't target only itself with kill $$"
+tags = ["job-control", "wait", "signals", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+"$0" -c "kill -TERM \$\$" &
+pid=$!
+wait "$pid"
+echo "waited:$?"
+'''

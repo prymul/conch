@@ -68,8 +68,20 @@ fn run_one_oracle_pair(case: &Case, oracle: Oracle) -> CaseResult {
     };
 
     let shell = ShellUnderTest::Oracle(oracle.program());
-    let a = invoke::run(&shell, case.invocation, &case.script, candidate_dir.path());
-    let b = invoke::run(&shell, case.invocation, &case.script, oracle_dir.path());
+    let a = invoke::run(
+        &shell,
+        case.invocation,
+        &case.script,
+        candidate_dir.path(),
+        case.stdin.as_deref(),
+    );
+    let b = invoke::run(
+        &shell,
+        case.invocation,
+        &case.script,
+        oracle_dir.path(),
+        case.stdin.as_deref(),
+    );
 
     match (a, b) {
         (Ok(a), Ok(b)) => {
@@ -143,12 +155,19 @@ fn run_one_differential_pair(case: &Case, oracle: Oracle, conch_bin: Option<&Pat
 
     let conch = ShellUnderTest::Conch(conch_bin.to_path_buf());
     let oracle_shell = ShellUnderTest::Oracle(oracle.program());
-    let candidate = invoke::run(&conch, case.invocation, &case.script, candidate_dir.path());
+    let candidate = invoke::run(
+        &conch,
+        case.invocation,
+        &case.script,
+        candidate_dir.path(),
+        case.stdin.as_deref(),
+    );
     let oracle_run = invoke::run(
         &oracle_shell,
         case.invocation,
         &case.script,
         oracle_dir.path(),
+        case.stdin.as_deref(),
     );
 
     match (candidate, oracle_run) {
@@ -217,7 +236,13 @@ fn run_known_difference(
     };
 
     let conch = ShellUnderTest::Conch(conch_bin.to_path_buf());
-    let outcome = invoke::run(&conch, case.invocation, &case.script, workdir.path());
+    let outcome = invoke::run(
+        &conch,
+        case.invocation,
+        &case.script,
+        workdir.path(),
+        case.stdin.as_deref(),
+    );
 
     match outcome {
         Ok(actual) => {
@@ -325,6 +350,7 @@ mod tests {
             compare: vec![CompareTarget::Stdout, CompareTarget::ExitCode],
             normalize: Vec::new(),
             script: "echo hi".to_string(),
+            stdin: None,
             known_difference: None,
             note: None,
             source_file: PathBuf::from("test.toml"),

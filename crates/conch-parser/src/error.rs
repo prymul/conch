@@ -30,4 +30,131 @@ pub enum ParseError {
     /// "this is valid shell syntax conch doesn't support yet".
     #[error("{message} (at byte {})", .span.start)]
     UnsupportedConstruct { message: String, span: Span },
+
+    /// The `command` grammar's compound-command chain (`parse_command` →
+    /// `parse_subshell`/`parse_if_clause`/`parse_while_clause`/.../
+    /// `parse_compound_list` → ... → `parse_command` again) recursed past
+    /// `conch_shell_parser::parser`'s (private) depth bound — see that
+    /// module's `MAX_COMMAND_DEPTH` for the full reasoning. Distinguished
+    /// from [`ParseError::UnexpectedToken`] since no single token is
+    /// invalid here; the input is simply nested deeper (`((((...))))`
+    /// subshells, `{ { { ... } } }` groups, or any mix) than this parser
+    /// will follow.
+    #[error("input nested too deeply (at byte {})", .span.start)]
+    NestingTooDeep { span: Span },
+
+    /// `Parser::maybe_expand_alias` performed more than
+    /// `conch_shell_parser::parser`'s (private) `MAX_ALIAS_EXPANSIONS`
+    /// substitutions across this one parse — see that constant's own
+    /// docs. A self-referential alias whose replacement reintroduces a
+    /// list operator (`alias c='c|c'`) can otherwise double the pending
+    /// parse work on every one of `parse_pipeline`/`parse_and_or`/the
+    /// `;`/`&`-list loops' repeated re-entries into `parse_command`,
+    /// reaching multiple gigabytes of memory within seconds with no OS
+    /// backstop to rely on — this bound turns that into a clean, reported
+    /// error instead.
+    #[error("too many alias expansions (at byte {})", .span.start)]
+    TooManyAliasExpansions { span: Span },
+}
+
+impl ParseError {
+    /// Whether this error means "the input simply ran out before some
+    /// still-open construct closed" (an unterminated quote/expansion
+    /// site, or the grammar reaching end-of-input while still expecting
+    /// another token) rather than a genuine syntax error found *within*
+    /// the input actually given.
+    ///
+    /// This is the exact signal an interactive REPL needs to implement
+    /// bash's `PS2` continuation prompt correctly: on a `true` result,
+    /// read another line, append it (with a newline in between,
+    /// reproducing the line break the user actually typed), and re-parse
+    /// the combined input, rather than reporting the error immediately —
+    /// see `conch`'s own binary crate for that loop. Consulting this
+    /// method (rather than a second, hand-rolled "is this incomplete"
+    /// check against the raw source text) is deliberate: it keeps the
+    /// REPL's continuation logic and this crate's own error taxonomy from
+    /// being able to silently drift apart as either evolves.
+    ///
+    /// Deliberately `false` for [`ParseError::UnsupportedConstruct`]: an
+    /// unclosed `<<` here-document, for example, is a *hard* error today
+    /// (here-documents aren't implemented at all yet — see this crate's
+    /// own module docs), not a signal to keep reading more input, since
+    /// there's no continuation logic here that could ever resolve it
+    /// either way. Also `false` for [`ParseError::UnexpectedToken`]: that
+    /// variant only ever fires when a *real* token was found somewhere
+    /// the grammar didn't allow it, which more input could never fix.
+    /// Also `false` for [`ParseError::NestingTooDeep`]: reading more
+    /// input cannot make already-too-deep nesting shallower again, so
+    /// there's nothing a continuation prompt could productively wait for
+    /// here either. Also `false` for
+    /// [`ParseError::TooManyAliasExpansions`], for the identical reason —
+    /// the bound was already exceeded, and more input only risks making
+    /// it worse, never resolves it.
+    #[must_use]
+    pub fn is_incomplete_input(&self) -> bool {
+        matches!(
+            self,
+            ParseError::Lex(
+                LexError::UnterminatedSingleQuote { .. }
+                    | LexError::UnterminatedDoubleQuote { .. }
+                    | LexError::UnterminatedParameterExpansion { .. }
+                    | LexError::UnterminatedCommandSubstitution { .. }
+                    | LexError::UnterminatedBackquote { .. }
+                    | LexError::UnterminatedArithmeticExpansion { .. }
+                    | LexError::TrailingBackslash { .. }
+            ) | ParseError::UnexpectedEof { .. }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unterminated_quote_is_incomplete() {
+        let err = ParseError::Lex(LexError::UnterminatedDoubleQuote { start: 0 });
+        assert!(err.is_incomplete_input());
+    }
+
+    #[test]
+    fn trailing_backslash_is_incomplete() {
+        let err = ParseError::Lex(LexError::TrailingBackslash { pos: 3 });
+        assert!(err.is_incomplete_input());
+    }
+
+    #[test]
+    fn unexpected_eof_is_incomplete() {
+        let err = ParseError::UnexpectedEof {
+            expected: "a command".to_string(),
+        };
+        assert!(err.is_incomplete_input());
+    }
+
+    #[test]
+    fn unsupported_construct_is_not_incomplete() {
+        let err = ParseError::UnsupportedConstruct {
+            message: "here-documents are not yet supported".to_string(),
+            span: Span::new(0, 2),
+        };
+        assert!(!err.is_incomplete_input());
+    }
+
+    #[test]
+    fn unexpected_token_is_not_incomplete() {
+        let err = ParseError::UnexpectedToken {
+            found: "`;`".to_string(),
+            span: Span::new(0, 1),
+            expected: "a command".to_string(),
+        };
+        assert!(!err.is_incomplete_input());
+    }
+
+    #[test]
+    fn nesting_too_deep_is_not_incomplete() {
+        let err = ParseError::NestingTooDeep {
+            span: Span::new(4, 5),
+        };
+        assert!(!err.is_incomplete_input());
+    }
 }

@@ -25,12 +25,83 @@ fn parse_one_simple_command(input: &str) -> SimpleCommand {
         1,
         "expected no pipeline for {input:?}"
     );
-    let Command::Simple(cmd) = &item.and_or.first.commands[0];
+    let Command::Simple(cmd) = &item.and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
     cmd.clone()
 }
 
 fn plain_word(text: &str) -> Word {
     Word::new(vec![WordSegment::Literal(text.to_string())])
+}
+
+fn plain_words(texts: &[&str]) -> Vec<Word> {
+    texts.iter().map(|t| plain_word(t)).collect()
+}
+
+/// Parses `input`, panicking unless it produces exactly one
+/// [`CommandListItem`] whose `and_or` has no `&&`/`||` and whose single
+/// pipeline has no `|` — i.e. exactly one [`CompoundCommand`] — returning
+/// it.
+fn parse_one_compound_command(input: &str) -> CompoundCommand {
+    let list = parse_ok(input);
+    assert_eq!(
+        list.items.len(),
+        1,
+        "expected exactly one item for {input:?}"
+    );
+    let item = &list.items[0];
+    assert!(
+        item.and_or.rest.is_empty(),
+        "expected no &&/|| for {input:?}"
+    );
+    assert_eq!(
+        item.and_or.first.commands.len(),
+        1,
+        "expected no pipeline for {input:?}"
+    );
+    let Command::Compound(cmd) = &item.and_or.first.commands[0] else {
+        unreachable!("expected a Command::Compound for {input:?}")
+    };
+    cmd.clone()
+}
+
+/// Parses `input`, panicking unless it produces exactly one
+/// [`CommandListItem`] whose `and_or` has no `&&`/`||` and whose single
+/// pipeline has no `|` — i.e. exactly one [`FunctionDefinition`] —
+/// returning it.
+fn parse_one_function_definition(input: &str) -> FunctionDefinition {
+    let list = parse_ok(input);
+    assert_eq!(
+        list.items.len(),
+        1,
+        "expected exactly one item for {input:?}"
+    );
+    let item = &list.items[0];
+    assert!(
+        item.and_or.rest.is_empty(),
+        "expected no &&/|| for {input:?}"
+    );
+    assert_eq!(
+        item.and_or.first.commands.len(),
+        1,
+        "expected no pipeline for {input:?}"
+    );
+    let Command::Function(func) = &item.and_or.first.commands[0] else {
+        unreachable!("expected a Command::Function for {input:?}")
+    };
+    func.clone()
+}
+
+/// Extracts the single command name of `list`'s one-and-only
+/// [`SimpleCommand`] item, for terse assertions on a compound command's
+/// body contents.
+fn only_command_name(list: &CommandList) -> &str {
+    assert_eq!(list.items.len(), 1, "expected exactly one body item");
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
+    cmd.name.as_ref().unwrap().as_plain_literal().unwrap()
 }
 
 // ---- simple commands -----------------------------------------------------
@@ -59,6 +130,7 @@ fn leading_assignment_is_recognized_and_split() {
         vec![Assignment {
             name: "FOO".to_string(),
             value: plain_word("bar"),
+            is_append: false,
         }]
     );
     assert_eq!(cmd.name, Some(plain_word("echo")));
@@ -74,10 +146,12 @@ fn multiple_leading_assignments_keep_original_order() {
             Assignment {
                 name: "A".to_string(),
                 value: plain_word("1"),
+                is_append: false,
             },
             Assignment {
                 name: "B".to_string(),
                 value: plain_word("2"),
+                is_append: false,
             },
         ]
     );
@@ -91,10 +165,53 @@ fn bare_assignment_with_no_command_name_is_valid() {
         vec![Assignment {
             name: "FOO".to_string(),
             value: plain_word("bar"),
+            is_append: false,
         }]
     );
     assert_eq!(cmd.name, None);
     assert!(cmd.args.is_empty());
+}
+
+#[test]
+fn append_assignment_is_recognized_and_split() {
+    // Bash extension, not POSIX baseline -- confirmed against real bash:
+    // `x=foo; x+=bar` leaves `x` as `foobar`, not `bar`. This test only
+    // pins down *parsing* (the `Assignment::is_append` flag); the actual
+    // append-to-existing-value *semantics* are conch-shell-core's job.
+    let cmd = parse_one_simple_command("FOO+=bar echo hi");
+    assert_eq!(
+        cmd.assignments,
+        vec![Assignment {
+            name: "FOO".to_string(),
+            value: plain_word("bar"),
+            is_append: true,
+        }]
+    );
+    assert_eq!(cmd.name, Some(plain_word("echo")));
+}
+
+#[test]
+fn bare_append_assignment_with_no_command_name_is_valid() {
+    let cmd = parse_one_simple_command("FOO+=bar");
+    assert_eq!(
+        cmd.assignments,
+        vec![Assignment {
+            name: "FOO".to_string(),
+            value: plain_word("bar"),
+            is_append: true,
+        }]
+    );
+    assert_eq!(cmd.name, None);
+}
+
+#[test]
+fn a_lone_plus_with_no_following_equals_is_not_an_assignment() {
+    // `x+bar` (no `=` at all after the `+`) must not be misrecognized as
+    // *any* kind of assignment -- confirmed against real bash: this runs
+    // (and fails to find) a command literally named `x+bar`.
+    let cmd = parse_one_simple_command("x+bar");
+    assert!(cmd.assignments.is_empty());
+    assert_eq!(cmd.name, Some(plain_word("x+bar")));
 }
 
 #[test]
@@ -107,6 +224,7 @@ fn assignment_value_can_contain_expansion_sites() {
             value: Word::new(vec![WordSegment::Parameter(Parameter::Name(
                 "bar".to_string()
             ))]),
+            is_append: false,
         }]
     );
 }
@@ -235,7 +353,9 @@ fn pipeline_of_three_commands() {
     let pipeline = &list.items[0].and_or.first;
     assert_eq!(pipeline.commands.len(), 3);
     for (cmd, expected) in pipeline.commands.iter().zip(["a", "b", "c"]) {
-        let Command::Simple(cmd) = cmd;
+        let Command::Simple(cmd) = cmd else {
+            unreachable!("expected a Command::Simple")
+        };
         assert_eq!(cmd.name, Some(plain_word(expected)));
     }
 }
@@ -254,7 +374,9 @@ fn and_or_preserves_operator_between_each_pair() {
     let list = parse_ok("a && b || c");
     assert_eq!(list.items.len(), 1);
     let and_or = &list.items[0].and_or;
-    let Command::Simple(first) = &and_or.first.commands[0];
+    let Command::Simple(first) = &and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
     assert_eq!(first.name, Some(plain_word("a")));
     assert_eq!(and_or.rest.len(), 2);
     assert_eq!(and_or.rest[0].0, LogicalOp::And);
@@ -291,7 +413,59 @@ fn trailing_semicolon_does_not_add_an_empty_item() {
 fn trailing_ampersand_marks_async() {
     let list = parse_ok("sleep 1 &");
     assert_eq!(list.items.len(), 1);
-    assert_eq!(list.items[0].separator, Separator::Async);
+    assert!(matches!(list.items[0].separator, Separator::Async(_)));
+}
+
+#[test]
+fn async_separator_captures_the_and_or_lists_own_verbatim_source() {
+    // conch-shell-core's executor re-execs this exact text (generalizing
+    // SubshellBody's own byte-slicing mechanism) to run a backgrounded
+    // list as a genuinely separate process -- see Separator::Async's docs.
+    let Separator::Async(source) = &parse_ok("sleep 1 &").items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "sleep 1");
+}
+
+#[test]
+fn async_separator_captures_the_whole_and_or_chain_not_just_the_first_pipeline() {
+    // POSIX 2.9.3.1: `&` backgrounds the *entire* and_or list -- confirmed
+    // against real bash `false && echo no &` backgrounds the whole chain.
+    let list = parse_ok("false && echo no &");
+    assert_eq!(list.items.len(), 1);
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "false && echo no");
+}
+
+#[test]
+fn async_separator_source_excludes_a_following_sequential_item() {
+    let list = parse_ok("sleep 1 & echo started");
+    assert_eq!(list.items.len(), 2);
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "sleep 1");
+    assert_eq!(list.items[1].separator, Separator::None);
+}
+
+#[test]
+fn async_separator_inside_a_compound_commands_body_also_captures_source() {
+    // `parse_compound_list` (every loop/if/brace-group/case-arm body)
+    // shares the exact same item-parsing path as the top-level program --
+    // `&` inside a brace group's body must capture correctly too.
+    let list = parse_ok("{ sleep 1 & echo started; }");
+    let Command::Compound(compound) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Compound")
+    };
+    let CompoundCommandKind::BraceGroup(body) = &compound.kind else {
+        unreachable!("expected a BraceGroup")
+    };
+    let Separator::Async(source) = &body.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "sleep 1");
 }
 
 #[test]
@@ -338,24 +512,11 @@ fn whitespace_and_comment_only_input_parses_to_an_empty_list() {
 // ---- deferred-construct errors -----------------------------------------------
 
 #[test]
-fn subshell_is_a_clear_unsupported_construct_error() {
-    let err = parse("(echo hi)").unwrap_err();
-    match err {
-        ParseError::UnsupportedConstruct { message, .. } => {
-            assert!(message.contains("subshell"), "message was: {message}");
-            assert!(message.contains("Phase 3"), "message was: {message}");
-        }
-        other => panic!("expected UnsupportedConstruct, got {other:?}"),
-    }
-}
-
-#[test]
 fn heredoc_is_a_clear_unsupported_construct_error() {
     let err = parse("cat <<EOF").unwrap_err();
     match err {
         ParseError::UnsupportedConstruct { message, .. } => {
             assert!(message.contains("here-document"), "message was: {message}");
-            assert!(message.contains("Phase 2"), "message was: {message}");
         }
         other => panic!("expected UnsupportedConstruct, got {other:?}"),
     }
@@ -368,9 +529,12 @@ fn fd_duplicating_redirect_is_a_clear_unsupported_construct_error() {
 }
 
 #[test]
-fn trailing_subshell_after_a_valid_command_is_still_reported() {
+fn trailing_unmatched_rparen_after_a_valid_command_is_a_syntax_error() {
+    // '(' / ')' are now meaningful (subshells), so a stray trailing ')'
+    // with nothing to match is an ordinary syntax error, not a
+    // "not yet supported" one.
     let err = parse("a b )").unwrap_err();
-    assert!(matches!(err, ParseError::UnsupportedConstruct { .. }));
+    assert!(matches!(err, ParseError::UnexpectedToken { .. }));
 }
 
 // ---- genuine syntax errors ----------------------------------------------------
@@ -406,12 +570,15 @@ fn realistic_combined_input() {
     assert_eq!(first.and_or.rest[0].0, LogicalOp::And);
     assert_eq!(first.and_or.rest[1].0, LogicalOp::Or);
     assert_eq!(first.and_or.first.commands.len(), 2);
-    let Command::Simple(cmd1) = &first.and_or.first.commands[0];
+    let Command::Simple(cmd1) = &first.and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
     assert_eq!(
         cmd1.assignments,
         vec![Assignment {
             name: "FOO".to_string(),
             value: plain_word("bar"),
+            is_append: false,
         }]
     );
     assert_eq!(cmd1.name, Some(plain_word("cmd1")));
@@ -426,7 +593,819 @@ fn realistic_combined_input() {
     );
 
     let second = &list.items[1];
-    assert_eq!(second.separator, Separator::Async);
-    let Command::Simple(cmd5) = &second.and_or.first.commands[0];
+    assert!(matches!(second.separator, Separator::Async(_)));
+    let Command::Simple(cmd5) = &second.and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
     assert_eq!(cmd5.name, Some(plain_word("cmd5")));
+}
+
+// ---- compound commands: if/elif/else ----------------------------------------
+
+#[test]
+fn if_then_fi_no_else() {
+    let cmd = parse_one_compound_command("if true; then echo yes; fi");
+    let CompoundCommandKind::If(clause) = cmd.kind else {
+        unreachable!("expected If")
+    };
+    assert_eq!(clause.branches.len(), 1);
+    assert_eq!(only_command_name(&clause.branches[0].0), "true");
+    assert_eq!(only_command_name(&clause.branches[0].1), "echo");
+    assert_eq!(clause.else_branch, None);
+}
+
+#[test]
+fn if_then_else_fi() {
+    let cmd = parse_one_compound_command("if false; then echo a; else echo b; fi");
+    let CompoundCommandKind::If(clause) = cmd.kind else {
+        unreachable!("expected If")
+    };
+    assert_eq!(clause.branches.len(), 1);
+    assert!(clause.else_branch.is_some());
+    assert_eq!(
+        only_command_name(clause.else_branch.as_ref().unwrap()),
+        "echo"
+    );
+}
+
+#[test]
+fn if_elif_elif_else_fi_flattens_elif_chain() {
+    let cmd =
+        parse_one_compound_command("if a; then b; elif c; then d; elif e; then f; else g; fi");
+    let CompoundCommandKind::If(clause) = cmd.kind else {
+        unreachable!("expected If")
+    };
+    // 1 leading `if` + 2 `elif`s = 3 branches, flattened into one Vec
+    // rather than nested else_parts.
+    assert_eq!(clause.branches.len(), 3);
+    assert_eq!(only_command_name(&clause.branches[0].0), "a");
+    assert_eq!(only_command_name(&clause.branches[1].0), "c");
+    assert_eq!(only_command_name(&clause.branches[2].0), "e");
+    assert!(clause.else_branch.is_some());
+}
+
+#[test]
+fn if_clause_accepts_trailing_redirect() {
+    let cmd = parse_one_compound_command("if true; then echo hi; fi > out.log");
+    assert_eq!(
+        cmd.redirects,
+        vec![Redirect {
+            fd: None,
+            operator: RedirectOperator::Output,
+            target: plain_word("out.log"),
+        }]
+    );
+}
+
+#[test]
+fn unclosed_if_is_a_syntax_error() {
+    let err = parse("if true; then echo hi").unwrap_err();
+    assert!(matches!(err, ParseError::UnexpectedEof { .. }));
+}
+
+#[test]
+fn bare_fi_at_command_start_is_a_syntax_error() {
+    let err = parse("fi").unwrap_err();
+    assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+}
+
+// ---- compound commands: reserved-word position sensitivity ------------------
+
+#[test]
+fn reserved_word_as_plain_argument_is_not_reinterpreted() {
+    // `if` here is just an ordinary argument to `echo` -- it's not in
+    // command-start position, so it must never be treated as the
+    // reserved word. Confirmed against real bash: `echo if` prints `if`.
+    let cmd = parse_one_simple_command("echo if");
+    assert_eq!(cmd.name, Some(plain_word("echo")));
+    assert_eq!(cmd.args, vec![plain_word("if")]);
+}
+
+#[test]
+fn reserved_word_glued_to_a_closing_command_without_separator_stays_an_argument() {
+    // Confirmed against real bash: `if true; then echo hi fi; fi` prints
+    // `hi fi` -- the un-separated `fi` right after `hi` is a second
+    // argument to `echo`, not the clause's closing `fi` (only the
+    // *second*, properly separated `fi` closes it).
+    let cmd = parse_one_compound_command("if true; then echo hi fi; fi");
+    let CompoundCommandKind::If(clause) = cmd.kind else {
+        unreachable!("expected If")
+    };
+    let body = &clause.branches[0].1;
+    assert_eq!(body.items.len(), 1);
+    let Command::Simple(echo) = &body.items[0].and_or.first.commands[0] else {
+        unreachable!("expected Command::Simple")
+    };
+    assert_eq!(echo.args, plain_words(&["hi", "fi"]));
+}
+
+#[test]
+fn quoted_reserved_word_is_never_recognized() {
+    // POSIX 2.10.2 rule 1: quoting removes a reserved word's special
+    // meaning. `'if'` as a command name should just try (and fail) to
+    // run a program literally named "if", not be parsed as `if_clause`.
+    let cmd = parse_one_simple_command("'if' true");
+    assert_eq!(
+        cmd.name,
+        Some(Word::new(vec![WordSegment::SingleQuoted("if".into())]))
+    );
+}
+
+// ---- compound commands: while/until ------------------------------------------
+
+#[test]
+fn while_do_done() {
+    let cmd = parse_one_compound_command("while true; do echo hi; done");
+    let CompoundCommandKind::While(clause) = cmd.kind else {
+        unreachable!("expected While")
+    };
+    assert_eq!(only_command_name(&clause.condition), "true");
+    assert_eq!(only_command_name(&clause.body), "echo");
+}
+
+#[test]
+fn until_do_done() {
+    let cmd = parse_one_compound_command("until false; do echo hi; done");
+    let CompoundCommandKind::Until(clause) = cmd.kind else {
+        unreachable!("expected Until")
+    };
+    assert_eq!(only_command_name(&clause.condition), "false");
+    assert_eq!(only_command_name(&clause.body), "echo");
+}
+
+#[test]
+fn while_condition_without_separator_before_do_is_a_syntax_error() {
+    // Confirmed against real bash: `while true do ... done` (no `;` or
+    // newline before `do`) is a syntax error -- `do` right after `true`
+    // is swallowed as part of the *condition* command, not recognized
+    // as the reserved word, leaving no `do` left to find.
+    let err = parse("while true do echo hi; done").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedEof { .. } | ParseError::UnexpectedToken { .. }
+    ));
+}
+
+// ---- compound commands: for ---------------------------------------------------
+
+#[test]
+fn for_in_wordlist() {
+    let cmd = parse_one_compound_command("for x in a b c; do echo $x; done");
+    let CompoundCommandKind::For(clause) = cmd.kind else {
+        unreachable!("expected For")
+    };
+    assert_eq!(clause.name, "x");
+    assert_eq!(clause.words, Some(plain_words(&["a", "b", "c"])));
+    assert_eq!(only_command_name(&clause.body), "echo");
+}
+
+#[test]
+fn for_in_with_empty_wordlist() {
+    let cmd = parse_one_compound_command("for x in; do echo $x; done");
+    let CompoundCommandKind::For(clause) = cmd.kind else {
+        unreachable!("expected For")
+    };
+    assert_eq!(clause.words, Some(vec![]));
+}
+
+#[test]
+fn for_without_in_clause_is_words_none() {
+    let cmd = parse_one_compound_command("for x; do echo $x; done");
+    let CompoundCommandKind::For(clause) = cmd.kind else {
+        unreachable!("expected For")
+    };
+    assert_eq!(clause.name, "x");
+    assert_eq!(clause.words, None);
+}
+
+#[test]
+fn for_without_in_clause_and_without_separator_before_do() {
+    // Confirmed against real bash: `for x do echo $x; done` (no `in`
+    // clause *and* no `;`/newline before `do`) is valid -- right after
+    // `name`, only a reserved word (`in` or `do`) can be next, so `do`
+    // is recognized immediately either way.
+    let cmd = parse_one_compound_command("for x do echo $x; done");
+    let CompoundCommandKind::For(clause) = cmd.kind else {
+        unreachable!("expected For")
+    };
+    assert_eq!(clause.words, None);
+}
+
+#[test]
+fn for_in_wordlist_without_separator_before_do_is_a_syntax_error() {
+    // Confirmed against real bash: `for x in a b do ...; done` (an `in`
+    // wordlist, but no `;`/newline before `do`) is a syntax error -- the
+    // un-separated `do` is swallowed as a fourth wordlist item.
+    let err = parse("for x in a b do echo $x; done").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedEof { .. } | ParseError::UnexpectedToken { .. }
+    ));
+}
+
+#[test]
+fn for_invalid_name_is_a_syntax_error() {
+    let err = parse("for 1x in a; do echo $1x; done").unwrap_err();
+    assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+}
+
+// ---- compound commands: case/esac --------------------------------------------
+
+#[test]
+fn case_multiple_arms_and_patterns_per_arm() {
+    let cmd =
+        parse_one_compound_command("case $x in a|b) echo ab ;; c) echo c ;; *) echo other ;; esac");
+    let CompoundCommandKind::Case(clause) = cmd.kind else {
+        unreachable!("expected Case")
+    };
+    assert_eq!(clause.arms.len(), 3);
+    assert_eq!(clause.arms[0].patterns, plain_words(&["a", "b"]));
+    assert_eq!(only_command_name(&clause.arms[0].body), "echo");
+    assert_eq!(clause.arms[0].terminator, CaseTerminator::Break);
+    assert_eq!(clause.arms[1].patterns, plain_words(&["c"]));
+    assert_eq!(clause.arms[2].patterns, plain_words(&["*"]));
+}
+
+#[test]
+fn case_last_arm_may_omit_double_semicolon() {
+    // Confirmed against real bash: a `;` (or newline) is still required
+    // before `esac` even when the terminator itself is omitted --
+    // `... b) echo b esac` (no separator at all) is a syntax error
+    // (`esac` gets swallowed as a second argument to `echo`, same
+    // reserved-word-position rule as `fi`/`done`); `... b) echo b; esac`
+    // is what's actually valid.
+    let cmd = parse_one_compound_command("case $x in a) echo a ;; b) echo b; esac");
+    let CompoundCommandKind::Case(clause) = cmd.kind else {
+        unreachable!("expected Case")
+    };
+    assert_eq!(clause.arms.len(), 2);
+    assert_eq!(clause.arms[0].terminator, CaseTerminator::Break);
+    assert_eq!(clause.arms[1].terminator, CaseTerminator::None);
+}
+
+#[test]
+fn case_last_arm_without_separator_before_esac_is_a_syntax_error() {
+    let err = parse("case $x in a) echo a ;; b) echo b esac").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedEof { .. } | ParseError::UnexpectedToken { .. }
+    ));
+}
+
+#[test]
+fn case_arm_with_empty_body() {
+    let cmd = parse_one_compound_command("case $x in a) ;; esac");
+    let CompoundCommandKind::Case(clause) = cmd.kind else {
+        unreachable!("expected Case")
+    };
+    assert_eq!(clause.arms.len(), 1);
+    assert_eq!(clause.arms[0].body.items.len(), 0);
+}
+
+#[test]
+fn case_with_no_arms_at_all() {
+    let cmd = parse_one_compound_command("case $x in esac");
+    let CompoundCommandKind::Case(clause) = cmd.kind else {
+        unreachable!("expected Case")
+    };
+    assert_eq!(clause.arms.len(), 0);
+}
+
+#[test]
+fn case_arm_pattern_accepts_optional_leading_paren() {
+    let cmd = parse_one_compound_command("case $x in (a) echo a ;; esac");
+    let CompoundCommandKind::Case(clause) = cmd.kind else {
+        unreachable!("expected Case")
+    };
+    assert_eq!(clause.arms[0].patterns, plain_words(&["a"]));
+}
+
+#[test]
+fn case_fallthrough_extension_is_a_syntax_error_not_a_silent_misparse() {
+    // `;&` is a bash extension this parser deliberately doesn't decode
+    // (see CaseTerminator's docs) -- it must be rejected, not silently
+    // treated as `;;` or swallowed into the next arm's body.
+    let err = parse("case $x in a) echo a ;& b) echo b ;; esac").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedToken { .. } | ParseError::UnexpectedEof { .. }
+    ));
+}
+
+// ---- compound commands: subshell / brace group -------------------------------
+
+#[test]
+fn subshell_parses_as_a_compound_command() {
+    let cmd = parse_one_compound_command("(echo hi)");
+    let CompoundCommandKind::Subshell(subshell) = cmd.kind else {
+        unreachable!("expected Subshell")
+    };
+    assert_eq!(only_command_name(&subshell.body), "echo");
+    // The raw source text is what conch-shell-core::exec actually runs
+    // (real fork semantics) -- see SubshellBody's docs.
+    assert_eq!(subshell.source, "echo hi");
+}
+
+#[test]
+fn subshell_with_pipeline_and_redirect() {
+    let cmd = parse_one_compound_command("(echo hi; echo bye) > out.log");
+    let CompoundCommandKind::Subshell(subshell) = cmd.kind else {
+        unreachable!("expected Subshell")
+    };
+    assert_eq!(subshell.body.items.len(), 2);
+    assert_eq!(subshell.source, "echo hi; echo bye");
+    assert_eq!(
+        cmd.redirects,
+        vec![Redirect {
+            fd: None,
+            operator: RedirectOperator::Output,
+            target: plain_word("out.log"),
+        }]
+    );
+}
+
+#[test]
+fn subshell_source_excludes_the_parens_and_preserves_nested_ones() {
+    let cmd = parse_one_compound_command("( (echo hi) )");
+    let CompoundCommandKind::Subshell(subshell) = cmd.kind else {
+        unreachable!("expected Subshell")
+    };
+    // Byte-exact slice of the original source between the outer parens
+    // -- includes the surrounding whitespace verbatim (harmless once
+    // handed to `conch -c`, which ignores leading/trailing blanks) and
+    // preserves the inner subshell's own parens untouched.
+    assert_eq!(subshell.source, " (echo hi) ");
+}
+
+#[test]
+fn brace_group_parses_as_a_compound_command() {
+    let cmd = parse_one_compound_command("{ echo hi; }");
+    let CompoundCommandKind::BraceGroup(body) = cmd.kind else {
+        unreachable!("expected BraceGroup")
+    };
+    assert_eq!(only_command_name(&body), "echo");
+}
+
+#[test]
+fn brace_group_closing_brace_needs_a_preceding_separator() {
+    // Confirmed against real bash: `{ echo hi }` (no `;` before `}`) is
+    // a syntax error -- `}` glued onto the argument list is just
+    // another argument, not the closing brace.
+    let err = parse("{ echo hi }").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedEof { .. } | ParseError::UnexpectedToken { .. }
+    ));
+}
+
+#[test]
+fn brace_group_closing_brace_without_a_space_after_semicolon_is_fine() {
+    let cmd = parse_one_compound_command("{ echo hi;}");
+    let CompoundCommandKind::BraceGroup(body) = cmd.kind else {
+        unreachable!("expected BraceGroup")
+    };
+    assert_eq!(only_command_name(&body), "echo");
+}
+
+// ---- compound commands: nesting and pipelines ---------------------------------
+
+#[test]
+fn compound_command_can_be_a_pipeline_stage() {
+    let list = parse_ok("if true; then echo hi; fi | cat");
+    assert_eq!(list.items[0].and_or.first.commands.len(), 2);
+    assert!(matches!(
+        list.items[0].and_or.first.commands[0],
+        Command::Compound(_)
+    ));
+}
+
+#[test]
+fn nested_compound_commands() {
+    let cmd = parse_one_compound_command("while true; do if true; then echo hi; fi; done");
+    let CompoundCommandKind::While(clause) = cmd.kind else {
+        unreachable!("expected While")
+    };
+    assert_eq!(clause.body.items.len(), 1);
+    assert!(matches!(
+        clause.body.items[0].and_or.first.commands[0],
+        Command::Compound(_)
+    ));
+}
+
+#[test]
+fn deeply_nested_subshells_error_cleanly_instead_of_overflowing_the_stack() {
+    // See `parser::MAX_COMMAND_DEPTH`'s own docs: `parse_command` ->
+    // `parse_subshell` -> `parse_compound_list` -> ... -> `parse_command`
+    // is fully mutually recursive with no depth tracking before this
+    // guard existed, so enough subshell nesting overflowed the stack
+    // instead of producing any `ParseError`. 1,000 is comfortably past
+    // `MAX_COMMAND_DEPTH` (40) -- the guard fires well before the input
+    // is exhausted, so this input's raw size has no bearing on this
+    // test's own stack usage regardless of how deep it goes.
+    let source = format!("{}echo hi{}", "(".repeat(1_000), ")".repeat(1_000));
+    let err = parse(&source).unwrap_err();
+    assert!(matches!(err, ParseError::NestingTooDeep { .. }));
+}
+
+#[test]
+fn deeply_nested_brace_groups_error_cleanly_instead_of_overflowing_the_stack() {
+    // Same guard, reached via the *other* named recursion shape called
+    // out in the Phase 7 hardening pass -- `{ { { ... } } }` groups
+    // rather than subshells -- confirming the single counter in
+    // `parse_command` bounds both, not just whichever shape happened to
+    // be probed first.
+    let source = format!("{}echo hi;{}", "{ ".repeat(1_000), " }".repeat(1_000));
+    let err = parse(&source).unwrap_err();
+    assert!(matches!(err, ParseError::NestingTooDeep { .. }));
+}
+
+#[test]
+fn for_loop_with_no_in_clause_and_nested_if() {
+    let cmd = parse_one_compound_command("for x; do if true; then echo $x; fi; done");
+    let CompoundCommandKind::For(clause) = cmd.kind else {
+        unreachable!("expected For")
+    };
+    assert_eq!(clause.words, None);
+    assert_eq!(clause.body.items.len(), 1);
+}
+
+// ---- function definitions ------------------------------------------------
+
+#[test]
+fn posix_function_definition_with_brace_group_body() {
+    let func = parse_one_function_definition("foo() { echo hi; }");
+    assert_eq!(func.name, "foo");
+    let CompoundCommandKind::BraceGroup(body) = func.body.kind else {
+        unreachable!("expected BraceGroup")
+    };
+    assert_eq!(only_command_name(&body), "echo");
+}
+
+#[test]
+fn posix_function_definition_tolerates_blanks_around_parens() {
+    // Confirmed against real bash: blanks anywhere around `fname()`'s
+    // parens are fine -- and fall out for free here since whitespace was
+    // never tokenized to begin with.
+    let func = parse_one_function_definition("foo ( ) { echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn posix_function_definition_allows_a_newline_before_the_body() {
+    let func = parse_one_function_definition("foo()\n{ echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn posix_function_definition_body_can_be_any_compound_command() {
+    // POSIX `function_body` permits any compound command, not just a
+    // brace group -- confirmed against real bash: `foo() (echo hi)` runs
+    // the body in a subshell every time `foo` is called.
+    let func = parse_one_function_definition("foo() (echo hi)");
+    let CompoundCommandKind::Subshell(subshell) = func.body.kind else {
+        unreachable!("expected Subshell")
+    };
+    assert_eq!(subshell.source, "echo hi");
+}
+
+#[test]
+fn posix_function_definition_invalid_name_is_a_syntax_error() {
+    let err = parse("1foo() { echo hi; }").unwrap_err();
+    assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+}
+
+#[test]
+fn function_keyword_without_parens() {
+    // bash extension: the `function` keyword makes the `()` optional.
+    let func = parse_one_function_definition("function foo { echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn function_keyword_with_parens() {
+    let func = parse_one_function_definition("function foo() { echo hi; }");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::BraceGroup(_)));
+}
+
+#[test]
+fn function_keyword_body_can_be_any_compound_command() {
+    let func = parse_one_function_definition("function foo while true; do break; done");
+    assert_eq!(func.name, "foo");
+    assert!(matches!(func.body.kind, CompoundCommandKind::While(_)));
+}
+
+#[test]
+fn function_definition_can_be_followed_by_a_redirect() {
+    let func = parse_one_function_definition("foo() { echo hi; } > out.log");
+    assert_eq!(
+        func.body.redirects,
+        vec![Redirect {
+            fd: None,
+            operator: RedirectOperator::Output,
+            target: plain_word("out.log"),
+        }]
+    );
+}
+
+#[test]
+fn ordinary_command_name_glued_to_parens_without_an_immediate_close_paren_is_not_a_function() {
+    // `at_posix_function_definition` requires `Word '(' ')'` with nothing
+    // between the parens -- `foo(bar)` isn't that shape (there's a `bar`
+    // between them), so this must NOT be parsed as a function
+    // definition. It also isn't valid as an ordinary simple command
+    // (bash agrees: this is a syntax error), so the only assertion that
+    // matters here is that the parser doesn't misinterpret `(bar)` as
+    // part of a function definition it silently accepts.
+    let err = parse("foo(bar)").unwrap_err();
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedToken { .. } | ParseError::UnexpectedEof { .. }
+    ));
+}
+
+#[test]
+fn ordinary_command_is_not_misparsed_as_a_function_definition() {
+    let cmd = parse_one_simple_command("echo hi");
+    assert_eq!(cmd.name, Some(plain_word("echo")));
+}
+
+#[test]
+fn function_definition_can_be_a_pipeline_stage_target() {
+    // A function *definition* itself isn't piped into anything
+    // meaningful in real shells either, but it must still be parseable
+    // as one pipeline stage without the parser choking -- confirming
+    // `parse_command`'s function-definition dispatch composes with the
+    // rest of the grammar around it.
+    let list = parse_ok("foo() { echo hi; }; foo");
+    assert_eq!(list.items.len(), 2);
+    assert!(matches!(
+        list.items[0].and_or.first.commands[0],
+        Command::Function(_)
+    ));
+    assert!(matches!(
+        list.items[1].and_or.first.commands[0],
+        Command::Simple(_)
+    ));
+}
+
+// ---- alias expansion ------------------------------------------------------
+
+fn aliases(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn plain_alias_expands_to_a_command_name_and_extra_args() {
+    let table = aliases(&[("ll", "ls -la")]);
+    let list = parse_with_aliases("ll", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-la"]));
+}
+
+#[test]
+fn alias_replacement_combines_with_trailing_arguments_from_the_original_command() {
+    let table = aliases(&[("ll", "ls -la")]);
+    let list = parse_with_aliases("ll /tmp", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-la", "/tmp"]));
+}
+
+#[test]
+fn alias_replacement_can_introduce_a_real_pipe_operator() {
+    let table = aliases(&[("ll", "ls -la | less")]);
+    let list = parse_with_aliases("ll", &table).unwrap();
+    assert_eq!(list.items[0].and_or.first.commands.len(), 2);
+}
+
+#[test]
+fn chained_aliases_expand_through_multiple_levels() {
+    let table = aliases(&[("ll", "la -h"), ("la", "ls -a")]);
+    let list = parse_with_aliases("ll", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-a", "-h"]));
+}
+
+#[test]
+fn self_referential_alias_does_not_infinitely_expand() {
+    // Confirmed against real bash: `alias ls='ls -la'; ls` runs the
+    // *real* `ls` with `-la` appended, rather than looping forever.
+    let table = aliases(&[("ls", "ls -la")]);
+    let list = parse_with_aliases("ls", &table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!()
+    };
+    assert_eq!(cmd.name, Some(plain_word("ls")));
+    assert_eq!(cmd.args, plain_words(&["-la"]));
+}
+
+#[test]
+fn self_referential_alias_containing_a_pipe_errors_cleanly_instead_of_exhausting_memory() {
+    // Regression test for a fuzzer-found unbounded-memory bug: unlike
+    // the plain `alias ls='ls -la'` case above, `expanding`'s per-call
+    // self-reference guard does *not* stop this shape, because the
+    // vulnerable re-expansion happens across *separate* calls to
+    // `maybe_expand_alias` -- one per `parse_pipeline` loop iteration,
+    // each with its own fresh, empty `expanding` set. Every round
+    // doubles the pending parse work (`c` -> `c|c` -> re-enter
+    // `parse_pipeline`'s loop for the second `c` -> `c|c` again -> ...),
+    // reaching multiple gigabytes of resident memory within a few
+    // seconds on the real binary with no OS backstop to rely on
+    // (confirmed empirically, not simulated, before this guard existed).
+    // `MAX_ALIAS_EXPANSIONS` must stop this quickly and cleanly.
+    let table = aliases(&[("c", "c|c")]);
+    let err = parse_with_aliases("c", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn self_referential_alias_containing_a_semicolon_also_errors_cleanly() {
+    // Same underlying bug, reached via `;` (parse_compound_list's list
+    // loop) instead of `|` (parse_pipeline's) -- confirmed by this
+    // project's own fuzzing pass to reproduce identically. Proves the
+    // guard is shared across every list-operator shape, not `|`-specific.
+    let table = aliases(&[("c", "c;c")]);
+    let err = parse_with_aliases("c", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn self_referential_alias_containing_and_if_also_errors_cleanly() {
+    // Same bug, reached via `&&` (parse_and_or's loop).
+    let table = aliases(&[("c", "c&&c")]);
+    let err = parse_with_aliases("c", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn async_separator_source_is_correct_when_the_command_was_alias_expanded() {
+    // Regression test for a fuzzer-found bug: `Separator::Async`'s
+    // verbatim-source capture used to slice `self.source` (the
+    // *original*, unexpanded input) using a token span that could
+    // actually be relative to the alias's own replacement text instead
+    // -- silently capturing the literal, pre-expansion alias name
+    // instead of what the backgrounded job actually runs. Confirmed
+    // against real bash: `alias a='echo hi'; a &` backgrounds a job that
+    // prints `hi`, not one that tries (and fails) to run a command
+    // literally named `a`.
+    let table = aliases(&[("a", "echo hi")]);
+    let list = parse_with_aliases("a &", &table).unwrap();
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "echo hi");
+}
+
+#[test]
+fn async_separator_source_is_correct_when_the_alias_replacement_itself_contains_an_ampersand() {
+    // The specific minimized shape the fuzzer's `parse_with_aliases`
+    // target found: the alias replacement text itself introduces the
+    // `&` operator token whose span gets read as `amp_start` -- this
+    // must still be `self.source`-relative once the replacement has
+    // been spliced in, not relative to the (2-byte) replacement string
+    // that token was originally lexed from.
+    let table = aliases(&[("a", "echo hi &")]);
+    let list = parse_with_aliases("a", &table).unwrap();
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "echo hi");
+}
+
+#[test]
+fn fuzz_minimized_repro_no_longer_panics_on_a_cross_string_slice() {
+    // Close relative of the exact minimized `Arbitrary`-encoded repro
+    // from this project's own fuzzing pass (`fuzz/artifacts/
+    // parse_with_aliases/crash-alias-splice-cross-string-offset-minimized`,
+    // `source: "\u{1} "`, `aliases: {"\u{1}": "\u{1}&\u{1}"}`) -- a short
+    // source consisting solely of the alias name, whose replacement text
+    // is a *different length* than the name itself *and* contains a
+    // literal `&`. This specific length mismatch is what previously
+    // produced a `byte range starts at 2 but ends at 1` panic (an
+    // inverted/out-of-range slice) rather than the merely-wrong-but-not-
+    // panicking output the same-length case above happens to produce.
+    //
+    // Deliberately *not* the fuzzer's own exact alias table here: that
+    // one's replacement also happens to reintroduce its own name
+    // (`"\u{1}"` inside `"\u{1}&\u{1}"`) combined with `&`, which is
+    // *also* exactly Bug #3's self-referential-alias-with-a-list-operator
+    // memory-bomb shape (confirmed separately elsewhere in this test
+    // module) -- now correctly caught by `MAX_ALIAS_EXPANSIONS` instead
+    // of ever reaching this function's own cross-string-offset fix at
+    // all, which would make this test a confound of *two* different
+    // fixes rather than isolating this one. Using a distinct
+    // non-self-referential replacement name here isolates the
+    // cross-string-offset fix specifically.
+    let table = aliases(&[("x", "yy&yy")]);
+    let list = parse_with_aliases("x ", &table).unwrap();
+    let Separator::Async(source) = &list.items[0].separator else {
+        unreachable!("expected Separator::Async")
+    };
+    assert_eq!(source, "yy");
+}
+
+#[test]
+fn ampersand_shaped_self_referential_alias_is_caught_by_the_shared_expansion_budget() {
+    // The fuzzer's *exact* original minimized alias table (see the
+    // sibling test above for why it's not used to test the
+    // cross-string-offset fix specifically): confirms the interaction
+    // the team explicitly flagged -- `&` previously hit Bug #2's panic
+    // before Bug #3's memory-bomb pattern ever got a chance to manifest
+    // for this specific separator; now that the panic is fixed, this
+    // must be independently re-verified to still terminate cleanly via
+    // `MAX_ALIAS_EXPANSIONS` (Bug #3's shared guard) rather than newly
+    // exposing an unbounded `&`-flavored memory bomb.
+    let table = aliases(&[("\u{1}", "\u{1}&\u{1}")]);
+    let err = parse_with_aliases("\u{1} ", &table).unwrap_err();
+    assert!(matches!(err, ParseError::TooManyAliasExpansions { .. }));
+}
+
+#[test]
+fn subshell_source_is_correct_when_the_open_paren_came_from_an_alias() {
+    // Sibling of the async-separator bug above, for
+    // `Self::parse_subshell`'s own verbatim-body capture -- flagged as
+    // "likely related, not independently confirmed" in the original
+    // fuzzing report; this pins it down directly. Confirmed against
+    // real bash: `alias sub='( echo hi'; sub )` runs the subshell body
+    // `echo hi`.
+    let table = aliases(&[("sub", "( echo hi")]);
+    let list = parse_with_aliases("sub )", &table).unwrap();
+    let Command::Compound(compound) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Compound")
+    };
+    let CompoundCommandKind::Subshell(subshell) = &compound.kind else {
+        unreachable!("expected a Subshell")
+    };
+    assert_eq!(subshell.source.trim(), "echo hi");
+}
+
+#[test]
+fn ordinary_non_cyclic_alias_use_well_under_the_budget_is_unaffected() {
+    // The shared, cumulative budget must not fire for realistic,
+    // non-adversarial input -- many independent (non-self-referential)
+    // alias uses across one parse should keep working exactly as before.
+    let table = aliases(&[("g", "grep"), ("ll", "ls -la")]);
+    let list = parse_with_aliases("g x; ll; g y; ll /tmp", &table).unwrap();
+    assert_eq!(list.items.len(), 4);
+}
+
+#[test]
+fn alias_only_applies_to_an_unquoted_command_word() {
+    // Reuses `Word::as_plain_literal`'s exact quote-awareness -- a
+    // quoted use of a name that happens to match an alias must never
+    // expand, the same way a quoted reserved word never re-triggers
+    // reserved-word recognition.
+    let table = aliases(&[("ll", "ls -la")]);
+    let cmd = parse_one_simple_command_with_aliases("\"ll\"", &table);
+    // Quoted, so `as_plain_literal()` is `None` -- never even eligible
+    // for alias lookup at all, let alone expanded; `args` staying empty
+    // additionally confirms `ls -la` was never spliced in.
+    assert_eq!(cmd.name.as_ref().and_then(Word::as_plain_literal), None);
+    assert!(cmd.args.is_empty());
+}
+
+#[test]
+fn alias_applies_to_every_pipeline_stage_not_just_the_first() {
+    let table = aliases(&[("g", "grep")]);
+    let list = parse_with_aliases("echo hi | g x", &table).unwrap();
+    let Command::Simple(second) = &list.items[0].and_or.first.commands[1] else {
+        unreachable!()
+    };
+    assert_eq!(second.name, Some(plain_word("grep")));
+}
+
+#[test]
+fn an_undefined_name_is_never_touched() {
+    let table = aliases(&[("ll", "ls -la")]);
+    let cmd = parse_one_simple_command_with_aliases("echo ll", &table);
+    // `ll` here is an *argument*, not a command word -- never checked
+    // against the alias table at all, matching how reserved-word
+    // recognition also only ever applies at the command-word position.
+    assert_eq!(cmd.args, plain_words(&["ll"]));
+}
+
+fn parse_one_simple_command_with_aliases(
+    input: &str,
+    table: &std::collections::HashMap<String, String>,
+) -> SimpleCommand {
+    let list = parse_with_aliases(input, table).unwrap();
+    let Command::Simple(cmd) = &list.items[0].and_or.first.commands[0] else {
+        unreachable!("expected a Command::Simple")
+    };
+    cmd.clone()
 }

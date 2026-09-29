@@ -1,0 +1,136 @@
+# Phase 5 -- the `read` builtin.
+#
+# The first corpus in this crate to use `stdin` (as opposed to
+# `Invocation::StdinPipe`, which delivers the *script itself* over
+# stdin) -- see `case::Case::stdin`'s doc comment and `invoke.rs`'s
+# `configure_stdin` for the harness-level addition this needed. Every
+# case here runs via the default `dash-c` invocation with a separate
+# `stdin` field supplying whatever `read` should consume.
+#
+# All POSIX baseline except the no-variable-name form (`read` with no
+# operand defaulting to `$REPLY`), which dash rejects outright
+# (`arg count`) -- see that case's own `oracles = ["bash"]`.
+
+[[case]]
+name = "read-basic-single-variable"
+description = "read var reads one line of stdin into var, stripping the trailing newline"
+tags = ["builtins", "read"]
+oracles = ["bash", "sh"]
+stdin = "hello\n"
+script = '''
+read x
+echo "got:$x"
+'''
+
+[[case]]
+name = "read-multiple-variables-splits-on-ifs"
+description = "read a b c splits the line on IFS, assigning one word per variable"
+tags = ["builtins", "read"]
+oracles = ["bash", "sh"]
+stdin = "one two three\n"
+script = '''
+read a b c
+echo "a=$a b=$b c=$c"
+'''
+
+[[case]]
+name = "read-extra-words-all-go-to-the-last-variable"
+description = "when there are more words than variables, the last variable absorbs everything remaining (including embedded spaces), not just the next single word"
+tags = ["builtins", "read"]
+oracles = ["bash", "sh"]
+stdin = "one two three four\n"
+script = '''
+read a b
+echo "a=$a b=$b"
+'''
+
+[[case]]
+name = "read-fewer-words-leaves-remaining-variables-empty"
+description = "when there are fewer words than variables, the leftover variables are set to the empty string rather than left unset or causing an error"
+tags = ["builtins", "read"]
+oracles = ["bash", "sh"]
+stdin = "one\n"
+script = '''
+read a b c
+echo "a=$a b=$b c=$c"
+'''
+
+[[case]]
+name = "read-eof-with-no-input-returns-nonzero-but-still-runs-the-rest-of-the-line"
+description = "read returns a nonzero exit status on immediate EOF (no stdin data at all), but that failure doesn't stop a ;-joined command from still running afterward"
+tags = ["builtins", "read", "exit-status"]
+oracles = ["bash", "sh"]
+stdin = ""
+script = '''
+read x
+echo "exit:$? got:$x"
+'''
+
+[[case]]
+name = "read-custom-ifs-splits-on-the-configured-delimiter"
+description = "setting IFS before read changes what read splits words on -- here, a colon instead of whitespace"
+tags = ["builtins", "read", "ifs"]
+oracles = ["bash", "sh"]
+stdin = "one:two:three\n"
+script = '''
+IFS=: read a b c
+echo "a=$a b=$b c=$c"
+'''
+
+[[case]]
+name = "read-without-dash-r-treats-a-trailing-backslash-as-line-continuation"
+description = "without -r, a backslash immediately before the newline is a line-continuation: read keeps reading the next physical line and joins it (backslash and newline both removed), instead of stopping at the first newline"
+tags = ["builtins", "read", "backslash"]
+oracles = ["bash", "sh"]
+stdin = "one\\\ntwo\n"
+script = '''
+read x
+echo "got:[$x]"
+'''
+
+[[case]]
+name = "read-dash-r-treats-backslash-as-an-ordinary-literal-character"
+description = "-r disables the trailing-backslash line-continuation entirely: the backslash is kept as a literal character and reading stops at the very next newline"
+tags = ["builtins", "read", "backslash"]
+oracles = ["bash", "sh"]
+stdin = "one\\\ntwo\n"
+script = '''
+read -r x
+echo "got:[$x]"
+'''
+
+[[case]]
+name = "while-read-loop-consumes-one-line-per-iteration"
+description = "the extremely common while read line; do ...; done idiom: each loop iteration consumes exactly one line of stdin"
+tags = ["builtins", "read", "while"]
+oracles = ["bash", "sh"]
+stdin = "a\nb\nc\n"
+script = '''
+while read line; do
+  echo "line:$line"
+done
+'''
+
+[[case]]
+name = "while-read-loop-skips-a-final-line-with-no-trailing-newline-but-still-populates-the-variable"
+description = "a final line with no trailing newline hits EOF while read is still populating the variable, so read returns nonzero and the loop body never runs for it -- but the variable itself still holds that partial line's data afterward, since the loop isn't run in a subshell here"
+tags = ["builtins", "read", "while", "eof"]
+oracles = ["bash", "sh"]
+stdin = "a\nb\nc"
+script = '''
+while read line; do
+  echo "line:$line"
+done
+echo "leftover:$line"
+'''
+
+[[case]]
+name = "read-with-no-variable-name-defaults-to-reply-bash-only"
+description = "bash defaults to the $REPLY variable when read is given no variable operands at all; dash instead rejects this outright with an argument-count error (confirmed: \"read: arg count\"), so this is bash-only rather than a shared case"
+tags = ["builtins", "read", "bash-extension"]
+oracles = ["bash"]
+stdin = "hello\n"
+script = '''
+read
+echo "REPLY=[$REPLY] exit=$?"
+'''

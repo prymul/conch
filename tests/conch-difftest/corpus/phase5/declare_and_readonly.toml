@@ -1,0 +1,114 @@
+# Phase 5 -- `declare` (bash-only) and `readonly` (POSIX baseline).
+#
+# `declare` is a bash extension with no dash equivalent at all (confirmed:
+# `dash: declare: not found`, since dash simply doesn't register it as a
+# builtin and falls through to command lookup) -- every `declare` case
+# here is `oracles = ["bash"]` only. conch has no array support at all
+# (out of scope for the whole project so far, not just this phase), so
+# nothing here exercises `declare -a`/`declare -A`; every case sticks to
+# scalar-variable attributes (`-r`, `-i`, `-x`, `-f`).
+#
+# `readonly` (distinct from `declare -r`, and POSIX baseline, unlike
+# `declare`) gets its own coverage below, including a **genuine,
+# confirmed bash-vs-dash divergence**: both shells reject reassigning a
+# readonly variable, but bash's failure only aborts the rest of that one
+# *physical source line*, while dash's aborts the entire remaining
+# script outright -- the exact same "special built-in error" asymmetry
+# `known-differences.md` already documents for `${var:?message}` and
+# arithmetic division by zero, now confirmed for `readonly`/`unset`
+# violations too. See `known-differences.md`'s cross-shell-quirks
+# section for the consolidated writeup.
+
+[[case]]
+name = "declare-basic-assignment-is-equivalent-to-a-plain-assignment"
+description = "declare var=value with no attribute flags behaves exactly like an ordinary assignment"
+tags = ["builtins", "declare", "bash-extension"]
+oracles = ["bash"]
+script = '''
+declare x=5
+echo "$x"
+'''
+
+[[case]]
+name = "declare-dash-r-marks-a-variable-readonly"
+description = "declare -r is equivalent to readonly for a scalar variable: reassignment afterward fails"
+tags = ["builtins", "declare", "bash-extension"]
+oracles = ["bash"]
+script = '''
+declare -r x=5
+x=6 2>/dev/null
+echo "after:$x"
+'''
+
+[[case]]
+name = "declare-dash-i-forces-arithmetic-evaluation-on-assignment"
+description = "a variable with the integer (-i) attribute has every subsequent assignment evaluated as an arithmetic expression automatically, without needing $(( ))"
+tags = ["builtins", "declare", "bash-extension"]
+oracles = ["bash"]
+script = '''
+declare -i x
+x="2+3"
+echo "$x"
+'''
+
+[[case]]
+name = "declare-dash-x-is-equivalent-to-export"
+description = "declare -x marks a variable for export into child processes' environments, the same as the export builtin"
+tags = ["builtins", "declare", "bash-extension"]
+oracles = ["bash"]
+script = '''
+declare -x FOO=bar
+printenv FOO
+'''
+
+[[case]]
+name = "declare-dash-f-prints-a-functions-definition"
+description = "declare -f name prints the named function's definition in re-parseable form"
+tags = ["builtins", "declare", "bash-extension", "functions"]
+oracles = ["bash"]
+script = '''
+f() { echo hi; }
+declare -f f | head -1
+'''
+
+[[case]]
+name = "readonly-marks-an-existing-variable-without-changing-its-value"
+description = "readonly with just a name (no =value) marks an already-assigned variable readonly in place, leaving its current value untouched"
+tags = ["builtins", "readonly"]
+oracles = ["bash", "sh"]
+script = '''
+x=hi
+readonly x
+echo "$x"
+'''
+
+[[case]]
+name = "readonly-reassignment-on-the-same-line-is-rejected-on-both-shells"
+description = "attempting to reassign a readonly variable fails on both shells, and on this shared physical line (joined by ;) both abort before reaching the trailing echo -- differing only in their reported exit status (bash: 1, dash: 2), which is why this narrows compare to stdout only rather than also asserting on exit-code"
+tags = ["builtins", "readonly", "cross-shell-quirk"]
+oracles = ["bash", "sh"]
+compare = ["stdout"]
+script = '''
+readonly x=5; x=6 2>/dev/null; echo "still:$x"
+'''
+
+[[case]]
+name = "readonly-reassignment-failure-only-halts-the-current-line-on-bash"
+description = "confirmed bash-vs-dash divergence: when the failed reassignment and the recovery echo are on separate physical lines (not joined by ;), bash's error aborts only that one line and execution continues on the next -- dash still aborts the entire rest of the script regardless. This is a stdout-content difference (bash prints \"still:5\", dash prints nothing at all), not just wording, so this is bash-only rather than a shared case with narrowed compare"
+tags = ["builtins", "readonly", "cross-shell-quirk"]
+oracles = ["bash"]
+script = '''
+readonly x=5
+x=6 2>/dev/null
+echo "still:$x"
+'''
+
+[[case]]
+name = "unset-on-a-readonly-variable-is-non-fatal-on-bash-but-aborts-the-script-on-dash"
+description = "confirmed bash-vs-dash divergence: attempting to unset a readonly variable fails on both shells, but bash treats it as an ordinary non-fatal error and keeps running (printing \"still:5\"), while dash aborts the whole script immediately, even on this same physical line -- a stdout-content difference, so this is bash-only rather than a shared case. This also checks stderr: bash fully suppresses unset's own diagnostic when it's redirected on the very same command, the same wording-independent guarantee eval-syntax-error-is-non-fatal-on-bash checks (see that case's own note)"
+tags = ["builtins", "unset", "readonly", "cross-shell-quirk"]
+oracles = ["bash"]
+compare = ["stdout", "stderr", "exit-code"]
+script = '''
+readonly x=5; unset x 2>/dev/null; echo "still:$x"
+'''

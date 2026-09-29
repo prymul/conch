@@ -33,6 +33,7 @@ dependencies = [
 name = "conch-difftest"
 version = "0.3.1"
 dependencies = [
+ "conch-shell-core",
  "serde",
  "tempfile",
  "toml",
@@ -53,13 +54,18 @@ name = "conch-shell-builtins"
 version = "0.3.1"
 dependencies = [
  "conch-shell-core",
+ "conch-shell-parser",
+ "tempfile",
 ]
 
 [[package]]
 name = "conch-shell-core"
 version = "0.3.1"
 dependencies = [
+ "conch-shell-lexer",
  "conch-shell-parser",
+ "nix",
+ "tempfile",
  "thiserror",
 ]
 

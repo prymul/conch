@@ -1,0 +1,103 @@
+# Phase 5 -- the `printf` builtin. All POSIX baseline, so every case runs
+# against both `bash` and `sh`.
+
+[[case]]
+name = "printf-basic-string-specifier"
+description = "%s substitutes its argument as a plain string"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "%s\n" hello
+'''
+
+[[case]]
+name = "printf-multiple-specifiers-in-one-format"
+description = "a format string can mix multiple specifiers, consuming one argument each in order"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "%s is %d\n" age 30
+'''
+
+[[case]]
+name = "printf-percent-percent-is-a-literal-percent-sign"
+description = "%% in the format string produces a single literal % rather than consuming an argument"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "100%%\n"
+'''
+
+[[case]]
+name = "printf-recycles-the-format-string-to-consume-every-extra-argument"
+description = "when there are more arguments than the format string's specifiers can consume in one pass, printf reapplies the entire format string as many times as needed rather than stopping early or erroring"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "%s\n" one two three
+'''
+
+[[case]]
+name = "printf-missing-arguments-default-to-empty-string-and-zero"
+description = "if there are fewer arguments than specifiers (including zero arguments at all), %s defaults to an empty string and %d defaults to 0, rather than erroring"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "[%s][%d]\n"
+'''
+
+[[case]]
+name = "printf-c-specifier-takes-only-the-first-character"
+description = "%c prints only the first character of its argument, discarding the rest"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "%c\n" hello
+'''
+
+[[case]]
+name = "printf-field-width-and-zero-padding"
+description = "a numeric field width pads with spaces by default, or with zeros when the width is prefixed with 0"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "[%5d]\n" 3
+printf "[%05d]\n" 3
+'''
+
+[[case]]
+name = "printf-negative-width-left-justifies"
+description = "a negative field width left-justifies instead of the default right-justification"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "[%-5d]\n" 3
+'''
+
+[[case]]
+name = "printf-no-trailing-newline-in-format-means-none-is-added"
+description = "printf never appends a newline on its own -- if the format string doesn't end in \\n, the output runs straight into whatever comes next"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "%s" hello
+echo "|after"
+'''
+
+[[case]]
+name = "printf-backslash-t-escape-in-the-format-string"
+description = "printf interprets its own backslash escapes (like \\t) inside the format string, same as echo's -e mode would, but unconditionally"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "a\tb\n"
+'''
+
+[[case]]
+name = "printf-x-hex-specifier"
+description = "%x formats its argument as lowercase hexadecimal"
+tags = ["builtins", "printf"]
+oracles = ["bash", "sh"]
+script = '''
+printf "%x\n" 255
+'''

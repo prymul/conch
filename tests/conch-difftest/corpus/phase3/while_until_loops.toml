@@ -1,0 +1,122 @@
+# Phase 3 -- `while`/`until` loops, each with a `break` and a `continue`.
+#
+# All POSIX baseline, so every case runs against both `bash` and `sh`.
+# Counters use `$((...))` arithmetic expansion (Phase 2, already landed in
+# the corpus/grammar) purely as the least ambiguous way to drive a
+# bounded loop -- these cases are about while/until/break/continue
+# semantics, not arithmetic. As with `for_loops.toml`, the numeric-level
+# `break N`/`continue N` form gets its own dedicated `nested_loops.toml`.
+
+[[case]]
+name = "while-loop-basic-counts-up"
+description = "a while loop runs its body for as long as its condition succeeds"
+tags = ["control-flow", "while"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+while [ "$i" -le 3 ]; do
+  echo "$i"
+  i=$((i + 1))
+done
+'''
+
+[[case]]
+name = "while-loop-false-condition-never-runs-body"
+description = "a while loop whose condition is false from the start never executes its body"
+tags = ["control-flow", "while"]
+oracles = ["bash", "sh"]
+script = '''
+while false; do
+  echo should-not-print
+done
+echo done
+'''
+
+[[case]]
+name = "while-loop-zero-iterations-exit-status-is-zero"
+description = "a while loop that never runs its body exits 0, mirroring the same zero-iterations rule as if/for"
+tags = ["control-flow", "while", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+while false; do
+  :
+done
+echo $?
+'''
+
+[[case]]
+name = "while-loop-break-exits-immediately"
+description = "break inside a while loop stops iterating immediately, before the condition is re-checked"
+tags = ["control-flow", "while", "break"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+while [ "$i" -le 5 ]; do
+  if [ "$i" -eq 3 ]; then
+    break
+  fi
+  echo "$i"
+  i=$((i + 1))
+done
+'''
+
+[[case]]
+name = "while-loop-continue-skips-to-condition-recheck"
+description = "continue inside a while loop skips the rest of the current body and jumps straight to re-checking the condition"
+tags = ["control-flow", "while", "continue"]
+oracles = ["bash", "sh"]
+script = '''
+i=0
+while [ "$i" -lt 5 ]; do
+  i=$((i + 1))
+  if [ "$i" -eq 3 ]; then
+    continue
+  fi
+  echo "$i"
+done
+'''
+
+[[case]]
+name = "until-loop-basic-runs-while-condition-is-false"
+description = "an until loop runs its body for as long as its condition fails -- the mirror image of while"
+tags = ["control-flow", "until"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+until [ "$i" -gt 3 ]; do
+  echo "$i"
+  i=$((i + 1))
+done
+'''
+
+[[case]]
+name = "until-loop-break-exits-immediately"
+description = "break inside an until loop stops iterating immediately, same as in while/for"
+tags = ["control-flow", "until", "break"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+until [ "$i" -gt 5 ]; do
+  if [ "$i" -eq 3 ]; then
+    break
+  fi
+  echo "$i"
+  i=$((i + 1))
+done
+'''
+
+[[case]]
+name = "until-loop-continue-skips-to-condition-recheck"
+description = "continue inside an until loop skips the rest of the current body and jumps straight to re-checking the condition"
+tags = ["control-flow", "until", "continue"]
+oracles = ["bash", "sh"]
+script = '''
+i=0
+until [ "$i" -ge 5 ]; do
+  i=$((i + 1))
+  if [ "$i" -eq 3 ]; then
+    continue
+  fi
+  echo "$i"
+done
+'''

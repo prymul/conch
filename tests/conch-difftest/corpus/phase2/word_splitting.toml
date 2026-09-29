@@ -1,0 +1,198 @@
+# Phase 2 -- IFS-based word splitting of unquoted expansions.
+#
+# Every case here was explicitly left OUT of the Phase 1 `expansion.toml`
+# corpus (see that file's header) since word splitting is Phase 2 scope.
+# All of these agree fully between bash and dash, so every case uses
+# `oracles = ["bash", "sh"]`.
+#
+# A recurring pattern in this file: `set -- $x; echo $#; printf '<%s>'
+# "$@"; echo` is used instead of a `for` loop to make the exact field
+# count and exact field boundaries (including empty fields) both visible
+# in one line of output -- a `for` loop alone can't distinguish "one field
+# containing a space" from "two fields" just by eyeballing printed lines.
+
+[[case]]
+name = "word-splitting-default-ifs-collapses-runs-of-whitespace"
+description = "under the default IFS (space/tab/newline), consecutive whitespace between fields collapses to a single delimiter -- no empty fields are produced"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+x="a b  c"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-custom-single-character-ifs"
+description = "setting IFS to a single non-whitespace character splits on exactly that character"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=:
+x="a:b:c"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-non-whitespace-ifs-consecutive-delimiters-produce-an-empty-field"
+description = "unlike default whitespace IFS, consecutive occurrences of a non-whitespace IFS character each count as a separate delimiter, producing an empty field between them"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=:
+x="a::b"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-empty-ifs-disables-splitting-entirely"
+description = "setting IFS to the empty string disables word splitting altogether -- the whole expansion becomes exactly one field"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=
+x="a b c"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-unset-ifs-behaves-like-default-whitespace"
+description = "an explicitly unset IFS behaves the same as the default space/tab/newline value, not like empty IFS"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+unset IFS
+x="a   b"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-ifs-mixing-whitespace-and-non-whitespace-characters"
+description = "IFS can hold multiple characters at once, mixing whitespace and non-whitespace delimiters, each following its own collapsing rule"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=" ,"
+x="a, b,,c"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-non-whitespace-ifs-leading-and-trailing-produce-empty-fields"
+description = "a non-whitespace IFS delimiter at the very start or end of the value produces a leading/trailing empty field, unlike whitespace IFS which trims those positions instead"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=","
+x=",a,b,"
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-whitespace-ifs-leading-and-trailing-are-trimmed-not-empty-fields"
+description = "in contrast to the non-whitespace case above, leading/trailing whitespace-IFS delimiters are trimmed entirely rather than producing empty fields"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=" "
+x="  leading and trailing  "
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-applies-in-a-for-loops-in-list"
+description = "word splitting of an unquoted expansion happens before a for loop iterates over the resulting words"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+x="a b c"
+for w in $x; do
+  echo "[$w]"
+done
+'''
+
+[[case]]
+name = "word-splitting-does-not-apply-to-literal-words-in-source"
+description = "IFS only splits the RESULT of an expansion -- a literal word written directly in the script's source is never re-split on IFS characters, even ones that happen to appear inside it"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+note = "contrast with word-splitting-custom-single-character-ifs, which splits the same-shaped text once it comes from an expansion instead of the source directly"
+script = '''
+IFS=:
+for w in a:b::c; do
+  echo "[$w]"
+done
+'''
+
+[[case]]
+name = "word-splitting-is-suppressed-by-double-quotes"
+description = "double-quoting an expansion suppresses IFS word splitting entirely, regardless of what IFS is set to"
+tags = ["expansion", "word-splitting", "ifs", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=:
+x="a:b:c"
+set -- "$x"
+echo $#
+printf '<%s>' "$@"
+echo
+'''
+
+[[case]]
+name = "word-splitting-empty-unquoted-expansion-produces-zero-words"
+description = "an unquoted expansion of a set-but-empty variable produces zero words, not one empty word"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+x=
+set -- $x
+echo $#
+'''
+
+[[case]]
+name = "word-splitting-unset-unquoted-expansion-produces-zero-words"
+description = "same as the empty-variable case: an unquoted expansion of an unset variable also produces zero words"
+tags = ["expansion", "word-splitting", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+unset x
+set -- $x
+echo $#
+'''
+
+[[case]]
+name = "word-splitting-applies-to-unquoted-command-substitution-too"
+description = "IFS splitting isn't specific to parameter expansion -- it applies identically to an unquoted command substitution's captured output"
+tags = ["expansion", "word-splitting", "ifs", "command-substitution"]
+oracles = ["bash", "sh"]
+script = '''
+IFS=:
+x=$(printf "a:b:c")
+set -- $x
+echo $#
+printf '<%s>' "$@"
+echo
+'''

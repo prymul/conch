@@ -1,0 +1,46 @@
+# Phase 3b -- recursive function calls.
+#
+# A single-level function call can't distinguish "the executor pushes and
+# pops a real call stack" from "the executor just special-cases one level
+# of nesting" -- recursion is the thing that actually exercises the
+# call-stack mechanism repeatedly, both for positional parameters
+# (`countdown-counts-down-via-self-recursion`, each call's own `$1`) and
+# for `local` scoping (`local-variables-nest-correctly-across-recursive-
+# calls`, each call's own `local depth` surviving the deeper calls that
+# happen while it's still live). Both are POSIX baseline (recursion itself
+# needs nothing bash-specific), confirmed against real bash and real
+# `/bin/dash`.
+
+[[case]]
+name = "countdown-counts-down-via-self-recursion"
+description = "a function that calls itself with a decremented argument until a base case, proving positional parameters and the call stack both work across more than one level of nesting"
+tags = ["functions", "recursion", "positional-parameters"]
+oracles = ["bash", "sh"]
+script = '''
+countdown() {
+  if [ "$1" -le 0 ]; then
+    echo "liftoff"
+    return 0
+  fi
+  echo "$1"
+  countdown $(($1 - 1))
+}
+countdown 3
+'''
+
+[[case]]
+name = "local-variables-nest-correctly-across-recursive-calls"
+description = "each recursive call gets its own local depth -- proven by the fact that after a deeper call returns, the current call's own depth is still correct in the message printed on the way back out; the messages appear in unwind order (1, then 2, then 3 -- the reverse of the order the calls were made in), which only happens if each call's local depth survived every deeper call made while it was still on the stack"
+tags = ["functions", "recursion", "local"]
+oracles = ["bash", "sh"]
+script = '''
+recurse() {
+  local depth="$1"
+  if [ "$depth" -le 0 ]; then
+    return 0
+  fi
+  recurse $((depth - 1))
+  echo "back at depth=$depth"
+}
+recurse 3
+'''

@@ -49,6 +49,20 @@ pub struct Case {
     pub normalize: Vec<NormalizeRule>,
     /// The shell source under test.
     pub script: String,
+    /// Literal bytes fed to the shell's stdin, for cases that exercise
+    /// stdin-driven builtins (`read`, `mapfile`/`readarray` if conch ever
+    /// grows them, ...) -- nothing before Phase 5 needed this, since
+    /// Phase 1-4 are entirely argv/script-text driven. Independent of
+    /// `invocation`: for `dash-c`/`script-file`, this is the *only* thing
+    /// the child ever sees on stdin (which otherwise defaults to a closed
+    /// pipe, so an unguarded `read` would see immediate EOF rather than
+    /// block or read real input). Setting this together with
+    /// `invocation = "stdin-pipe"` is a validation error -- `stdin-pipe`
+    /// already uses the child's one stdin stream to deliver the *script
+    /// itself*, and there's no way to unambiguously share that same
+    /// stream with separate `read`-input data too.
+    #[serde(default)]
+    pub stdin: Option<String>,
     /// When set, this case is not compared against a live oracle at all;
     /// it pins conch's own expected output directly. Use this for
     /// deliberate, documented divergences from bash/sh behavior (see
@@ -89,6 +103,14 @@ impl Case {
         }
         if self.script.trim().is_empty() {
             return Err(format!("case {:?}: script must not be empty", self.name));
+        }
+        if self.stdin.is_some() && self.invocation == Invocation::StdinPipe {
+            return Err(format!(
+                "case {:?}: stdin can't be combined with invocation = \"stdin-pipe\" -- that \
+                 invocation mode already uses the child's stdin to deliver the script itself, so \
+                 there's no single stream both uses could unambiguously share",
+                self.name
+            ));
         }
         match &self.known_difference {
             Some(kd) => {
@@ -214,6 +236,7 @@ mod tests {
             compare: default_compare(),
             normalize: Vec::new(),
             script: "echo hi".to_string(),
+            stdin: None,
             known_difference: None,
             note: None,
             source_file: PathBuf::new(),
@@ -272,6 +295,23 @@ mod tests {
     }
 
     #[test]
+    fn stdin_combined_with_stdin_pipe_invocation_is_rejected() {
+        let mut case = minimal_case();
+        case.invocation = Invocation::StdinPipe;
+        case.stdin = Some("input\n".to_string());
+        let err = case.validate().unwrap_err();
+        assert!(err.contains("stdin-pipe"));
+    }
+
+    #[test]
+    fn stdin_combined_with_dash_c_invocation_is_allowed() {
+        let mut case = minimal_case();
+        case.invocation = Invocation::DashC;
+        case.stdin = Some("input\n".to_string());
+        assert!(case.validate().is_ok());
+    }
+
+    #[test]
     fn deserializes_a_minimal_case_file() {
         let toml = r#"
             [[case]]
@@ -291,6 +331,7 @@ mod tests {
             case.compare,
             vec![CompareTarget::Stdout, CompareTarget::ExitCode]
         );
+        assert_eq!(case.stdin, None);
     }
 
     #[test]
@@ -305,6 +346,7 @@ mod tests {
             normalize = ["workdir", "trailing-newline"]
             tags = ["builtins", "cd"]
             note = "needs workdir normalization since pwd embeds an absolute path"
+            stdin = "some input\n"
             script = '''
             cd sub
             pwd
@@ -326,5 +368,6 @@ mod tests {
             case.normalize,
             vec![NormalizeRule::Workdir, NormalizeRule::TrailingNewline]
         );
+        assert_eq!(case.stdin, Some("some input\n".to_string()));
     }
 }

@@ -8,3 +8,14 @@ repository.workspace = true
 
 [dependencies]
 conch-shell-core = { workspace = true }
+# Needed by `eval`/`source` (Phase 5): both re-invoke
+# `conch_shell_parser::parse` directly against the *current* `Shell` via
+# `conch_shell_core::exec_program` -- no re-exec, unlike a subshell/command
+# substitution -- see this crate's own `Eval`/`Source` docs for the full
+# "why" (POSIX: a variable assignment or `cd` inside either must persist in
+# the calling context exactly as if that text had been typed there
+# directly).
+conch-shell-parser = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

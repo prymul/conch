@@ -1,0 +1,108 @@
+# Phase 3b -- the quoted-vs-unquoted `$@`/`$*` field-splitting contrast.
+#
+# This is the trickiest positional-parameter semantic in the whole corpus,
+# so it gets dedicated, focused coverage rather than a case or two folded
+# into `positional_parameters.toml`. The core rules, each with its own
+# case below:
+#
+# - `"$@"` (double-quoted) expands to exactly one field *per positional
+#   parameter*, preserving any whitespace inside each one -- it behaves as
+#   if each positional parameter were individually double-quoted.
+#   `quoted-at-preserves-each-positional-parameter-as-one-field` proves
+#   this with a positional parameter that itself contains a space.
+# - `$@` unquoted is ordinary field splitting: the expansion is joined with
+#   spaces and then re-split on IFS, so a positional parameter containing
+#   whitespace gets split into multiple fields just like any other
+#   unquoted expansion would. `unquoted-at-splits-on-ifs-same-as-any-
+#   other-unquoted-expansion` uses the identical positional-parameter list
+#   as the quoted case above so the contrast is unambiguous: two fields
+#   quoted, three fields unquoted.
+# - `"$*"` (double-quoted) joins *every* positional parameter into a
+#   single field, using the first character of `$IFS` as the separator
+#   (falling back to a plain space if `IFS` is unset or empty) --
+#   `quoted-star-joins-into-one-field-using-the-first-ifs-character`.
+# - with zero positional parameters, `"$@"` contributes exactly zero
+#   fields to whatever it's used in -- not one empty field. This is the
+#   classic easy-to-get-wrong edge case, and it needs a command that
+#   actually distinguishes "zero fields" from "one empty field" to prove
+#   it: `zero-positional-parameters-quoted-at-iterates-zero-times` (a for
+#   loop's iteration count) and
+#   `zero-positional-parameters-quoted-at-passed-to-a-function-gives-zero-args`
+#   (a function's own `$#`) both do. See
+#   `printf-with-zero-positional-at-is-not-a-valid-zero-fields-demonstration`,
+#   below, for why `printf` specifically -- tried first, since it's an
+#   intuitive choice -- is *not* a valid way to demonstrate this.
+#
+# All of the above is POSIX baseline, so every case runs against both
+# `bash` and `sh`, confirmed directly against real bash and real
+# `/bin/dash` while building this corpus.
+
+[[case]]
+name = "quoted-at-preserves-each-positional-parameter-as-one-field"
+description = "\"$@\" with a positional parameter that itself contains a space still produces exactly one field per positional parameter -- the internal space is preserved rather than causing a further split"
+tags = ["positional-parameters", "field-splitting", "at-star"]
+oracles = ["bash", "sh"]
+script = '''
+set -- "a b" c
+for x in "$@"; do
+  echo "[$x]"
+done
+'''
+
+[[case]]
+name = "unquoted-at-splits-on-ifs-same-as-any-other-unquoted-expansion"
+description = "the identical positional-parameter list as quoted-at-preserves-each-positional-parameter-as-one-field, but with $@ left unquoted: ordinary IFS word splitting now applies, so \"a b\"'s internal space produces two separate fields instead of one -- three fields total instead of two"
+tags = ["positional-parameters", "field-splitting", "at-star"]
+oracles = ["bash", "sh"]
+script = '''
+set -- "a b" c
+for x in $@; do
+  echo "[$x]"
+done
+'''
+
+[[case]]
+name = "quoted-star-joins-into-one-field-using-the-first-ifs-character"
+description = "\"$*\" always produces exactly one field, joining every positional parameter together using the first character of $IFS (comma, here) as the separator"
+tags = ["positional-parameters", "field-splitting", "at-star", "ifs"]
+oracles = ["bash", "sh"]
+script = '''
+set -- a b c
+IFS=,
+echo "[$*]"
+'''
+
+[[case]]
+name = "zero-positional-parameters-quoted-at-iterates-zero-times"
+description = "with no positional parameters set at all, \"$@\" used as a for loop's word list produces zero fields, so the loop body never runs even once -- proving \"$@\" contributes zero fields, not one empty field, when there are no positional parameters"
+tags = ["positional-parameters", "field-splitting", "at-star"]
+oracles = ["bash", "sh"]
+script = '''
+count=0
+for x in "$@"; do
+  count=$((count + 1))
+done
+echo "iterations=$count"
+'''
+
+[[case]]
+name = "zero-positional-parameters-quoted-at-passed-to-a-function-gives-zero-args"
+description = "the same zero-fields property demonstrated a second, independent way: passing \"$@\" as a function call's arguments when there are no positional parameters gives the function $# = 0, not $# = 1 with an empty $1"
+tags = ["positional-parameters", "field-splitting", "at-star", "functions"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  echo "got $# args"
+}
+f "$@"
+'''
+
+[[case]]
+name = "printf-with-zero-positional-at-is-not-a-valid-zero-fields-demonstration"
+description = "a deliberate negative example, kept for documentation value: printf '%s\\n' \"$@\" with zero positional parameters still prints one blank line, identical to calling printf '%s\\n' with no operands at all -- printf always applies its format string at least once, substituting empty/zero for any missing conversion, so this output is NOT evidence that \"$@\" produced one field here. The for-loop and function-call cases above are the correct way to prove \"$@\" itself contributes zero fields; contrast their (zero) iteration/argument counts against this case's one line of output for the identical zero-positional-parameters situation"
+tags = ["positional-parameters", "field-splitting", "at-star"]
+oracles = ["bash", "sh"]
+script = '''
+printf "[%s]\n" "$@"
+echo done
+'''

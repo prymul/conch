@@ -8,4 +8,51 @@ repository.workspace = true
 
 [dependencies]
 conch-shell-parser = { workspace = true }
+# `PS1`'s own backslash-escape prompt grammar (`prompt.rs`) needs
+# `lex_dollar_expansion`/`lex_backquote_expansion` -- the same standalone
+# `$`/backquote-expansion-site recognizers `conch-shell-parser`'s own
+# arithmetic-expansion body scanner already reuses for its own "a third
+# quoting ruleset" reason (see that crate's module docs); this is a
+# fourth. Already pulled in transitively via `conch-shell-parser`, but
+# neither function is re-exported through that crate's own root, so this
+# needs to be a direct dependency too. `highlight.rs`'s `classify` needs
+# the same two functions for the identical "`$`/backquote expansion-site
+# recognition" reason.
+conch-shell-lexer = { workspace = true }
 thiserror = "2"
+# Process-group/terminal-control/signal-handling primitives Phase 4 job
+# control needs (`setpgid`/`tcsetpgrp`/`sigaction`/`waitpid`), following
+# the GNU libc manual's job-control chapter's protocol -- see this crate's
+# `job` module docs. `process`/`signal`/`term` are exactly the three
+# feature-gated modules that protocol needs (`unistd`'s `setpgid`/`Pid`,
+# `sys::wait`; `sys::signal`; `unistd`'s `tcsetpgrp`/`tcgetpgrp`
+# respectively) -- no broader `nix` surface than that is pulled in.
+# Already resolved at 0.31.3 transitively via `rustyline`'s own
+# termios/tty handling, so this adds no new version to the dependency
+# graph, only new feature flags on an already-locked crate. `fs` (Phase 5)
+# adds `sys::stat::{umask, Mode}` for the `umask` builtin -- there's no
+# umask-only wrapper anywhere else in the `nix`/`libc` surface already in
+# use here. `user`/`hostname` (Phase 6) add `unistd::{Uid, geteuid}` and
+# `unistd::gethostname`, wrapped as this crate's own `is_effective_root`/
+# `hostname` (`exec.rs`, alongside `current_umask`) purely so `conch`'s
+# binary crate -- which has no `nix` dependency of its own, matching
+# `conch-shell-builtins`'s own precedent for not needing one -- can read
+# them for `PS1`'s `\$`/`\h`/`\H` prompt escapes without adding one.
+# Confirmed by reading nix 0.31.3's own source that both are gated behind
+# their own Cargo features (`Uid`/`geteuid` behind `feature = "user"`,
+# `gethostname` behind `feature = "hostname"`), *not* already pulled in by
+# `process`/`signal`/`term`/`fs` the way `unistd::Pid`/`getpid`/`access`
+# already are -- easy to assume otherwise since all of these live in the
+# same `nix::unistd` module, but that module itself has no blanket
+# feature gate.
+nix = { version = "0.31", features = [
+    "process",
+    "signal",
+    "term",
+    "fs",
+    "user",
+    "hostname",
+] }
+
+[dev-dependencies]
+tempfile = "3"

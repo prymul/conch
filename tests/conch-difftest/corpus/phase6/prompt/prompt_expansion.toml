@@ -1,0 +1,158 @@
+# Phase 6 `PS1`/`PS2` prompt-expansion cases -- see `prompt_case.rs`'s
+# module doc comment for why this is a wholly separate schema from
+# `corpus/phase1-5/*.toml`'s `[[case]]` shape (no `script`/`invocation`/
+# `oracles`: the oracle is always real bash's `${VAR@P}` transform, driven
+# by `prompt_oracle.rs`, and the candidate is a direct, in-process call to
+# `conch_shell_core::expand_prompt` -- see `tests/phase6_prompt_differential.rs`
+# for the actual wiring, and the crate README's "Phase 6" section for the
+# full backstory).
+#
+# Every live-compared case here sticks to escapes/mechanisms confirmed
+# deterministic and safe for a live bash-oracle comparison (backslash
+# escapes, `promptvars` plain-variable expansion, `$?` forced to a known
+# value, hostname). Deliberately excluded, and why:
+#
+# - Wall-clock date/time escapes (`\d`/`\t`/`\T`/`\@`/`\A`/`\D{fmt}`) and
+#   interpreter-internal counters (`\j`/`\!`/`\#`) -- see
+#   `prompt_oracle.rs`'s "Non-determinism this module's callers must
+#   avoid" for the full reasoning.
+# - `\s`/`\v`/`\V` (shell name/version) -- `known_difference` cases below,
+#   not live comparisons: conch permanently and correctly reports its own
+#   name/version here, not bash's, so a live comparison would fail
+#   forever by design, exactly the scenario `known_difference` exists for
+#   (see `known-differences.md`, KD-0006).
+# - **`$(...)`/`` `...` `` command substitution inside a template** --
+#   deliberately *not* here despite `expand_prompt`'s own `promptvars`
+#   pass genuinely supporting it (confirmed correct in the real `conch`
+#   binary, and covered by `conch-shell-core::prompt`'s own unit tests for
+#   the surrounding guarantees -- e.g. `$?`-restoration, no re-scanning of
+#   a substituted value). It cannot be exercised through *this*
+#   differential harness specifically: `expand_prompt`'s command
+#   substitution is implemented by re-`exec`ing `std::env::current_exe()`
+#   as `conch -c <body>` (`conch-shell-core::expand::run_command_substitution`,
+#   shared with every other command-substitution site), and
+#   `current_exe()` inside *any* test binary (this crate's, or
+#   `conch-shell-core`'s own) resolves to that test binary itself, not the
+#   real `conch` binary -- confirmed empirically while wiring
+#   `phase6_prompt_differential.rs`: a `cmdsub:$(echo hi)` case candidate-
+#   side produced `cmdsub:` (empty, silently swallowed -- see
+#   `expand_prompt`'s own "a broken expansion site must never crash prompt
+#   display" doc comment) while the oracle correctly produced `cmdsub:hi`.
+#   This is **not** a product bug (real interactive conch runs the
+#   substitution correctly) and **not** a bash divergence either (conch
+#   and bash agree in real use) -- it's a structural harness limitation,
+#   the exact "a genuine testability boundary, not a bug to file" case
+#   this project's own guardrails describe. See the crate README's Phase 6
+#   section for the fuller writeup.
+
+[[case]]
+name = "hostname-escapes-are-reproducible-on-the-same-machine"
+description = "\\h/\\H both call the real gethostname(2) on both sides, so they agree deterministically on any single machine (including CI)"
+tags = ["ps1", "escapes"]
+template = "\\h|\\H"
+
+[[case]]
+name = "plain-text-with-no-escapes-expands-unchanged"
+description = "a template with no backslash escapes or $-expansions passes through byte-for-byte"
+tags = ["ps1", "baseline"]
+template = "just text> "
+
+[[case]]
+name = "dollar-escape-renders-a-plain-dollar-sign"
+description = "\\$ renders a literal $ (bash's escape for effective-UID-based $/# is moot for an ordinary, non-root user)"
+tags = ["ps1", "escapes"]
+template = "\\$ "
+
+[[case]]
+name = "literal-backslash-escape-renders-one-backslash"
+description = "\\\\ renders exactly one backslash, not two"
+tags = ["ps1", "escapes"]
+template = "a\\\\b"
+
+[[case]]
+name = "newline-escape-renders-a-real-newline"
+description = "\\n renders an actual newline byte, not the two characters backslash-n"
+tags = ["ps1", "escapes"]
+template = "a\\nb"
+
+[[case]]
+name = "working-directory-escape-reflects-the-current-directory"
+description = "\\w expands to the full current working directory"
+tags = ["ps1", "escapes", "cwd"]
+template = "\\w"
+normalize = ["workdir"]
+
+[[case]]
+name = "basename-working-directory-escape-shows-only-the-last-component"
+description = "\\W expands to only the current directory's basename, not the full path"
+tags = ["ps1", "escapes", "cwd"]
+template = "\\W"
+cwd_subdir = "myproject"
+
+[[case]]
+name = "exit-status-is-visible-via-plain-dollar-question-mark"
+description = "an unescaped $? in the template is expanded via promptvars against the forced last_status"
+tags = ["ps1", "promptvars", "exit-status"]
+template = "[$?]"
+last_status = 42
+
+[[case]]
+name = "zero-exit-status-is-the-default-and-is-still-visible"
+description = "last_status defaults to 0 and still participates in promptvars expansion (not merely 'absent')"
+tags = ["ps1", "promptvars", "exit-status"]
+template = "[$?]"
+
+[[case]]
+name = "env-var-is-visible-via-promptvars-parameter-expansion"
+description = "a template referencing $MY_VAR (not a backslash escape) is expanded via promptvars, same as an ordinary double-quoted string would be"
+tags = ["ps1", "promptvars"]
+template = "var:$MY_VAR"
+[[case.env]]
+name = "MY_VAR"
+value = "hello"
+
+[[case]]
+name = "bell-and-escape-and-octal-escapes-decode-to-the-right-bytes"
+description = "\\a (BEL), \\e (ESC), and a three-digit octal escape all decode to their literal byte values"
+tags = ["ps1", "escapes"]
+template = "\\101\\a\\e"
+
+[[case]]
+name = "bracket-non-printing-markers-are-dropped-on-both-sides"
+description = "\\[ and \\] (bash's readline-cursor-math markers) are dropped by both conch and bash, leaving only what's between them"
+tags = ["ps1", "escapes"]
+template = "\\[X\\]plain\\[Y\\]"
+
+[[case]]
+name = "shell-name-escape-is-a-known-difference"
+description = "\\s reports the invoking shell's own name -- conch permanently reports \"conch\", not bash's \"bash\""
+tags = ["ps1", "escapes", "known-difference"]
+template = "\\s"
+known_difference = { id = "KD-0006", expect = "conch" }
+
+# \v/\V (shell version) are the same kind of permanent divergence as \s
+# above (conch reports its own version, not bash's) but are deliberately
+# *not* a corpus case here: the expected string changes on every version
+# bump (this project's release process re-versions automatically on every
+# push to main -- see CLAUDE.md), and `known_difference.expect` is a
+# static, hand-pinned TOML string with no way to stay in sync with that
+# automatically. Documented in `known-differences.md` (KD-0006) instead of
+# pinned here -- exactly the same "not every divergence needs a corpus
+# case" precedent KD-0002/KD-0003 already established.
+
+[[case]]
+name = "ps2-continuation-prompt-expands-through-the-same-pipeline-as-ps1"
+description = "PS2 goes through an identical escape/promptvars pipeline to PS1, just against a different source variable"
+tags = ["ps2"]
+prompt = "ps2"
+template = "> "
+
+[[case]]
+name = "ps2-with-an-escape-and-an-env-var"
+description = "PS2's own pipeline still applies both backslash escapes and promptvars expansion together"
+tags = ["ps2", "escapes", "promptvars"]
+prompt = "ps2"
+template = "\\$ $MY_VAR> "
+[[case.env]]
+name = "MY_VAR"
+value = "cont"

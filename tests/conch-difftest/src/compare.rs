@@ -146,6 +146,7 @@ mod tests {
             compare,
             normalize,
             script: "echo hi".to_string(),
+            stdin: None,
             known_difference: None,
             note: None,
             source_file: PathBuf::new(),

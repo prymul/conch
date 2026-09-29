@@ -1,0 +1,129 @@
+# Phase 3 -- subshell `( ... )` vs. brace group `{ ...; }`.
+#
+# The whole point of this file is the contrast between the two: a subshell
+# runs its list in a *forked child process* with a copy of the shell's
+# state, so anything that mutates shell state inside it (`cd`, a variable
+# assignment, `exit`) is invisible to the parent once the subshell exits --
+# while a brace group runs its list in the *current* shell process, so the
+# same mutations persist afterward. Every pair of cases below (`subshell-*`
+# next to its `brace-*` counterpart) exercises the identical script shape
+# so the difference in outcome is attributable only to `( )` vs `{ }`.
+#
+# All POSIX baseline, so every case runs against both `bash` and `sh`.
+# Cases whose output embeds `pwd`/`$(pwd)` need `normalize = ["workdir"]`
+# since every run happens in its own freshly created temp directory -- see
+# ../../README.md#non-determinism-and-normalization.
+
+[[case]]
+name = "subshell-cd-does-not-leak-to-the-parent-shell"
+description = "cd run inside a subshell changes the subshell's own working directory only; the parent shell's cwd is unchanged once the subshell exits"
+tags = ["control-flow", "subshell", "cd"]
+oracles = ["bash", "sh"]
+normalize = ["workdir"]
+script = '''
+mkdir sub
+(
+  cd sub
+  echo "inside: $(pwd)"
+)
+echo "outside: $(pwd)"
+'''
+
+[[case]]
+name = "brace-group-cd-persists-in-the-parent-shell"
+description = "cd run inside a brace group changes the current shell's working directory, same as if the cd had been run directly with no grouping at all -- the direct contrast with the subshell case above"
+tags = ["control-flow", "brace-group", "cd"]
+oracles = ["bash", "sh"]
+normalize = ["workdir"]
+script = '''
+mkdir sub
+{
+  cd sub
+  echo "inside: $(pwd)"
+}
+echo "outside: $(pwd)"
+'''
+
+[[case]]
+name = "subshell-variable-assignment-does-not-leak-to-the-parent-shell"
+description = "a variable assigned inside a subshell is local to that subshell's copy of the shell state and reverts to the parent's original value once the subshell exits"
+tags = ["control-flow", "subshell", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+x=outside
+(
+  x=inside
+  echo "in subshell: $x"
+)
+echo "in parent: $x"
+'''
+
+[[case]]
+name = "brace-group-variable-assignment-persists-in-the-parent-shell"
+description = "a variable assigned inside a brace group is the same shell's variable, so the new value is still visible afterward -- the direct contrast with the subshell case above"
+tags = ["control-flow", "brace-group", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+x=outside
+{
+  x=inside
+  echo "in group: $x"
+}
+echo "after group: $x"
+'''
+
+[[case]]
+name = "subshell-exit-status-is-its-last-command-status"
+description = "a subshell's own exit status (as seen by the parent, e.g. via $?) is the exit status of the last command it ran"
+tags = ["control-flow", "subshell", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+(
+  false
+  true
+)
+echo $?
+'''
+
+[[case]]
+name = "exit-inside-a-subshell-only-terminates-the-subshell"
+description = "exit run inside a subshell terminates only that child process; the parent shell keeps running afterward and sees the subshell's exit code via $?"
+tags = ["control-flow", "subshell", "exit"]
+oracles = ["bash", "sh"]
+script = '''
+(
+  exit 5
+)
+echo "after: $?"
+echo still-running
+'''
+
+[[case]]
+name = "exit-inside-a-brace-group-terminates-the-whole-script"
+description = "exit run inside a brace group terminates the current shell process itself (there is no separate child process to exit out of), so nothing after it -- inside or outside the group -- ever runs; the direct contrast with the subshell exit case above"
+tags = ["control-flow", "brace-group", "exit"]
+oracles = ["bash", "sh"]
+script = '''
+{
+  exit 5
+  echo should-not-print
+}
+echo also-should-not-print
+'''
+
+[[case]]
+name = "subshell-nested-inside-brace-group-still-isolates-its-own-state"
+description = "a subshell nested inside a brace group still forks its own child process, so a variable assignment inside it doesn't leak out to the enclosing brace group or the parent shell, even though the brace group itself shares state with the parent"
+tags = ["control-flow", "subshell", "brace-group", "nested", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+x=outer
+{
+  (
+    x=inner
+    echo "deepest: $x"
+  )
+  echo "group-after-subshell: $x"
+}
+echo "final: $x"
+'''

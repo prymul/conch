@@ -1,0 +1,195 @@
+# Phase 2 -- pathname expansion (globbing): `*`, `?`, `[...]`, hidden-file
+# and no-match handling.
+#
+# Every case that lists more than one matched filename in a single
+# `echo`/`printf` starts with `export LC_ALL=C`: bash and dash sort
+# multi-match glob results using the active locale's collation order, and
+# a locale that collates case-insensitively-ish (the default on this
+# harness's dev machine and plausibly on CI too) orders "FILE3.TXT" very
+# differently from the plain-ASCII byte order dash falls back to under
+# `LC_ALL=C` -- confirmed empirically while building this corpus (both
+# shells agree once `LC_ALL=C` is forced explicitly inside the script,
+# independent of whatever locale the harness process itself inherited).
+# This is purely a display-order artifact of the oracle shells' own glob()
+# implementations, not a shell-compatibility question, so cases that don't
+# need multi-match ordering (a single match, or an intentional no-match)
+# skip it.
+#
+# One genuine bash-vs-dash divergence was found and is deliberately
+# **not** given a `["bash", "sh"]` case: a pattern with a literal leading
+# `.` (e.g. `.*`) matches the real directory entries `.` and `..`
+# themselves on dash, but bash's underlying glob() implementation never
+# returns `.`/`..` for a wildcard pattern (only for a pattern that is
+# exactly `.` or `..`, with no wildcard characters at all). See
+# `glob-leading-dot-pattern-dot-and-dotdot-handling-bash-only` below and
+# `../../known-differences.md`.
+#
+# A second divergence: bash treats `^` as a GNU libc fnmatch() extension
+# synonym for `!` (bracket-expression negation); POSIX only defines `!`
+# for that, and dash treats `^` as an ordinary literal member of the
+# bracket set. See `glob-bracket-caret-negation-is-a-bash-extension` below.
+
+[[case]]
+name = "glob-star-matches-all-non-hidden-files"
+description = "a bare * matches every filename in the directory except those starting with a literal dot"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch apple banana cherry
+export LC_ALL=C
+echo *
+'''
+
+[[case]]
+name = "glob-question-mark-matches-exactly-one-character"
+description = "? matches any single character, no more and no fewer"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch cat cot coat
+export LC_ALL=C
+echo c?t
+'''
+
+[[case]]
+name = "glob-star-with-literal-suffix-pattern"
+description = "*.txt matches only files ending in the literal suffix"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch file1.txt file2.txt file3.md
+export LC_ALL=C
+echo *.txt
+'''
+
+[[case]]
+name = "glob-no-match-stays-literal"
+description = "a glob pattern with no matching filename is left completely unexpanded -- the literal pattern text itself becomes the word, not an empty result or an error"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+echo nomatch*xyz
+'''
+
+[[case]]
+name = "glob-bare-star-in-empty-directory-stays-literal"
+description = "the same no-match-stays-literal rule applies to a bare * when the directory has no non-hidden entries at all"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+echo *
+'''
+
+[[case]]
+name = "glob-bracket-explicit-character-set"
+description = "[ab]* matches filenames whose first character is exactly a or b"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch apple banana cherry
+export LC_ALL=C
+echo [ab]*
+'''
+
+[[case]]
+name = "glob-bracket-negation-with-bang-is-posix-baseline"
+description = "[!x]* negates the bracket set using ! -- the POSIX-standard negation character, agreed on by both shells"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch apple banana cherry
+export LC_ALL=C
+echo [!a]*
+'''
+
+[[case]]
+name = "glob-bracket-caret-negation-is-a-bash-extension"
+description = "bash also accepts ^ as a bracket-negation synonym for ! (a glibc fnmatch() extension); dash treats ^ as an ordinary literal character in the bracket set instead, so [^a]* only matches names literally starting with ^ or a on dash -- these are genuinely different results, not just an ordering difference"
+tags = ["expansion", "globbing", "bash-extension"]
+oracles = ["bash"]
+script = '''
+touch apple banana cherry
+export LC_ALL=C
+echo [^a]*
+'''
+
+[[case]]
+name = "glob-leading-dot-required-to-match-hidden-files"
+description = "* alone never matches a filename starting with a literal dot; the pattern itself needs an explicit leading dot to match one"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch .hidden1 .hidden2 visible
+export LC_ALL=C
+echo *
+echo .h*
+'''
+
+[[case]]
+name = "glob-leading-dot-pattern-dot-and-dotdot-handling-bash-only"
+description = "a pattern with a literal leading dot (.*) would also literally match the directory entries . and .. themselves -- bash's glob() implementation special-cases those two names out unless the pattern is exactly \".\" or \"..\"; dash has no such special case and includes them, so this is bash-only rather than a shared-oracle case"
+tags = ["expansion", "globbing", "bash-extension"]
+oracles = ["bash"]
+script = '''
+touch .onlyhidden
+export LC_ALL=C
+echo .*
+'''
+
+[[case]]
+name = "glob-posix-character-class-upper"
+description = "[[:upper:]]* is a POSIX bracket character class, matching filenames starting with an uppercase letter"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch FILE.TXT file.txt
+export LC_ALL=C
+echo [[:upper:]]*
+'''
+
+[[case]]
+name = "glob-bracket-numeric-range"
+description = "a bracket range like [0-9] matches any digit"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch file1.txt file2.txt fileA.txt
+export LC_ALL=C
+echo *[0-9].txt
+'''
+
+[[case]]
+name = "glob-directory-entries-get-trailing-slash-with-slash-suffixed-pattern"
+description = "a pattern ending in a literal / only matches directories, and the slash is preserved in the result"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+mkdir subdir
+touch afile
+export LC_ALL=C
+echo */
+'''
+
+[[case]]
+name = "glob-pattern-held-in-a-variable-only-expands-when-unquoted"
+description = "a variable whose value looks like a glob pattern is expanded as one when referenced unquoted (after parameter expansion, per POSIX's expansion order), but stays literal text when double-quoted"
+tags = ["expansion", "globbing", "quoting"]
+oracles = ["bash", "sh"]
+script = '''
+touch one.txt two.txt
+export LC_ALL=C
+pat="*.txt"
+echo $pat
+echo "$pat"
+'''
+
+[[case]]
+name = "glob-bracket-range-narrower-than-available-matches"
+description = "a bracket range only matches the characters actually inside it, leaving out-of-range filenames unmatched"
+tags = ["expansion", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch a1 a2 a3 b1
+export LC_ALL=C
+echo a[1-2]
+'''

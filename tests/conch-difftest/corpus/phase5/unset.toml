@@ -1,0 +1,52 @@
+# Phase 5 -- the `unset` builtin. All POSIX baseline, so every case runs
+# against both `bash` and `sh`. See `declare_and_readonly.toml` for
+# `unset`'s interaction with a readonly variable, which turned out to
+# diverge genuinely between bash and dash and is documented there
+# alongside `readonly`'s own equivalent divergence.
+
+[[case]]
+name = "unset-removes-a-variable-entirely"
+description = "after unset, the variable expands to empty exactly as if it had never been assigned, not just cleared to an empty string"
+tags = ["builtins", "unset"]
+oracles = ["bash", "sh"]
+script = '''
+x=hi
+unset x
+echo "[${x}]"
+'''
+
+[[case]]
+name = "unset-accepts-multiple-names-at-once"
+description = "unset a b removes every named variable in one call"
+tags = ["builtins", "unset"]
+oracles = ["bash", "sh"]
+script = '''
+a=1
+b=2
+unset a b
+echo "[$a][$b]"
+'''
+
+[[case]]
+name = "unset-dash-v-explicitly-targets-a-variable"
+description = "-v is the default target kind (a variable) and can be spelled out explicitly"
+tags = ["builtins", "unset"]
+oracles = ["bash", "sh"]
+script = '''
+x=hi
+unset -v x
+echo "[${x}]"
+'''
+
+[[case]]
+name = "unset-dash-f-targets-a-function-instead-of-a-variable"
+description = "-f targets a shell function by name; after unsetting it, calling that name falls through to command lookup (command not found), the same as if the function had never been defined. This also checks stderr: both shells fully suppress the command-not-found diagnostic when redirected on the very same command -- unlike eval-syntax-error-is-non-fatal-on-bash's already-fixed equivalent for a builtin's own diagnostic (see that case's note), this is checking the separate external-command-lookup error path"
+tags = ["builtins", "unset", "functions"]
+oracles = ["bash", "sh"]
+compare = ["stdout", "stderr", "exit-code"]
+script = '''
+f() { echo hi; }
+unset -f f
+f 2>/dev/null
+echo "exit:$?"
+'''

@@ -1,0 +1,160 @@
+# Phase 3 -- `if`/`elif`/`else`/`fi` conditional compound commands.
+#
+# Every case here is POSIX baseline (no bash-only extensions involved), so
+# every case uses `oracles = ["bash", "sh"]`. `true`/`false` are used as
+# conditions where the specific truthiness source doesn't matter (mirroring
+# `corpus/phase1/lists.toml`'s style), with a couple of `[ ... ]` test-builtin
+# cases included for realism since numeric/string comparisons are the most
+# common real-world `if` condition.
+
+[[case]]
+name = "if-true-runs-then-branch"
+description = "a true condition runs the then-branch"
+tags = ["control-flow", "if"]
+oracles = ["bash", "sh"]
+script = '''
+if true; then
+  echo then-branch
+fi
+'''
+
+[[case]]
+name = "if-false-with-no-else-runs-nothing-and-exits-zero"
+description = "a bare if (no else) with a false condition runs neither branch, and the if statement itself exits 0 -- not the exit status of the failed condition"
+tags = ["control-flow", "if"]
+oracles = ["bash", "sh"]
+script = '''
+if false; then
+  echo should-not-print
+fi
+echo "if-exit:$?"
+echo after
+'''
+
+[[case]]
+name = "if-false-with-else-runs-else-branch"
+description = "a false condition with an else clause runs the else-branch instead of the then-branch"
+tags = ["control-flow", "if", "else"]
+oracles = ["bash", "sh"]
+script = '''
+if false; then
+  echo then-branch
+else
+  echo else-branch
+fi
+'''
+
+[[case]]
+name = "if-elif-chain-first-branch-matches"
+description = "in an if/elif/else chain, the first true condition's branch runs and later elif/else branches are skipped"
+tags = ["control-flow", "if", "elif"]
+oracles = ["bash", "sh"]
+script = '''
+if true; then
+  echo first
+elif true; then
+  echo second
+else
+  echo third
+fi
+'''
+
+[[case]]
+name = "if-elif-chain-middle-branch-matches"
+description = "when the initial if condition is false, control falls to the first true elif's branch"
+tags = ["control-flow", "if", "elif"]
+oracles = ["bash", "sh"]
+script = '''
+if false; then
+  echo first
+elif true; then
+  echo second
+else
+  echo third
+fi
+'''
+
+[[case]]
+name = "if-elif-chain-falls-through-to-final-else"
+description = "when the if condition and every elif condition are false, control falls all the way through to the final else"
+tags = ["control-flow", "if", "elif", "else"]
+oracles = ["bash", "sh"]
+script = '''
+if false; then
+  echo first
+elif false; then
+  echo second
+else
+  echo third
+fi
+'''
+
+[[case]]
+name = "if-elif-chain-with-multiple-elifs-and-no-final-else"
+description = "an elif chain may have more than one elif and omit the final else entirely; only the first matching branch runs"
+tags = ["control-flow", "if", "elif"]
+oracles = ["bash", "sh"]
+script = '''
+x=3
+if [ "$x" = 1 ]; then
+  echo one
+elif [ "$x" = 2 ]; then
+  echo two
+elif [ "$x" = 3 ]; then
+  echo three
+elif [ "$x" = 4 ]; then
+  echo four
+fi
+'''
+
+[[case]]
+name = "if-exit-status-reflects-executed-branch"
+description = "the if statement's own exit status is whatever the executed branch's last command exited with, not always 0"
+tags = ["control-flow", "if", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+if true; then
+  false
+fi
+echo $?
+'''
+
+[[case]]
+name = "if-condition-may-be-a-command-list"
+description = "an if condition is a full compound-list, not just a single simple command; only the exit status of the list's last command determines the branch taken"
+tags = ["control-flow", "if"]
+oracles = ["bash", "sh"]
+script = '''
+if false; true; then
+  echo printed
+fi
+'''
+
+[[case]]
+name = "if-nested-inside-if"
+description = "an if/else compound command nests freely inside another if's branch"
+tags = ["control-flow", "if", "nested"]
+oracles = ["bash", "sh"]
+script = '''
+if true; then
+  if false; then
+    echo inner-then
+  else
+    echo inner-else
+  fi
+fi
+'''
+
+[[case]]
+name = "if-uses-test-builtin-for-numeric-comparison"
+description = "a realistic if condition using the [ ... ] test command for a numeric comparison"
+tags = ["control-flow", "if", "test"]
+oracles = ["bash", "sh"]
+script = '''
+x=5
+if [ "$x" -gt 3 ]; then
+  echo big
+else
+  echo small
+fi
+'''

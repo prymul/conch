@@ -1,0 +1,136 @@
+# Phase 3 -- `case`/`esac` pattern matching: multiple patterns per arm
+# (`pat1|pat2)`), glob patterns (`*.txt)`, `a[0-9])`), and the default `*)`
+# arm. All POSIX baseline (bash's `;;&`/`;&` fallthrough terminators are a
+# bash-only extension and are deliberately not exercised here -- out of
+# this corpus's stated Phase 3 scope), so every case runs against both
+# `bash` and `sh`.
+
+[[case]]
+name = "case-matches-a-single-literal-pattern"
+description = "a case statement runs the arm whose pattern matches the subject word"
+tags = ["control-flow", "case"]
+oracles = ["bash", "sh"]
+script = '''
+x=foo
+case "$x" in
+  foo)
+    echo matched-foo
+    ;;
+  bar)
+    echo matched-bar
+    ;;
+esac
+'''
+
+[[case]]
+name = "case-multiple-patterns-per-arm-separated-by-pipe"
+description = "pat1|pat2) matches either pattern for the same arm"
+tags = ["control-flow", "case", "multiple-patterns"]
+oracles = ["bash", "sh"]
+script = '''
+for x in cat dog bird; do
+  case "$x" in
+    cat|dog)
+      echo "$x is a common pet"
+      ;;
+    *)
+      echo "$x is something else"
+      ;;
+  esac
+done
+'''
+
+[[case]]
+name = "case-glob-suffix-pattern-matches-file-extension"
+description = "a glob pattern like *.txt) matches based on shell pattern rules, the same as pathname expansion patterns"
+tags = ["control-flow", "case", "glob"]
+oracles = ["bash", "sh"]
+script = '''
+for f in report.txt image.png notes.txt; do
+  case "$f" in
+    *.txt)
+      echo "$f is text"
+      ;;
+    *)
+      echo "$f is other"
+      ;;
+  esac
+done
+'''
+
+[[case]]
+name = "case-bracket-glob-pattern-matches-a-character-class"
+description = "a bracket expression inside a case pattern (a[0-9]) matches like it does in pathname expansion"
+tags = ["control-flow", "case", "glob"]
+oracles = ["bash", "sh"]
+script = '''
+for code in a1 a2 b1; do
+  case "$code" in
+    a[0-9])
+      echo "$code matches a-digit"
+      ;;
+    *)
+      echo "$code no match"
+      ;;
+  esac
+done
+'''
+
+[[case]]
+name = "case-default-star-arm-catches-unmatched-values"
+description = "a bare *) arm at the end acts as a default, matching anything no earlier arm matched"
+tags = ["control-flow", "case", "default"]
+oracles = ["bash", "sh"]
+script = '''
+x=zzz
+case "$x" in
+  foo)
+    echo foo
+    ;;
+  bar)
+    echo bar
+    ;;
+  *)
+    echo default
+    ;;
+esac
+'''
+
+[[case]]
+name = "case-no-matching-pattern-and-no-default-arm-runs-nothing"
+description = "when no arm's pattern matches and there is no default *) arm, the case statement runs no arm at all and execution continues normally afterward"
+tags = ["control-flow", "case"]
+oracles = ["bash", "sh"]
+script = '''
+x=zzz
+case "$x" in
+  foo) echo foo ;;
+  bar) echo bar ;;
+esac
+echo after
+'''
+
+[[case]]
+name = "case-with-no-matching-arm-exits-zero"
+description = "a case statement that matches no arm exits 0, not an error"
+tags = ["control-flow", "case", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+x=zzz
+case "$x" in
+  foo) echo foo ;;
+esac
+echo $?
+'''
+
+[[case]]
+name = "case-exit-status-is-the-matched-arm-last-command-status"
+description = "the case statement's own exit status is whatever the matched arm's last command exited with"
+tags = ["control-flow", "case", "exit-status"]
+oracles = ["bash", "sh"]
+script = '''
+case yes in
+  yes) false ;;
+esac
+echo $?
+'''

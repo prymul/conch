@@ -49,25 +49,41 @@
 //! on an expansion result: splitting, globbing, and dropping the
 //! now-unneeded quote-segment wrappers).
 //!
-//! # What Phase 2 will build on this
+//! # What Phase 2 built on this
 //!
 //! [`WordSegment::ComplexParameterExpansion`], [`WordSegment::CommandSubstitution`],
 //! and [`WordSegment::ArithmeticExpansion`] all carry their body as a
-//! **verbatim raw string**, not further parsed. This crate has already
+//! **verbatim raw string**, not further parsed. This crate had already
 //! done the hard, error-prone part (finding the correct boundary through
 //! arbitrary nested quoting — see `lexer.rs`'s module docs for the
 //! pathological cases this was checked against, empirically, against real
-//! bash); Phase 2 can parse `ComplexParameterExpansion`'s body into POSIX
-//! 2.6.2 operators, and recursively invoke `conch-shell-parser`'s own
-//! entry point on a `CommandSubstitution`'s body, without needing any
-//! changes here.
+//! bash); Phase 2's `conch-shell-parser` parses `ComplexParameterExpansion`'s
+//! body into POSIX 2.6.2 operators and `ArithmeticExpansion`'s body into an
+//! arithmetic-expression AST, and recursively invokes its own entry point
+//! on a `CommandSubstitution`'s body.
+//!
+//! That turned out to need a handful of small, purely *additive* changes
+//! here after all — not to boundary-finding (still untouched and correct),
+//! but because Phase 2 needs to *re-lex* a `${...}` operand word and an
+//! arithmetic body's expansion sites using the exact same
+//! quoting/escaping rules this crate already uses internally, and
+//! duplicating that logic in `conch-shell-parser` would have been exactly
+//! the kind of subtly-diverging-copy this project treats as a correctness
+//! risk. See [`lex_word_body`], [`lex_double_quoted_body`],
+//! [`lex_dollar_expansion`], [`lex_backquote_expansion`], and
+//! [`match_bare_parameter`] — all reuses of this crate's existing internal
+//! scanning, exposed rather than duplicated, and all still no-ops for
+//! ordinary [`lex`] behavior.
 
 mod error;
 mod lexer;
 mod token;
 
 pub use error::LexError;
-pub use lexer::{Lexer, lex};
+pub use lexer::{
+    Lexer, lex, lex_backquote_expansion, lex_dollar_expansion, lex_double_quoted_body,
+    lex_word_body, match_bare_parameter,
+};
 pub use token::{
     CommandSubstitution, Operator, Parameter, Span, SpecialParameter, SubstitutionStyle, Token,
     TokenKind, Word, WordSegment,

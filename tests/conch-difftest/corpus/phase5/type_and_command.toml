@@ -1,0 +1,82 @@
+# Phase 5 -- `type` and `command`.
+#
+# `type`'s plain (no-flag) output text happens to read identically on
+# bash and dash for the two common cases exercised here (a builtin, an
+# external command) -- confirmed empirically -- so those two are shared
+# cases despite `type`'s output generally being the kind of
+# human-readable, implementation-specific text this crate is usually wary
+# of comparing verbatim (see "Why stderr isn't compared by default" in
+# the README for the general concern this echoes). `type -t` (the
+# machine-parseable, single-word-output form) is a bash-only extension:
+# dash's `type` doesn't recognize `-t` as a flag at all and instead tries
+# to look up a command literally named `-t` (confirmed:
+# `-t: not found` printed as a spurious extra line before the real
+# answer) -- so every `-t`-based case here is bash-only.
+
+[[case]]
+name = "type-plain-identifies-a-builtin"
+description = "type name reports that a shell builtin is, in fact, a shell builtin -- and the exact wording happens to match between bash and dash for this case"
+tags = ["builtins", "type"]
+oracles = ["bash", "sh"]
+script = '''
+type echo
+'''
+
+[[case]]
+name = "type-plain-identifies-an-external-command-and-its-resolved-path"
+description = "type name for an external command reports its full resolved path -- again, matching wording between bash and dash for this common case"
+tags = ["builtins", "type"]
+oracles = ["bash", "sh"]
+script = '''
+type ls
+'''
+
+[[case]]
+name = "type-dash-t-prints-a-single-machine-readable-word-bash-only"
+description = "-t (bash-only, see this file's header) prints just one of builtin/file/function/alias/keyword, without any of the surrounding human-readable sentence -- much more useful for scripting than parsing type's plain prose output"
+tags = ["builtins", "type", "bash-extension"]
+oracles = ["bash"]
+script = '''
+type -t echo
+type -t ls
+'''
+
+[[case]]
+name = "type-dash-t-of-an-unknown-command-fails"
+description = "type -t of a name that doesn't resolve to anything prints nothing and exits nonzero, rather than printing an error sentence"
+tags = ["builtins", "type", "bash-extension", "error-handling"]
+oracles = ["bash"]
+script = '''
+type -t nonexistent-cmd-xyz
+echo "exit:$?"
+'''
+
+[[case]]
+name = "command-bypasses-a-shell-function-of-the-same-name"
+description = "the whole point of the command builtin: it skips function (and alias) lookup for its argument, going straight to the builtin/external command of that name instead"
+tags = ["builtins", "command"]
+oracles = ["bash", "sh"]
+script = '''
+echo() { printf "function-echo\n"; }
+echo hi
+command echo hi
+'''
+
+[[case]]
+name = "command-dash-v-prints-the-resolved-form-of-a-name"
+description = "command -v is the POSIX-portable way to ask \"how would this name resolve\" -- for a builtin, it just prints the name itself"
+tags = ["builtins", "command"]
+oracles = ["bash", "sh"]
+script = '''
+command -v echo
+'''
+
+[[case]]
+name = "command-dash-v-of-an-unknown-name-prints-nothing"
+description = "command -v of a name that doesn't resolve to anything prints nothing on either shell -- both agree on that, but their nonzero exit statuses for this differ (bash: 1, dash: 127), so this narrows compare to stdout only rather than also asserting on the specific exit code"
+tags = ["builtins", "command", "cross-shell-quirk"]
+oracles = ["bash", "sh"]
+compare = ["stdout"]
+script = '''
+command -v nonexistent-cmd-xyz
+'''

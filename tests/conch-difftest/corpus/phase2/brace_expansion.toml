@@ -1,0 +1,101 @@
+# Phase 2 -- brace expansion: `{a,b,c}`, `{1..5}`, and nested/cross-product
+# forms.
+#
+# Brace expansion is a **bash extension, not POSIX** -- POSIX `sh` (and
+# dash, the `sh` used as this repo's POSIX oracle) never expands `{...}`
+# at all; it's passed through as literal text. Every case in this file
+# therefore uses `oracles = ["bash"]` only. See
+# `../../known-differences.md` ("Bash extensions not in the POSIX
+# baseline") for the full list of constructs in this corpus that share
+# this shape (bash-only, dash left out deliberately rather than expected
+# to agree).
+#
+# Brace expansion is purely lexical/textual: it happens before parameter
+# ($VAR), command substitution, and pathname (glob) expansion in POSIX's
+# expansion order (bash performs it first of all, since it isn't POSIX's
+# order to begin with -- it's bash's own addition slotted in ahead of
+# everything else). `brace-expansion-runs-before-parameter-expansion`
+# below is the one case that specifically demonstrates that ordering.
+
+[[case]]
+name = "brace-expansion-comma-list"
+description = "{a,b,c} expands to three separate words, comma-joined alternatives"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {a,b,c}
+'''
+
+[[case]]
+name = "brace-expansion-numeric-range"
+description = "{1..5} expands to an ascending numeric sequence"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {1..5}
+'''
+
+[[case]]
+name = "brace-expansion-numeric-range-with-step"
+description = "{1..10..2} expands to a numeric sequence stepping by 2"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {1..10..2}
+'''
+
+[[case]]
+name = "brace-expansion-alpha-range"
+description = "{a..e} expands to an ascending alphabetic sequence"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {a..e}
+'''
+
+[[case]]
+name = "brace-expansion-prefix-and-suffix"
+description = "text immediately surrounding a brace group is preserved as a literal prefix/suffix on every alternative"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo file{1,2,3}.txt
+'''
+
+[[case]]
+name = "brace-expansion-nested"
+description = "a brace group nested inside another alternative expands both levels"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {a,b{1,2}}
+'''
+
+[[case]]
+name = "brace-expansion-cross-product"
+description = "two adjacent brace groups expand as a cross product of their alternatives"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {a,b}{1,2}
+'''
+
+[[case]]
+name = "brace-expansion-without-comma-or-range-stays-literal"
+description = "a {...} group with neither a comma nor a .. range is not brace expansion at all -- it's passed through literally, braces included"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+script = '''
+echo {only}
+'''
+
+[[case]]
+name = "brace-expansion-runs-before-parameter-expansion"
+description = "brace expansion splits on the literal comma first; each resulting word is then parameter-expanded normally, so $x inside a brace item expands using the value assigned to x"
+tags = ["expansion", "brace"]
+oracles = ["bash"]
+note = "demonstrates brace expansion's position as the very first expansion step, ahead of $-expansion, in bash's (non-POSIX) expansion order"
+script = '''
+x=hi
+echo {$x,bye}
+'''

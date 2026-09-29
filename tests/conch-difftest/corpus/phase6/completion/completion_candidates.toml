@@ -1,0 +1,93 @@
+# Phase 6 command-position tab-completion cases -- see
+# `completion_case.rs`'s module doc comment for the full schema rationale
+# (a third, separate schema alongside `case.rs`/`prompt_case.rs`) and
+# scoping (`command_candidates` only ever covers command position;
+# argument-position filename completion has no `Shell`-dependent pure core
+# to test at all, and real conch/bash builtin name *rosters* are
+# deliberately never compared against each other -- see that module's own
+# doc comment for why).
+#
+# Every case's `$PATH` is fully replaced (never appended to the real,
+# inherited one) with a fresh directory containing exactly this case's own
+# `path_executables`, on both the candidate (`CompletionState.path`) and
+# oracle (`compgen_via_bash`'s own `$PATH` replacement) sides -- see
+# `tests/phase6_completion_differential.rs`. Every function/alias/
+# executable name below is a deliberately obviously-fake test token (the
+# same "can't possibly collide with a real bash builtin/keyword/host
+# command" discipline `completion_oracle.rs`'s own unit tests already use)
+# except the one reserved-word case, which deliberately targets a real,
+# permanent point of agreement instead (POSIX/bash's fixed keyword table).
+
+[[case]]
+name = "function-name-matching-prefix-is-offered"
+description = "a defined function whose name starts with the prefix is a candidate"
+tags = ["functions"]
+prefix = "zzfrob"
+functions = ["zzfrobnicate", "zzfrobulate"]
+
+[[case]]
+name = "function-name-not-matching-prefix-is-not-offered"
+description = "a defined function that doesn't share the prefix is excluded"
+tags = ["functions"]
+prefix = "zzfrobnicate"
+functions = ["zzfrobnicate", "zzunrelated"]
+
+[[case]]
+name = "alias-name-matching-prefix-is-offered"
+description = "a defined alias whose name starts with the prefix is a candidate"
+tags = ["aliases"]
+prefix = "zzal"
+[[case.aliases]]
+name = "zzalias1"
+value = "ls -la"
+
+[[case]]
+name = "path-executable-matching-prefix-is-offered"
+description = "an executable file on the (fully replaced) $PATH whose name starts with the prefix is a candidate"
+tags = ["path"]
+prefix = "zzexe"
+path_executables = ["zzexecutable1", "zzexecutable2"]
+
+[[case]]
+name = "reserved-word-is-offered-alongside-other-sources"
+description = "a POSIX/bash reserved word (a fixed, shared grammar element on both shells) is offered as a command-position candidate too -- confirmed against real bash's own compgen -c, not assumed"
+tags = ["reserved-words"]
+prefix = "wh"
+functions = ["zzwholly-unrelated-noise"]
+
+[[case]]
+name = "functions-aliases-and-path-executables-merge-into-one-deduplicated-list"
+description = "all three sources (plus reserved words) are merged into one combined, deduplicated candidate set for a shared prefix"
+tags = ["functions", "aliases", "path"]
+prefix = "zzmerge"
+functions = ["zzmerge-fn"]
+path_executables = ["zzmerge-exe"]
+[[case.aliases]]
+name = "zzmerge-alias"
+
+[[case]]
+name = "duplicate-name-across-sources-is-reported-once"
+description = "the same name defined as both a function and a path executable is only offered once, not twice"
+tags = ["functions", "path"]
+prefix = "zzdup"
+functions = ["zzdupname"]
+path_executables = ["zzdupname"]
+
+# An empty-prefix ("match everything defined") case is deliberately *not*
+# here: with `CompletionState.builtins` always left empty on the candidate
+# side (see this file's own header), an empty prefix on the oracle side
+# would additionally match every one of real bash's ~70 actual builtins
+# (`compgen -c ""` -- confirmed empirically while building this corpus),
+# which the candidate correctly excludes by design. That's not a bug to
+# chase; it's the same "don't force a comparison that isn't testing the
+# real pipeline" scoping decision as the builtins exclusion itself. The
+# "empty prefix matches everything defined" property is already covered
+# where it *can* be fairly asserted: `conch-shell-core::completion`'s own
+# `empty_prefix_matches_everything` unit test.
+
+[[case]]
+name = "no-match-is-an-empty-list-not-an-error"
+description = "a prefix matching nothing defined returns an empty candidate list on both sides"
+tags = ["baseline"]
+prefix = "zznomatch"
+functions = ["zzcompletely-different-name"]

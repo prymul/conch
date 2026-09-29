@@ -1,0 +1,70 @@
+# Phase 3b -- the `local` builtin and function-scoped variables.
+#
+# The three contrasts this file exists to make unambiguous:
+#
+# - a `local` variable inside a function is invisible outside it: once the
+#   function returns, the name reverts to whatever it was before the call
+#   (unset, if it never existed) -- see
+#   `local-variable-does-not-leak-to-the-caller-after-return`.
+# - an *ordinary* assignment inside a function, with no `local` keyword, is
+#   not scoped to the function at all -- it's the exact same global
+#   variable the caller sees, so the new value is still there after the
+#   function returns. Contrast this directly against the case above --
+#   see `non-local-assignment-persists-in-the-caller-after-return`, which
+#   uses the identical shape script with only the `local` keyword removed.
+# - a `local` variable *shadows* a global of the same name for the
+#   duration of the call (so code running inside the function sees the
+#   local value, not the global one) and the global's original value
+#   reappears once the function returns -- see
+#   `local-variable-shadows-a-global-of-the-same-name-during-the-call`.
+#
+# `local` itself isn't in POSIX's own utility list at all, but it's a
+# de facto standard every shell relevant to this project implements the
+# same way, including dash -- so every case here runs against both `bash`
+# and `sh`, confirmed directly against real bash and real `/bin/dash`.
+
+[[case]]
+name = "local-variable-does-not-leak-to-the-caller-after-return"
+description = "a variable declared with local inside a function is scoped to that call only -- once the function returns, the name reverts to its value from before the call (here, unset entirely)"
+tags = ["functions", "local", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  local x=inside
+  echo "in f: $x"
+}
+x=outside
+f
+echo "after f: $x"
+'''
+
+[[case]]
+name = "non-local-assignment-persists-in-the-caller-after-return"
+description = "the exact same script as local-variable-does-not-leak-to-the-caller-after-return, but with the local keyword removed: an ordinary assignment inside a function is the caller's own global variable, so the new value is still visible after the function returns -- the direct contrast that proves local, not calling a function at all, is what scopes the assignment"
+tags = ["functions", "local", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+f() {
+  x=inside
+  echo "in f: $x"
+}
+x=outside
+f
+echo "after f: $x"
+'''
+
+[[case]]
+name = "local-variable-shadows-a-global-of-the-same-name-during-the-call"
+description = "a local declaration with the same name as an existing global temporarily shadows it: code inside the function sees the local value, but the global's original value reappears unchanged once the function returns"
+tags = ["functions", "local", "variables"]
+oracles = ["bash", "sh"]
+script = '''
+x=global
+f() {
+  local x=local-value
+  echo "in f: $x"
+}
+echo "before f: $x"
+f
+echo "after f: $x"
+'''

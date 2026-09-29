@@ -1,0 +1,198 @@
+# Phase 3 -- nested loops with POSIX's numeric `break n` / `continue n`
+# level argument. This is the trickiest part of loop-control semantics to
+# get right (it needs a runtime notion of "how many loops am I currently
+# inside", not just a single flag), so it gets real, dedicated coverage
+# here rather than a couple of cases tacked onto for_loops.toml/
+# while_until_loops.toml.
+#
+# The key contrasts every reader should be able to see across this file:
+#
+# - plain `break`/`continue` (no argument, or equivalently `1`) only ever
+#   affects the *innermost* enclosing loop --
+#   `nested-for-loops-plain-break-only-exits-the-innermost-loop` proves
+#   this by showing the outer loop keeps running.
+# - `break n` unwinds n enclosing loops at once and resumes execution
+#   *after* the nth one -- contrast `nested-for-loops-break-2-exits-both-
+#   loops`'s output (stops after the very first outer iteration) against
+#   the plain-break case's output (all three outer iterations run).
+# - `continue n` jumps to the *next iteration* of the nth enclosing loop
+#   (re-checking that loop's own condition), it does not terminate it --
+#   contrast `nested-for-loops-continue-2-continues-the-outer-loop`'s
+#   output (all three outer iterations still happen) against break 2's.
+# - the level count is loop-keyword-agnostic: `for`, `while`, and `until`
+#   all share the same nesting depth, so `break 2`/`continue 2` works
+#   identically when the two nested loops are different kinds
+#   (`mixed-loop-types-break-2-crosses-a-for-and-a-while`).
+# - a level argument larger than the actual nesting depth is not an error;
+#   it's clamped to "all enclosing loops" for break, and to "the outermost
+#   enclosing loop" for continue.
+#
+# All POSIX baseline (`break`/`continue` with a numeric argument are
+# standard POSIX, not a bash extension), so every case runs against both
+# `bash` and `sh`. Every script here was run against real bash and dash
+# directly (not only through this harness's own `sh`) while building this
+# corpus, with a hard wall-clock timeout guard, specifically because a
+# nested-loop-control script that gets the break/continue level wrong is
+# exactly the kind of mistake that produces an infinite loop instead of a
+# clean failure.
+
+[[case]]
+name = "nested-for-loops-plain-break-only-exits-the-innermost-loop"
+description = "break with no numeric argument only breaks out of the nearest enclosing loop, letting the outer loop continue to its next iteration"
+tags = ["control-flow", "nested-loops", "break"]
+oracles = ["bash", "sh"]
+script = '''
+for i in 1 2 3; do
+  for j in a b c; do
+    if [ "$j" = b ]; then
+      break
+    fi
+    echo "$i-$j"
+  done
+done
+'''
+
+[[case]]
+name = "nested-for-loops-break-2-exits-both-loops"
+description = "break 2 unwinds both the inner and outer for loop at once, so execution resumes after the outer loop entirely -- contrast with the plain-break case, where all three outer iterations run"
+tags = ["control-flow", "nested-loops", "break"]
+oracles = ["bash", "sh"]
+script = '''
+for i in 1 2 3; do
+  for j in a b c; do
+    if [ "$j" = b ]; then
+      break 2
+    fi
+    echo "$i-$j"
+  done
+done
+echo after-loops
+'''
+
+[[case]]
+name = "nested-for-loops-continue-2-continues-the-outer-loop"
+description = "continue 2 jumps straight to the outer for loop's next iteration (skipping the rest of the inner loop and anything after it in the outer body), but -- unlike break 2 -- does not stop the outer loop from continuing to run every iteration"
+tags = ["control-flow", "nested-loops", "continue"]
+oracles = ["bash", "sh"]
+script = '''
+for i in 1 2 3; do
+  for j in a b c; do
+    if [ "$j" = b ]; then
+      continue 2
+    fi
+    echo "$i-$j"
+  done
+  echo "outer-tail-$i"
+done
+echo after-loops
+'''
+
+[[case]]
+name = "triple-nested-for-loops-break-3-exits-all-three-levels"
+description = "break's numeric argument generalizes past two levels: break 3 from the innermost of three nested for loops exits all of them, and the outer loop's remaining iterations (i=2 here) never run at all"
+tags = ["control-flow", "nested-loops", "break"]
+oracles = ["bash", "sh"]
+script = '''
+for i in 1 2; do
+  for j in 1 2; do
+    for k in 1 2; do
+      if [ "$k" = 2 ] && [ "$j" = 2 ]; then
+        break 3
+      fi
+      echo "$i.$j.$k"
+    done
+  done
+done
+echo after
+'''
+
+[[case]]
+name = "nested-while-loops-break-2-exits-both"
+description = "break 2 works the same way for while loops as it does for for loops"
+tags = ["control-flow", "nested-loops", "break", "while"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+while [ "$i" -le 3 ]; do
+  j=1
+  while [ "$j" -le 3 ]; do
+    if [ "$j" -eq 2 ]; then
+      break 2
+    fi
+    echo "$i.$j"
+    j=$((j + 1))
+  done
+  i=$((i + 1))
+done
+echo after
+'''
+
+[[case]]
+name = "nested-until-loops-continue-2-continues-the-outer-until"
+description = "continue 2 works the same way for until loops as it does for for loops; the outer loop's own increment (which happens before the inner loop starts here, specifically so continue 2 can't skip it and cause an infinite loop) still runs every time"
+tags = ["control-flow", "nested-loops", "continue", "until"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+until [ "$i" -gt 3 ]; do
+  j=1
+  until [ "$j" -gt 2 ]; do
+    if [ "$i" -eq 2 ] && [ "$j" -eq 1 ]; then
+      i=$((i + 1))
+      continue 2
+    fi
+    echo "$i.$j"
+    j=$((j + 1))
+  done
+  echo "outer-tail-$i"
+  i=$((i + 1))
+done
+echo after
+'''
+
+[[case]]
+name = "break-level-exceeding-nesting-depth-breaks-all-enclosing-loops"
+description = "break N where N is larger than the number of loops actually enclosing it is not an error -- it just breaks out of every enclosing loop, same as if N had been exactly the nesting depth"
+tags = ["control-flow", "nested-loops", "break"]
+oracles = ["bash", "sh"]
+script = '''
+for i in 1 2; do
+  echo "outer-$i"
+  break 5
+done
+echo after
+'''
+
+[[case]]
+name = "continue-level-exceeding-nesting-depth-acts-on-the-outermost-loop"
+description = "continue N where N is larger than the number of loops actually enclosing it is clamped to the outermost enclosing loop -- for a single loop, continue 3 behaves exactly like a plain continue"
+tags = ["control-flow", "nested-loops", "continue"]
+oracles = ["bash", "sh"]
+script = '''
+for i in 1 2 3; do
+  if [ "$i" = 2 ]; then
+    continue 3
+  fi
+  echo "$i"
+done
+'''
+
+[[case]]
+name = "mixed-loop-types-break-2-crosses-a-for-and-a-while"
+description = "the break-level count is loop-keyword-agnostic: break 2 from a for loop nested inside a while loop unwinds both, exactly as it would for two nested for loops or two nested while loops"
+tags = ["control-flow", "nested-loops", "break", "while", "for"]
+oracles = ["bash", "sh"]
+script = '''
+i=1
+while [ "$i" -le 2 ]; do
+  for j in a b c; do
+    if [ "$j" = b ]; then
+      break 2
+    fi
+    echo "$i-$j"
+  done
+  echo "while-tail-$i"
+  i=$((i + 1))
+done
+echo after
+'''

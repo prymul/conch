@@ -1,0 +1,75 @@
+# Phase 4 -- checking a background job's running/finished status via
+# `kill -0` and `jobs -p`, deliberately kept minimal.
+#
+# `jobs`' exact textual output (job-number annotations, "Running"/"Done"
+# labels, and so on) is not something POSIX pins down to an exact format,
+# and it was confirmed while building this corpus to be genuinely
+# bash/dash-implementation-specific in ways well beyond formatting -- see
+# the two divergences below, found empirically, neither of which is a
+# question of which shell is "wrong":
+#
+# - `jobs -p` run through a pipe or command substitution (`jobs -p | wc
+#   -l`, `n=$(jobs -p)`) sees the running background job on bash but sees
+#   *nothing* on dash -- both of those constructs put `jobs` on the
+#   read/producer side of a subshell environment, and dash's job table
+#   isn't visible from inside one the way bash's is. Every case below
+#   works around this by redirecting `jobs -p`'s output straight to a
+#   file (an ordinary redirect, not a subshell) and reading the count back
+#   with a separate `wc -l < file`, which both shells agree on.
+# - `jobs -p`'s bookkeeping for *when* a job disappears from the list
+#   after being explicitly `wait`-ed on differs: bash removes it
+#   immediately, dash still lists it. Because of this, every case here
+#   only asserts a job's presence *while it's still running* (an
+#   unambiguous, agreed-on fact on both shells) and deliberately does not
+#   assert anything about `jobs -p`'s state after `wait` -- use `kill -0`
+#   (which both shells agree on precisely, before and after) for a
+#   liveness check that needs to hold at both points.
+#
+# Neither of the above is a `known_difference` (that schema is for a
+# deliberate, permanent *conch* divergence -- see ../../known-differences.md)
+# since it's a divergence between the two *oracle* shells themselves, not
+# a conch decision; it's recorded there anyway under "Cross-shell quirks
+# worth knowing" for the same reason Phase 2's globbing/arithmetic
+# quirks are.
+#
+# Every "is it still running" check below uses a `mkfifo` + blocking
+# `read` as a synchronization gate rather than a `sleep` guess: the
+# backgrounded job blocks on reading from the FIFO until the main script
+# explicitly writes to it, so "is it still running at this point" is a
+# fact guaranteed by construction, not a race against how long some
+# arbitrary sleep happens to take on whatever machine this runs on. This
+# is the same technique `background_and_wait.toml`'s header describes for
+# ordering; here it's used to pin down a *mid-flight* state instead of
+# just an eventual-completion order.
+#
+# All POSIX baseline, so every case runs against both `bash` and `sh`.
+
+[[case]]
+name = "kill-zero-confirms-a-backgrounded-job-is-running-then-finished"
+description = "kill -0 pid succeeds (exit 0) while the background job is still alive and fails once it has actually finished -- both checked at FIFO-gated, unambiguous points rather than guessed via a sleep"
+tags = ["job-control", "jobs", "kill"]
+oracles = ["bash", "sh"]
+script = '''
+mkfifo gate
+(read x < gate) &
+bgpid=$!
+if kill -0 "$bgpid" 2>/dev/null; then echo running; else echo not-running; fi
+echo go > gate
+wait "$bgpid"
+if kill -0 "$bgpid" 2>/dev/null; then echo running; else echo not-running; fi
+'''
+
+[[case]]
+name = "jobs-dash-p-lists-a-still-running-backgrounded-job"
+description = "jobs -p, redirected to a file (never through a pipe or command substitution -- see this file's header), lists exactly one PID while the FIFO-gated background job is still blocked"
+tags = ["job-control", "jobs"]
+oracles = ["bash", "sh"]
+script = '''
+mkfifo gate
+(read x < gate; echo done-bg) &
+bgpid=$!
+jobs -p > jobsfile.txt
+wc -l < jobsfile.txt
+echo go > gate
+wait "$bgpid"
+'''

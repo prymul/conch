@@ -1,0 +1,88 @@
+# Phase 5 -- completing `set`'s option-flag half (`-e`, `-u`, `-f`, `-C`,
+# and friends). `set --`/positional-parameter manipulation itself is
+# already covered in `corpus/phase3b/positional_parameters.toml`; this
+# file is specifically the option-flag side POSIX also bundles into the
+# same builtin.
+#
+# `set -u`'s failure on an unset-variable reference is another instance
+# of the POSIX "special built-in" abort-asymmetry pattern already seen in
+# `corpus/phase5/declare_and_readonly.toml` and `source_and_eval.toml`
+# (`set` itself is on POSIX's special-built-in list) -- see
+# `known-differences.md` for the consolidated writeup covering all of
+# these at once.
+#
+# All POSIX baseline (`-o pipefail` is the one common bash-only `set`
+# extension, and is deliberately not included here since it's arguably
+# closer to Phase 2/3 expansion-and-pipeline semantics than a Phase 5
+# builtin-completeness concern -- worth a future case elsewhere, not
+# omitted by oversight).
+
+[[case]]
+name = "set-dash-e-aborts-the-script-on-an-unhandled-failing-command"
+description = "with -e active, a plain command that fails outside of any exempted context (not part of &&/||, not an if/while/until condition) aborts the whole script immediately"
+tags = ["builtins", "set", "errexit"]
+oracles = ["bash", "sh"]
+script = '''
+set -e
+false
+echo unreached
+'''
+
+[[case]]
+name = "set-dash-e-does-not-trigger-inside-an-if-condition"
+description = "POSIX explicitly exempts a command's failure from triggering -e when that command is the condition of an if/while/until -- a failing condition is exactly how those constructs are supposed to work"
+tags = ["builtins", "set", "errexit"]
+oracles = ["bash", "sh"]
+script = '''
+set -e
+if false; then
+  echo then-branch
+fi
+echo reached
+'''
+
+[[case]]
+name = "set-dash-u-treats-an-unset-variable-reference-as-an-error"
+description = "with -u active, expanding a variable that was never set is itself a fatal error rather than silently expanding to an empty string -- both shells abort before the trailing echo, differing only in reported exit status (bash: 127, dash: 2), so this narrows compare to stdout only"
+tags = ["builtins", "set", "nounset", "cross-shell-quirk"]
+oracles = ["bash", "sh"]
+compare = ["stdout"]
+script = '''
+set -u
+echo "$undefined_var"
+echo unreached
+'''
+
+[[case]]
+name = "set-dash-f-disables-pathname-expansion"
+description = "with -f (noglob) active, a glob pattern is left completely unexpanded, as literal text, even when it would otherwise match real files"
+tags = ["builtins", "set", "noglob", "globbing"]
+oracles = ["bash", "sh"]
+script = '''
+touch a.txt
+set -f
+echo *.txt
+'''
+
+[[case]]
+name = "set-dash-capital-c-noclobber-prevents-overwriting-an-existing-file-with-redirection"
+description = "with -C (noclobber) active, a plain > redirection to a file that already exists is refused rather than silently truncating it -- proven by the file still holding its original content afterward"
+tags = ["builtins", "set", "noclobber", "redirection"]
+oracles = ["bash", "sh"]
+script = '''
+set -C
+echo first > f.txt
+echo second > f.txt 2>/dev/null
+cat f.txt
+'''
+
+[[case]]
+name = "set-dash-o-long-option-names-are-equivalent-to-the-short-flags"
+description = "set -o errexit is the same as set -e, and set +o errexit is the same as set +e -- the long -o spelling is just an alternate way to name the same option"
+tags = ["builtins", "set", "errexit"]
+oracles = ["bash", "sh"]
+script = '''
+set -o errexit
+false
+echo unreached
+'''

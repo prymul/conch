@@ -20,6 +20,145 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(input).tokenize()
 }
 
+/// Re-lexes `input` as one word's worth of segments, using the same
+/// quoting/escaping/expansion-site rules [`lex`] uses inside an ordinary
+/// (unquoted-context) `WORD` token — POSIX 2.2's quoting mechanisms, and
+/// `$`/backquote expansion sites — except the word never ends early at a
+/// blank, newline, or operator character: the only boundary is the end
+/// of `input`.
+///
+/// # What this is for
+///
+/// `conch-shell-parser`'s Phase 2 parameter-expansion parser uses this to
+/// re-lex the `word` operand of `${parameter:-word}` and its sibling
+/// POSIX 2.6.2 operators, *after* this crate has already found the
+/// operand's correct extent (captured verbatim in
+/// [`WordSegment::ComplexParameterExpansion`]) — the operand can itself
+/// contain quoting and further expansion sites (e.g. `${x:-$OTHER}`,
+/// `${x:-'a b' c}`), so it needs the same segment-aware re-lexing an
+/// ordinary word gets, not a flat string.
+///
+/// Use this specific entry point when the enclosing `${...}` is **not**
+/// itself nested inside an outer `"..."` — confirmed against real bash
+/// that unquoted `${x:-'a b' c}` keeps `'a b'` together as one field (real
+/// single-quoting) while splitting on the unquoted space before `c`. See
+/// [`lex_double_quoted_body`] for the different ruleset bash uses when
+/// the enclosing `${...}` *is* nested inside `"..."` — getting this
+/// distinction wrong is exactly the kind of "almost-right" quoting bug
+/// this crate exists to avoid, so callers must pick deliberately rather
+/// than defaulting to one or the other; see that function's docs for the
+/// worked example that tells them apart.
+///
+/// # Errors
+///
+/// Returns [`LexError`] if `input` contains an unterminated quote or a
+/// trailing unescaped backslash. In practice this should never happen for
+/// a body this crate already bounded correctly (the same quote/backslash
+/// scanning rules apply both times), but the error is still surfaced
+/// rather than panicking, in case of a genuine inconsistency.
+pub fn lex_word_body(input: &str) -> Result<Word, LexError> {
+    Lexer::new(input).scan_word_until(|_| false)
+}
+
+/// Re-lexes `input` as double-quoted-*style* content — literal text with
+/// the double-quote backslash-escape set (`$ \` " \` plus newline)
+/// resolved, and `$`/backquote still introducing nested expansion sites —
+/// running to the end of `input` rather than stopping at a closing `"`.
+///
+/// # What this is for
+///
+/// Same purpose as [`lex_word_body`] — re-lexing a `${parameter:-word}`-
+/// shaped operand for `conch-shell-parser`'s Phase 2 parameter-expansion
+/// parser — but for the case where the enclosing `${...}` **is** nested
+/// inside an outer `"..."`. Confirmed against real bash that this is a
+/// genuinely different ruleset, not just the same one applied in a
+/// quoted position: POSIX 2.2.3's "a single-quote loses its special
+/// meaning within double-quotes" turns out to reach straight through
+/// `${...}` nesting. For example:
+///
+/// - `echo ${x:-'a b'}` (unquoted, unset `x`) prints `a b` — the `'...'`
+///   really quotes, and quote removal strips it.
+/// - `echo "${x:-'a b'}"` (nested in `"..."`, unset `x`) prints `'a b'`
+///   *with the quote characters still in the output* — inside the outer
+///   double quotes, `'` is just an ordinary character.
+///
+/// A nested `"..."` inside the operand is unaffected by this distinction
+/// (POSIX 2.6.2/2.6.3's own "tokenizing rules applied recursively" let
+/// double quotes always re-open inside `${...}`, even here) — e.g.
+/// `echo "${x:-"y"}"` still prints `y`, not `"y"`.
+///
+/// # Errors
+///
+/// See [`lex_word_body`].
+pub fn lex_double_quoted_body(input: &str) -> Result<Vec<WordSegment>, LexError> {
+    Lexer::new(input).scan_double_quoted_style_until(|_| false)
+}
+
+/// Recognizes one `$`-led expansion site — `$name`, `${...}`, `$(...)`,
+/// or `$((...))` — starting at the beginning of `input`, or, if what
+/// follows the `$` isn't valid parameter/substitution syntax, a literal
+/// `"$"` (POSIX: a `$` not followed by valid syntax has no special
+/// meaning). Returns the recognized segment and how many bytes of
+/// `input` it consumed.
+///
+/// This is the exact recognition [`lex`], [`lex_word_body`], and
+/// [`lex_double_quoted_body`] already use for the `$` case, exposed
+/// standalone for `conch-shell-parser`'s arithmetic-expansion body
+/// scanner (`$((...))`'s content), which needs the identical
+/// `$`-expansion recognition but under a *third* set of quoting rules for
+/// everything else — POSIX 2.6.4: the arithmetic body is "treated as if
+/// it were in double-quotes, except that a double-quote inside the
+/// expression is not treated specially," and confirmed against real bash
+/// that a literal `'` never quotes there either (unlike both
+/// [`lex_word_body`] and [`lex_double_quoted_body`]) — so it re-lexes the
+/// body with its own loop rather than reusing either of those.
+///
+/// # Panics
+///
+/// Panics if `input` does not start with `$`; callers only call this
+/// after checking that themselves (mirroring [`Lexer`]'s internal
+/// `lex_operator`, which has the same "caller already checked" contract).
+///
+/// # Errors
+///
+/// Returns [`LexError`] if the `$` opens a `${...}`, `$(...)`, or
+/// `$((...))` construct that never finds its matching terminator.
+pub fn lex_dollar_expansion(input: &str) -> Result<(WordSegment, usize), LexError> {
+    assert_eq!(
+        input.chars().next(),
+        Some('$'),
+        "lex_dollar_expansion requires input starting with '$'"
+    );
+    let mut lexer = Lexer::new(input);
+    let segment = lexer.scan_dollar()?;
+    Ok((segment, lexer.pos))
+}
+
+/// Recognizes one `` `...` `` backquoted command substitution starting at
+/// the beginning of `input`. Returns the segment and how many bytes of
+/// `input` it consumed. See [`lex_dollar_expansion`] for why this is
+/// exposed standalone.
+///
+/// # Panics
+///
+/// Panics if `input` does not start with `` ` ``; see
+/// [`lex_dollar_expansion`]'s docs for the same contract.
+///
+/// # Errors
+///
+/// Returns [`LexError::UnterminatedBackquote`] if no closing `` ` `` is
+/// found.
+pub fn lex_backquote_expansion(input: &str) -> Result<(WordSegment, usize), LexError> {
+    assert_eq!(
+        input.chars().next(),
+        Some('`'),
+        "lex_backquote_expansion requires input starting with '`'"
+    );
+    let mut lexer = Lexer::new(input);
+    let segment = lexer.scan_backquote_segment()?;
+    Ok((segment, lexer.pos))
+}
+
 /// A streaming tokenizer over a `&str`.
 ///
 /// Most callers should prefer the [`lex`] convenience function; this type
@@ -249,13 +388,31 @@ impl<'a> Lexer<'a> {
     /// Scans a full `WORD` token: a maximal run of segments up to (but not
     /// including) the next blank, newline, operator character, or EOF.
     fn scan_word(&mut self) -> Result<Word, LexError> {
+        self.scan_word_until(|c| matches!(c, ' ' | '\t' | '\n') || is_operator_char(c))
+    }
+
+    /// Scans word segments — quotes, `$`/backquote expansion sites, and
+    /// backslash-escaped literal text, per POSIX 2.2/2.6.2/2.6.3/2.6.4 —
+    /// until `is_boundary` reports `true` for the next unconsumed
+    /// character, or end of input, whichever comes first.
+    ///
+    /// Factored out of [`Self::scan_word`] (which stops at a blank,
+    /// newline, or operator character, per POSIX `WORD` token
+    /// recognition) so [`lex_word_body`] can reuse the *exact* same
+    /// quoting/escaping/expansion-site recognition to re-lex a `${...}`
+    /// operand word for Phase 2's parameter-expansion parser
+    /// (`conch-shell-parser`) — there, the only real boundary is
+    /// end-of-string: the operand was already captured to its correct
+    /// end by this crate's brace-matching (see [`Self::skip_to_matching_brace`]),
+    /// so nothing inside it — blanks, `;`, `|`, ... — should stop the scan
+    /// early the way it would for an ordinary `WORD` token.
+    fn scan_word_until(&mut self, is_boundary: impl Fn(char) -> bool) -> Result<Word, LexError> {
         let mut segments = Vec::new();
         let mut literal = String::new();
         loop {
             match self.peek() {
                 None => break,
-                Some(' ' | '\t' | '\n') => break,
-                Some(c) if is_operator_char(c) => break,
+                Some(c) if is_boundary(c) => break,
                 Some('\'') => {
                     flush_literal(&mut literal, &mut segments);
                     segments.push(self.scan_single_quoted()?);
@@ -295,6 +452,44 @@ impl<'a> Lexer<'a> {
                         // continuation) is removed entirely — it does not
                         // even act as a word separator.
                         Some('\n') => {
+                            self.bump();
+                        }
+                        // A backslash escaping a character that's ever
+                        // glob-pattern-syntactically significant (POSIX
+                        // 2.13.1's pattern-matching notation: `*`/`?`/`[`
+                        // at any position, or `]`/`-`/`!` specifically
+                        // inside a `[...]` bracket expression — this
+                        // lexer has no bracket-expression awareness of
+                        // its own to know *which* of those apply here,
+                        // so it preserves the backslash for all six
+                        // uniformly and leaves the distinction to
+                        // whichever later stage actually interprets the
+                        // text as a pattern) is kept **verbatim** —
+                        // both the backslash and the character — rather
+                        // than having ordinary POSIX 2.2.1 quote removal
+                        // resolve it immediately the way every other
+                        // escaped character gets resolved right here.
+                        // This is a deliberate, narrow exception matching
+                        // POSIX 2.6's real expansion order: quote removal
+                        // is always the *last* step, strictly after
+                        // pathname expansion, so an unquoted backslash
+                        // protecting a glob metacharacter must still be
+                        // visible when pathname expansion runs — collapsing
+                        // it this early would make the character
+                        // indistinguishable from an ordinary, unescaped
+                        // occurrence of itself, silently turning `\*`
+                        // into a real wildcard instead of a literal `*`
+                        // (confirmed against real bash: `echo \*` prints
+                        // a literal `*`, never triggering pathname
+                        // expansion, and `[C\-D]*` matches literal `C`,
+                        // `-`, and `D`, not the range `C`-`D`). See
+                        // `conch_shell_core::expand`'s `resolve_glob_escapes`
+                        // for where this deferred escape finally gets
+                        // resolved once expansion knows whether pathname
+                        // expansion actually ran or not.
+                        Some(special @ ('*' | '?' | '[' | ']' | '-' | '!')) => {
+                            literal.push('\\');
+                            literal.push(special);
                             self.bump();
                         }
                         Some(other) => {
@@ -341,15 +536,42 @@ impl<'a> Lexer<'a> {
     fn scan_double_quoted(&mut self) -> Result<WordSegment, LexError> {
         let open_pos = self.pos;
         self.bump(); // opening '"'
+        let segments = self.scan_double_quoted_style_until(|c| c == '"')?;
+        if self.peek().is_none() {
+            return Err(LexError::UnterminatedDoubleQuote { start: open_pos });
+        }
+        self.bump(); // closing '"'
+        Ok(WordSegment::DoubleQuoted(segments))
+    }
+
+    /// Scans double-quoted-*style* content — literal text with the
+    /// double-quote backslash-escape set (`$ \` " \` plus newline)
+    /// resolved, and `$`/backquote still introducing nested expansion
+    /// sites — until `is_boundary` reports `true` for the next
+    /// unconsumed character, or end of input.
+    ///
+    /// Factored out of [`Self::scan_double_quoted`] (which stops at the
+    /// closing `"`) so [`lex_double_quoted_body`] can reuse the same
+    /// escape/expansion-site recognition to re-lex a `${...}` operand
+    /// word that is itself nested inside an outer `"..."` — confirmed
+    /// against real bash that this is a genuinely different ruleset from
+    /// [`Self::scan_word_until`]/[`lex_word_body`] (POSIX 2.2.3: a
+    /// single-quote has no special meaning inside double quotes, and that
+    /// reaches straight through `${...}` nesting — see [`lex_double_quoted_body`]'s
+    /// docs for the worked example). Does *not* itself decide whether
+    /// `is_boundary` matching means "found a real closing quote" versus
+    /// "ran out of input"; callers that care (like
+    /// [`Self::scan_double_quoted`]) check `self.peek()` afterward.
+    fn scan_double_quoted_style_until(
+        &mut self,
+        is_boundary: impl Fn(char) -> bool,
+    ) -> Result<Vec<WordSegment>, LexError> {
         let mut segments = Vec::new();
         let mut literal = String::new();
         loop {
             match self.peek() {
-                None => return Err(LexError::UnterminatedDoubleQuote { start: open_pos }),
-                Some('"') => {
-                    self.bump();
-                    break;
-                }
+                None => break,
+                Some(c) if is_boundary(c) => break,
                 Some('\\') => {
                     self.bump();
                     match self.peek() {
@@ -376,6 +598,22 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
+                // A bare, unescaped '"' that `is_boundary` doesn't already
+                // treat as this call's own terminator (i.e. only reachable
+                // from `lex_double_quoted_body`, never from
+                // `scan_double_quoted` itself, since that call's
+                // `is_boundary` is `|c| c == '"'` and the arm above always
+                // wins first) opens a genuinely nested double-quoted
+                // segment — confirmed against real bash
+                // (`echo "${x:-"y"}"` prints `y`, not `"y"`): POSIX
+                // 2.6.2/2.6.3's "tokenizing rules applied recursively" let
+                // `"..."` re-open inside `${...}` even when the whole
+                // thing is already nested inside an outer `"..."`, unlike
+                // a nested `'...'` (see this function's docs).
+                Some('"') => {
+                    flush_literal(&mut literal, &mut segments);
+                    segments.push(self.scan_double_quoted()?);
+                }
                 Some('$') => match self.scan_dollar()? {
                     WordSegment::Literal(s) => literal.push_str(&s),
                     segment => {
@@ -394,7 +632,7 @@ impl<'a> Lexer<'a> {
             }
         }
         flush_literal(&mut literal, &mut segments);
-        Ok(WordSegment::DoubleQuoted(segments))
+        Ok(segments)
     }
 
     /// `` `...` `` as a word segment: finds the boundary via
@@ -421,15 +659,62 @@ impl<'a> Lexer<'a> {
                 self.bump(); // consume '{'
                 self.scan_braced_parameter(dollar_pos)
             }
+            // POSIX 2.6.4's own documented ambiguity: "the syntax of the
+            // shell command language has an ambiguity for expansions
+            // beginning with '$((', which can introduce an arithmetic
+            // expansion or a command substitution that starts with a
+            // subshell. Arithmetic expansion has precedence; that is, the
+            // shell shall first determine whether it can parse the
+            // expansion as an arithmetic expansion and shall only parse
+            // the expansion as a command substitution if it determines
+            // that it cannot." See [`Self::try_skip_arithmetic_parens`]
+            // for exactly what "can parse... as an arithmetic expansion"
+            // means mechanically (confirmed empirically against real bash
+            // 5.3 and dash, since POSIX's own prose doesn't spell out the
+            // byte-level rule) and for why falling back to an ordinary
+            // command substitution here is a real POSIX-mandated
+            // fallback, not a bash-only extension.
             Some('(') if self.peek2() == Some('(') => {
-                self.bump();
-                self.bump(); // consume "(("
+                self.bump(); // consume the outer, real '('
+                // Where a plain `$(...)` command substitution's body
+                // would start if this construct turns out not to be
+                // genuine arithmetic after all -- i.e. right after the
+                // single '(' `$(...)` itself always opens with. Kept
+                // separate from `body_start` below (which additionally
+                // assumes the *second* '(' is arithmetic-opening syntax,
+                // not body content) so falling back can resume scanning
+                // from exactly the right place without needing to guess
+                // or re-derive it afterward.
+                let fallback_body_start = self.pos;
+                self.bump(); // tentatively consume the second '(' as arithmetic-opening syntax
                 let body_start = self.pos;
-                self.skip_balanced_parens(2, BalanceContext::Arithmetic, dollar_pos)?;
-                let body_end = self.pos - 2;
-                Ok(WordSegment::ArithmeticExpansion(
-                    self.input[body_start..body_end].to_string(),
-                ))
+                match self.try_skip_arithmetic_parens(dollar_pos)? {
+                    Some(body_end) => Ok(WordSegment::ArithmeticExpansion(
+                        self.input[body_start..body_end].to_string(),
+                    )),
+                    None => {
+                        // Not genuine arithmetic -- POSIX's documented
+                        // fallback. Re-scan from `fallback_body_start`
+                        // (before the tentative "second open" was
+                        // consumed) as an ordinary command substitution;
+                        // that second '(' is now correctly re-processed
+                        // as the start of this command substitution's own
+                        // body (typically a nested subshell), exactly the
+                        // same way `Self::rest`'s `Some('(')` arm below
+                        // handles a plain `$(...)`.
+                        self.pos = fallback_body_start;
+                        self.skip_balanced_parens(
+                            1,
+                            BalanceContext::CommandSubstitution,
+                            dollar_pos,
+                        )?;
+                        let body_end = self.pos - 1;
+                        Ok(WordSegment::CommandSubstitution(CommandSubstitution {
+                            style: SubstitutionStyle::DollarParen,
+                            body: self.input[fallback_body_start..body_end].to_string(),
+                        }))
+                    }
+                }
             }
             Some('(') => {
                 self.bump(); // consume '('
@@ -442,7 +727,7 @@ impl<'a> Lexer<'a> {
                 }))
             }
             Some(_) => {
-                if let Some((param, len)) = try_match_bare_parameter(self.rest(), false) {
+                if let Some((param, len)) = match_bare_parameter(self.rest(), false) {
                     self.pos += len;
                     Ok(WordSegment::Parameter(param))
                 } else {
@@ -458,7 +743,7 @@ impl<'a> Lexer<'a> {
     /// decodes); otherwise finds the true matching `}` and captures the
     /// raw body for Phase 2.
     fn scan_braced_parameter(&mut self, dollar_pos: usize) -> Result<WordSegment, LexError> {
-        if let Some((param, len)) = try_match_bare_parameter(self.rest(), true)
+        if let Some((param, len)) = match_bare_parameter(self.rest(), true)
             && self.rest().as_bytes().get(len) == Some(&b'}')
         {
             self.pos += len + 1;
@@ -593,6 +878,118 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    /// Scans a candidate `$((...))` arithmetic-expansion body, called
+    /// with `self.pos` immediately after the two already-(tentatively)
+    /// consumed opening parens. Distinct from the general
+    /// [`Self::skip_balanced_parens`] (used for this exact same `depth =
+    /// 2` case too, but *without* this function's extra bookkeeping) —
+    /// this one additionally tracks whether the specific `)` that brings
+    /// the count to zero is itself immediately preceded (zero bytes
+    /// apart) by another bare, depth-decrementing `)`, which is exactly
+    /// what determines whether this is genuine arithmetic at all, per
+    /// POSIX 2.6.4's own documented ambiguity between `$((expr))` and
+    /// `$( (subshell) ... )` (see [`Self::scan_dollar`]'s own doc comment
+    /// for the exact POSIX text). Confirmed empirically against real bash
+    /// 5.3 and dash to be exactly this rule, not merely "depth reaches
+    /// zero somewhere" — worked examples:
+    ///
+    /// - `$((1+2))`: the loop reaches depth zero via two adjacent `)`s
+    ///   (`1+2` then `))`) — genuine arithmetic, confirmed against real
+    ///   bash (prints `3`).
+    /// - `$((echo hi))`: same shape (`echo hi` then `))`, still two
+    ///   adjacent closers) — also recognized as an arithmetic *attempt*
+    ///   (confirmed against real bash: `arithmetic syntax error in
+    ///   expression (error token is "hi")`, a semantic error from trying
+    ///   to evaluate non-numeric text, not a "this wasn't arithmetic at
+    ///   all" rejection — this function only decides the *syntactic*
+    ///   question of which construct this is, never whether the resulting
+    ///   text is valid arithmetic).
+    /// - `$(()ݠ)`: depth reaches zero via a *lone* `)` (preceded by `ݠ`,
+    ///   not another `)`) — not genuine arithmetic. Confirmed against
+    ///   real bash: falls back to command substitution, reporting a
+    ///   syntax error *inside* one (bash's own message literally shows
+    ///   the reconstructed fallback body, `` `()ݠ' ``).
+    /// - `$((1+2) )` (a space between the two closing parens): not
+    ///   adjacent, so not genuine arithmetic either — confirmed against
+    ///   real bash (`1+2: command not found`, i.e. it ran the nested
+    ///   `(1+2)` as an ordinary subshell attempting to execute the
+    ///   command named `1+2`).
+    ///
+    /// Returns `Ok(Some(body_end))` — a byte offset immediately before
+    /// the *first* of the two adjacent closing parens, always a valid
+    /// char boundary since both of those bytes are, by construction,
+    /// literal single-byte ASCII `)` characters — when the adjacency
+    /// holds. Returns `Ok(None)` when depth reaches zero some other way
+    /// (not arithmetic; the caller falls back to an ordinary command
+    /// substitution scan from one byte earlier — see [`Self::scan_dollar`]).
+    /// Returns `Err` only when depth never reaches zero at all (a genuine
+    /// unterminated `$((...`) — confirmed against real bash and dash that
+    /// this case is simply unterminated on both, with no fallback
+    /// attempted (and none would help: falling back to a depth-1 scan
+    /// from one byte earlier hits the exact same end-of-input, by the
+    /// same paren-counting arithmetic that makes the two scans always
+    /// agree on *where* they'd stop when they do stop at all).
+    fn try_skip_arithmetic_parens(&mut self, open_pos: usize) -> Result<Option<usize>, LexError> {
+        let mut depth: i32 = 2;
+        // Whether the immediately preceding loop iteration was a bare,
+        // depth-decrementing ')' with nothing else processed since —
+        // i.e. whether the *next* ')' this loop sees (if any) would be
+        // truly adjacent to it. Reset to `false` on every other kind of
+        // step (an open paren, an ordinary character, or an atomically-
+        // skipped quote/backquote/nested-dollar-construct), since any of
+        // those means real content sits between the two closers.
+        let mut prev_was_close = false;
+        loop {
+            if self.skip_nested_dollar_construct()? {
+                prev_was_close = false;
+                continue;
+            }
+            match self.peek() {
+                None => return Err(BalanceContext::Arithmetic.unterminated_error(open_pos)),
+                Some('\\') => {
+                    self.bump();
+                    if self.peek().is_none() {
+                        return Err(LexError::TrailingBackslash {
+                            pos: self.pos.saturating_sub(1),
+                        });
+                    }
+                    self.bump();
+                    prev_was_close = false;
+                }
+                Some('\'') => {
+                    self.skip_single_quoted_raw()?;
+                    prev_was_close = false;
+                }
+                Some('"') => {
+                    self.skip_double_quoted_raw()?;
+                    prev_was_close = false;
+                }
+                Some('`') => {
+                    self.skip_backquote_raw()?;
+                    prev_was_close = false;
+                }
+                Some('(') => {
+                    self.bump();
+                    depth += 1;
+                    prev_was_close = false;
+                }
+                Some(')') => {
+                    let adjacent = prev_was_close;
+                    self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(adjacent.then(|| self.pos - 2));
+                    }
+                    prev_was_close = true;
+                }
+                Some(_) => {
+                    self.bump();
+                    prev_was_close = false;
+                }
+            }
+        }
+    }
+
     /// Finds the matching `}` for a `${`-opened parameter expansion.
     /// Confirmed against real bash that a *bare* `{`/`}` is **not**
     /// depth-tracked (`echo "${y:-}}"` with `y=Z` prints `Z}` — the
@@ -687,7 +1084,18 @@ fn flush_literal(literal: &mut String, segments: &mut Vec<WordSegment>) {
 /// different rules for: unbraced `$digit` only ever consumes exactly one
 /// digit (`$12` is positional parameter 1 followed by literal `2`), while
 /// braced `${digits}` consumes the whole run (`${10}`, `${11}`, ...).
-fn try_match_bare_parameter(s: &str, allow_multi_digit: bool) -> Option<(Parameter, usize)> {
+///
+/// Exposed as `pub` (beyond this crate's own `$name`/`${name}`
+/// recognition) for `conch-shell-parser`'s Phase 2 parameter-expansion
+/// parser, which needs the *identical* parameter-name recognition to
+/// implement POSIX 2.6.2's `${#parameter}` string-length form: that form
+/// requires the text after the `#` to match a bare parameter and *nothing
+/// else* (the whole remainder, to the closing `}`) — confirmed against
+/// real bash (`${#x#l}` is a syntax error, not length-of-`x` followed by
+/// a stray `#l`) — which this same function's return value (how many
+/// bytes it consumed) makes easy to check: the length form applies iff
+/// the match consumes the entire remaining string.
+pub fn match_bare_parameter(s: &str, allow_multi_digit: bool) -> Option<(Parameter, usize)> {
     let first = s.chars().next()?;
     if let Some(special) = special_parameter_for(first) {
         return Some((Parameter::Special(special), first.len_utf8()));
